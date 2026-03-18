@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "event-harvester"
+version = "0.1.0"
+description = "Harvest Discord + Telegram messages, extract tasks via OpenRouter, create in TickTick"
+requires-python = ">=3.10"
+dependencies = [
+    "telethon>=1.42",
+    "openai>=1.0",
+    "python-dotenv>=1.0",
+    "ticktick-py>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+event-harvester = "event_harvester.cli:main_sync"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["win-64"]
+
+[tool.pixi.dependencies]
+python = ">=3.12,<3.13"
+
+[tool.pixi.pypi-dependencies]
+event-harvester = { path = ".", editable = true }
+
+[tool.pixi.environments]
+default = { solve-group = "default" }
+dev = { features = ["dev"], solve-group = "default" }
+
+[tool.pixi.tasks]
+test = { cmd = "pytest -v", depends-on = [], features = ["dev"] }
+lint = { cmd = "ruff check src/ tests/", features = ["dev"] }
+format = { cmd = "ruff format src/ tests/", features = ["dev"] }
+harvest = "python -m event_harvester"
