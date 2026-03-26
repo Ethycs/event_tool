@@ -15,6 +15,9 @@ ENV/
 # Environment / secrets
 .env
 *.session
+credentials.json
+token.json
+client_secret_*.json
 
 # IDE
 .vscode/

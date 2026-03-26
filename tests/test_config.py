@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from event_harvester.config import (
     AppConfig,
-    OpenRouterConfig,
+    LLMConfig,
     TelegramConfig,
     TickTickConfig,
     load_config,
@@ -20,7 +20,7 @@ class TestConfigLoading:
             cfg = load_config()
             assert cfg.telegram.api_id == 0
             assert cfg.telegram.session == "harvest_session"
-            assert cfg.openrouter.model == "anthropic/claude-3.5-haiku"
+            assert "claude" in cfg.llm.model
             assert cfg.days_back == 7
             assert cfg.telegram_channels == []
 
@@ -29,6 +29,7 @@ class TestConfigLoading:
             "TELEGRAM_API_ID": "99999",
             "TELEGRAM_API_HASH": "abc123",
             "TELEGRAM_PHONE": "+1555",
+            "LLM_MODEL": "anthropic/claude-3.5-sonnet",
             "OPENROUTER_API_KEY": "sk-test",
             "DAYS_BACK": "14",
             "TELEGRAM_CHANNELS": "chat-a, chat-b",
@@ -38,7 +39,8 @@ class TestConfigLoading:
             cfg = load_config()
             assert cfg.telegram.api_id == 99999
             assert cfg.telegram.api_hash == "abc123"
-            assert cfg.openrouter.api_key == "sk-test"
+            assert cfg.llm.model == "anthropic/claude-3.5-sonnet"
+            assert cfg.llm.api_key == "sk-test"
             assert cfg.days_back == 14
             assert cfg.telegram_channels == ["chat-a", "chat-b"]
             assert cfg.telegram_exclude == ["spam"]
@@ -53,18 +55,20 @@ class TestConfigValidation:
     def test_no_warnings_when_all_configured(self):
         cfg = AppConfig(
             telegram=TelegramConfig(api_id=123, api_hash="abc"),
-            openrouter=OpenRouterConfig(api_key="sk-test"),
+            llm=LLMConfig(model="openrouter/test"),
             ticktick=TickTickConfig(
-                client_id="cid", client_secret="cs", username="u", password="p"
+                client_id="cid", client_secret="cs",
+                username="u", password="p",
             ),
         )
-        warnings = validate_config(cfg)
+        warnings = validate_config(cfg, need_gmail=False)
         assert warnings == []
 
     def test_warnings_when_telegram_missing(self):
         cfg = AppConfig()
         warnings = validate_config(
-            cfg, need_discord=False, need_analysis=False, need_ticktick=False,
+            cfg, need_discord=False, need_gmail=False,
+            need_analysis=False, need_ticktick=False,
         )
         assert len(warnings) == 1
         assert "Telegram" in warnings[0]
@@ -74,17 +78,27 @@ class TestConfigValidation:
         warnings = validate_config(
             cfg,
             need_telegram=False, need_discord=False,
-            need_analysis=False, need_ticktick=False,
+            need_gmail=False, need_analysis=False,
+            need_ticktick=False,
         )
         assert warnings == []
 
     def test_is_configured_properties(self):
         assert not TelegramConfig().is_configured
         assert TelegramConfig(api_id=1, api_hash="x").is_configured
-        assert not OpenRouterConfig().is_configured
-        assert OpenRouterConfig(api_key="k").is_configured
+        assert not LLMConfig(model="").is_configured
+        assert LLMConfig(model="openrouter/test").is_configured
         assert not TickTickConfig().is_configured
         tt = TickTickConfig(
-            client_id="a", client_secret="b", username="c", password="d",
+            client_id="a", client_secret="b",
+            username="c", password="d",
         )
         assert tt.is_configured
+
+    def test_llm_litellm_model(self):
+        # Model string passed through directly to litellm
+        cfg = LLMConfig(model="gpt-4o-mini")
+        assert cfg.litellm_model == "gpt-4o-mini"
+        # With provider prefix
+        cfg2 = LLMConfig(model="anthropic/claude-3.5-sonnet")
+        assert cfg2.litellm_model == "anthropic/claude-3.5-sonnet"

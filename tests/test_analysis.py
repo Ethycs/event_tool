@@ -1,12 +1,10 @@
-"""Tests for OpenRouter analysis — prompt building and response parsing."""
+"""Tests for LLM analysis - prompt building and response parsing."""
 
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
-
-import pytest
+from unittest.mock import MagicMock, patch
 
 from event_harvester.analysis import analyse_and_extract_tasks, build_prompt
-from event_harvester.config import OpenRouterConfig
+from event_harvester.config import LLMConfig
 
 
 class TestBuildPrompt:
@@ -33,10 +31,8 @@ class TestBuildPrompt:
             }
         ]
         prompt = build_prompt(messages, 1)
-        # Each message content is capped at 400 chars
         lines = [line for line in prompt.split("\n") if "user:" in line]
         assert len(lines) == 1
-        # The content in the prompt line should be <= 400 chars
         content_part = lines[0].split("user: ")[1]
         assert len(content_part) <= 400
 
@@ -53,7 +49,6 @@ class TestBuildPrompt:
             for i in range(100)
         ]
         prompt = build_prompt(messages, 1)
-        # Should include only last 60
         assert "msg 99" in prompt
         assert "msg 40" in prompt
         assert "msg 39" not in prompt
@@ -70,15 +65,13 @@ class TestBuildPrompt:
 
 
 class TestAnalyseAndExtractTasks:
-    @pytest.mark.asyncio
-    async def test_returns_empty_when_not_configured(self):
-        cfg = OpenRouterConfig(api_key="", model="test")
-        summary, tasks = await analyse_and_extract_tasks([], 7, cfg)
+    def test_returns_empty_when_not_configured(self):
+        cfg = LLMConfig(model="")
+        summary, tasks = analyse_and_extract_tasks([], 7, cfg)
         assert summary == ""
         assert tasks == []
 
-    @pytest.mark.asyncio
-    async def test_parses_valid_response(self, sample_messages):
+    def test_parses_valid_response(self, sample_messages):
         response_data = {
             "summary": "Test summary",
             "tasks": [
@@ -96,32 +89,35 @@ class TestAnalyseAndExtractTasks:
         mock_resp = MagicMock()
         mock_resp.choices = [mock_choice]
 
-        mock_client = AsyncMock()
-        mock_client.chat.completions.create = AsyncMock(return_value=mock_resp)
+        cfg = LLMConfig(model="openrouter/test-model")
 
-        cfg = OpenRouterConfig(api_key="sk-test", model="test-model")
-
-        with patch("event_harvester.analysis.AsyncOpenAI", return_value=mock_client):
-            summary, tasks = await analyse_and_extract_tasks(sample_messages, 7, cfg)
+        with patch(
+            "event_harvester.analysis.completion",
+            return_value=mock_resp,
+        ):
+            summary, tasks = analyse_and_extract_tasks(
+                sample_messages, 7, cfg,
+            )
 
         assert summary == "Test summary"
         assert len(tasks) == 1
         assert tasks[0]["title"] == "Review auth PR"
 
-    @pytest.mark.asyncio
-    async def test_handles_malformed_json(self, sample_messages):
+    def test_handles_malformed_json(self, sample_messages):
         mock_choice = MagicMock()
         mock_choice.message.content = "not valid json {"
         mock_resp = MagicMock()
         mock_resp.choices = [mock_choice]
 
-        mock_client = AsyncMock()
-        mock_client.chat.completions.create = AsyncMock(return_value=mock_resp)
+        cfg = LLMConfig(model="openrouter/test-model")
 
-        cfg = OpenRouterConfig(api_key="sk-test", model="test-model")
-
-        with patch("event_harvester.analysis.AsyncOpenAI", return_value=mock_client):
-            summary, tasks = await analyse_and_extract_tasks(sample_messages, 7, cfg)
+        with patch(
+            "event_harvester.analysis.completion",
+            return_value=mock_resp,
+        ):
+            summary, tasks = analyse_and_extract_tasks(
+                sample_messages, 7, cfg,
+            )
 
         assert tasks == []
-        assert summary == "not valid json {"  # raw text returned as summary
+        assert summary == "not valid json {"

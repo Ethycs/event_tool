@@ -1,11 +1,11 @@
-"""OpenRouter client — structured task extraction from messages."""
+"""LLM-based task extraction from messages via litellm."""
 
 import json
 import logging
 
-from openai import AsyncOpenAI
+from litellm import completion
 
-from event_harvester.config import OpenRouterConfig
+from event_harvester.config import LLMConfig
 
 logger = logging.getLogger("event_harvester.analysis")
 
@@ -59,10 +59,10 @@ def build_prompt(messages: list[dict], days_back: int) -> str:
     lines = [
         f"Review {len(messages)} messages from the last {days_back} day(s) "
         f"across {len(grouped)} chat(s).\n",
-        "Extract ONLY genuine action items — things someone actually needs to do, "
+        "Extract ONLY genuine action items - things someone actually needs to do, "
         "follow up on, or respond to. Ignore casual chat, announcements with no action, "
         "and already-resolved discussions. Be selective: 3 good tasks beats 10 weak ones.\n",
-        "─── Messages ───\n",
+        "--- Messages ---\n",
     ]
     for chat, msgs in sorted(grouped.items()):
         lines.append(f"### {chat}  ({len(msgs)} messages)")
@@ -74,51 +74,43 @@ def build_prompt(messages: list[dict], days_back: int) -> str:
     return "\n".join(lines)
 
 
-async def analyse_and_extract_tasks(
+def analyse_and_extract_tasks(
     messages: list[dict],
     days_back: int,
-    cfg: OpenRouterConfig,
+    cfg: LLMConfig,
 ) -> tuple[str, list[dict]]:
-    """Send messages to OpenRouter and return (summary, tasks)."""
+    """Send messages to LLM via litellm and return (summary, tasks)."""
     if not cfg.is_configured:
-        logger.warning("OPENROUTER_API_KEY not set — skipping analysis.")
+        logger.warning("LLM not configured - skipping analysis.")
         return "", []
 
-    client = AsyncOpenAI(
-        api_key=cfg.api_key,
-        base_url="https://openrouter.ai/api/v1",
-        default_headers={"X-Title": "event_harvester"},
-    )
+    model = cfg.litellm_model
+    logger.info("Sending %d messages to %s ...", len(messages), model)
 
-    logger.info("Sending %d messages to %s ...", len(messages), cfg.model)
-
-    resp = await client.chat.completions.create(
-        model=cfg.model,
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": "task_extraction",
-                "strict": True,
-                "schema": TASK_SCHEMA,
-            },
-        },
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a personal assistant that reads messaging activity "
-                    "and extracts genuine, actionable tasks. Return valid JSON only."
-                ),
-            },
-            {"role": "user", "content": build_prompt(messages, days_back)},
-        ],
-        max_tokens=2048,
-    )
+    try:
+        resp = completion(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a personal assistant that reads messaging activity "
+                        "and extracts genuine, actionable tasks. Return valid JSON only."
+                    ),
+                },
+                {"role": "user", "content": build_prompt(messages, days_back)},
+            ],
+            max_tokens=2048,
+            response_format={"type": "json_object"},
+        )
+    except Exception as e:
+        logger.error("LLM call failed: %s", e)
+        return "", []
 
     raw = resp.choices[0].message.content
     try:
         data = json.loads(raw)
         return data.get("summary", ""), data.get("tasks", [])
     except json.JSONDecodeError as e:
-        logger.error("Failed to parse OpenRouter JSON response: %s", e)
+        logger.error("Failed to parse LLM JSON response: %s", e)
         return raw, []

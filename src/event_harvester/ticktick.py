@@ -44,7 +44,7 @@ def get_ticktick_client(cfg: TickTickConfig):
 
     if not cfg.is_configured:
         logger.warning(
-            "TickTick: missing credentials — set TICKTICK_CLIENT_ID, "
+            "TickTick: missing credentials - set TICKTICK_CLIENT_ID, "
             "TICKTICK_CLIENT_SECRET, TICKTICK_USERNAME, TICKTICK_PASSWORD"
         )
         return None
@@ -92,7 +92,7 @@ def create_ticktick_tasks(
         if project_id:
             logger.info("Using TickTick project: %s", project_name)
         else:
-            logger.warning("TickTick project '%s' not found — using Inbox", project_name)
+            logger.warning("TickTick project '%s' not found - using Inbox", project_name)
 
     created = []
     now = datetime.now(timezone.utc)
@@ -138,13 +138,13 @@ def create_ticktick_tasks(
             created.append(result)
             new_hashes.add(task_hash)
             print(
-                f"  {GREEN}✓{RESET} {BOLD}{title}{RESET} "
+                f"  {GREEN}+{RESET} {BOLD}{title}{RESET} "
                 f"{DIM}(priority={prio_label}"
                 + (f", due in {due_days}d" if due_days else "")
                 + f"){RESET}"
             )
         except Exception as e:
-            print(f"  {RED}✗ Failed to create '{title}': {e}{RESET}")
+            print(f"  {RED}x Failed to create '{title}': {e}{RESET}")
 
     # Persist dedup hashes
     if new_hashes:

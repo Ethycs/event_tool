@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from telethon import TelegramClient
+from telethon.tl.types import InputMessagesFilterPinned as _PinnedFilter
 from telethon.tl.types import Message
 
 from event_harvester.config import TelegramConfig
@@ -26,6 +27,33 @@ def _should_include_dialog(
     return True
 
 
+def _msg_to_dict(
+    msg: Message, channel_name: str, pinned: bool = False,
+) -> Optional[dict]:
+    """Convert a Telethon Message to our dict format."""
+    if not isinstance(msg, Message):
+        return None
+    if not msg.text:
+        return None
+    msg_date = msg.date.replace(tzinfo=timezone.utc)
+    sender = (
+        getattr(msg.sender, "username", None)
+        or getattr(msg.sender, "first_name", None)
+        or "unknown"
+    ) if msg.sender else "unknown"
+    d = {
+        "platform": "telegram",
+        "id": str(msg.id),
+        "timestamp": msg_date.isoformat(),
+        "author": sender,
+        "channel": channel_name,
+        "content": msg.text,
+    }
+    if pinned:
+        d["pinned"] = True
+    return d
+
+
 async def read_telegram_messages(
     cutoff: datetime,
     cfg: TelegramConfig,
@@ -33,6 +61,7 @@ async def read_telegram_messages(
     channels_allowlist: Optional[list[str]] = None,
     channels_blocklist: Optional[list[str]] = None,
     client: Optional[TelegramClient] = None,
+    include_pinned: bool = True,
 ) -> list[dict]:
     """Read Telegram messages newer than cutoff.
 
@@ -40,7 +69,7 @@ async def read_telegram_messages(
     Otherwise a new client is created and disconnected after use.
     """
     if not cfg.is_configured:
-        logger.info("TELEGRAM_API_ID/HASH not set — skipping.")
+        logger.info("TELEGRAM_API_ID/HASH not set - skipping.")
         return []
 
     own_client = client is None
@@ -49,6 +78,8 @@ async def read_telegram_messages(
         await client.start(phone=cfg.phone or None)
 
     messages: list[dict] = []
+    seen_ids: set[str] = set()
+
     try:
         me = await client.get_me()
         logger.info("Telegram: logged in as @%s", me.username or me.first_name)
@@ -71,6 +102,22 @@ async def read_telegram_messages(
                 logger.debug("Telegram: skipping dialog '%s' (filtered)", name)
                 continue
 
+            # Pinned messages (regardless of cutoff date)
+            if include_pinned:
+                try:
+                    async for msg in client.iter_messages(
+                        dialog.entity, filter=_PinnedFilter,
+                    ):
+                        d = _msg_to_dict(msg, name, pinned=True)
+                        if d and d["id"] not in seen_ids:
+                            seen_ids.add(d["id"])
+                            messages.append(d)
+                except Exception as e:
+                    logger.debug(
+                        "Telegram: pinned msgs for '%s': %s", name, e,
+                    )
+
+            # Recent messages within cutoff
             try:
                 async for msg in client.iter_messages(
                     dialog.entity,
@@ -83,23 +130,10 @@ async def read_telegram_messages(
                     msg_date = msg.date.replace(tzinfo=timezone.utc)
                     if msg_date < cutoff:
                         break
-                    if not msg.text:
-                        continue
-                    sender = (
-                        getattr(msg.sender, "username", None)
-                        or getattr(msg.sender, "first_name", None)
-                        or "unknown"
-                    ) if msg.sender else "unknown"
-                    messages.append(
-                        {
-                            "platform": "telegram",
-                            "id": str(msg.id),
-                            "timestamp": msg_date.isoformat(),
-                            "author": sender,
-                            "channel": name,
-                            "content": msg.text,
-                        }
-                    )
+                    d = _msg_to_dict(msg, name)
+                    if d and d["id"] not in seen_ids:
+                        seen_ids.add(d["id"])
+                        messages.append(d)
             except Exception as e:
                 logger.warning("Telegram: skipping '%s': %s", name, e)
     finally:
@@ -107,9 +141,10 @@ async def read_telegram_messages(
             await client.disconnect()
 
     messages.sort(key=lambda m: m["timestamp"])
+    n_pinned = sum(1 for m in messages if m.get("pinned"))
     logger.info(
-        "Telegram: %d message(s) since %s UTC",
-        len(messages), cutoff.strftime("%Y-%m-%d %H:%M"),
+        "Telegram: %d message(s) (%d pinned) since %s UTC",
+        len(messages), n_pinned, cutoff.strftime("%Y-%m-%d %H:%M"),
     )
     return messages
 

@@ -2,6 +2,7 @@
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -26,13 +27,22 @@ class TelegramConfig:
 
 
 @dataclass
-class OpenRouterConfig:
+class LLMConfig:
+    model: str = "gpt-4o-mini"
     api_key: str = ""
-    model: str = "anthropic/claude-3.5-haiku"
 
     @property
     def is_configured(self) -> bool:
-        return bool(self.api_key)
+        return bool(self.model)
+
+    @property
+    def litellm_model(self) -> str:
+        """Return model string in litellm format.
+
+        litellm uses the model name directly for OpenAI (gpt-4o-mini),
+        and provider/model for others (anthropic/claude-3.5-haiku).
+        """
+        return self.model
 
 
 @dataclass
@@ -50,6 +60,22 @@ class TickTickConfig:
 
 
 @dataclass
+class GmailConfig:
+    credentials_file: str = "credentials.json"
+    token_file: str = "token.json"
+    query: str = "newer_than:7d"
+    max_results: int = 200
+
+    @property
+    def is_configured(self) -> bool:
+        return (
+            Path(self.credentials_file).exists()
+            or bool(os.getenv("GMAIL_CREDENTIALS_JSON"))
+            or bool(os.getenv("GMAIL_TOKEN_JSON"))
+        )
+
+
+@dataclass
 class DiscordConfig:
     cache_path: Optional[str] = None  # env override; auto-detected if None
 
@@ -62,9 +88,14 @@ class DiscordConfig:
 class AppConfig:
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     discord: DiscordConfig = field(default_factory=DiscordConfig)
-    openrouter: OpenRouterConfig = field(default_factory=OpenRouterConfig)
+    gmail: GmailConfig = field(default_factory=GmailConfig)
+    llm: LLMConfig = field(default_factory=LLMConfig)
     ticktick: TickTickConfig = field(default_factory=TickTickConfig)
     days_back: int = 7
+
+    # Obsidian output
+    obsidian_events_dir: str = ""
+    obsidian_recruiters_dir: str = ""
 
     # Filtering
     telegram_channels: list[str] = field(default_factory=list)
@@ -102,9 +133,13 @@ def load_config() -> AppConfig:
         discord=DiscordConfig(
             cache_path=os.getenv("DISCORD_CACHE_PATH"),
         ),
-        openrouter=OpenRouterConfig(
+        gmail=GmailConfig(
+            credentials_file=os.getenv("GMAIL_CREDENTIALS_FILE", "credentials.json"),
+            token_file=os.getenv("GMAIL_TOKEN_FILE", "token.json"),
+        ),
+        llm=LLMConfig(
+            model=os.getenv("LLM_MODEL", "openrouter/anthropic/claude-3.5-haiku"),
             api_key=os.getenv("OPENROUTER_API_KEY", ""),
-            model=os.getenv("OPENROUTER_MODEL", "anthropic/claude-3.5-haiku"),
         ),
         ticktick=TickTickConfig(
             client_id=os.getenv("TICKTICK_CLIENT_ID", ""),
@@ -114,6 +149,8 @@ def load_config() -> AppConfig:
             password=os.getenv("TICKTICK_PASSWORD", ""),
             project=os.getenv("TICKTICK_PROJECT", ""),
         ),
+        obsidian_events_dir=os.getenv("OBSIDIAN_EVENTS_DIR", ""),
+        obsidian_recruiters_dir=os.getenv("OBSIDIAN_RECRUITERS_DIR", ""),
         days_back=days_back,
         telegram_channels=_parse_csv_env("TELEGRAM_CHANNELS"),
         telegram_exclude=_parse_csv_env("TELEGRAM_EXCLUDE"),
@@ -125,6 +162,7 @@ def validate_config(
     *,
     need_telegram: bool = True,
     need_discord: bool = True,
+    need_gmail: bool = True,
     need_analysis: bool = True,
     need_ticktick: bool = True,
 ) -> list[str]:
@@ -133,20 +171,26 @@ def validate_config(
 
     if need_telegram and not cfg.telegram.is_configured:
         warnings.append(
-            "Telegram: TELEGRAM_API_ID and TELEGRAM_API_HASH not set — Telegram will be skipped. "
+            "Telegram: TELEGRAM_API_ID and TELEGRAM_API_HASH not set - Telegram will be skipped. "
             "Get them from https://my.telegram.org"
         )
 
-    if need_analysis and not cfg.openrouter.is_configured:
+    if need_gmail and not cfg.gmail.is_configured:
         warnings.append(
-            "OpenRouter: OPENROUTER_API_KEY not set — analysis will be skipped. "
-            "Get a key from https://openrouter.ai/settings/keys"
+            "Gmail: credentials.json not found - Gmail will be skipped. "
+            "Download it from Google Cloud Console (APIs & Services > Credentials)."
+        )
+
+    if need_analysis and not cfg.llm.is_configured:
+        warnings.append(
+            "LLM: No model configured - analysis will be skipped. "
+            "Set LLM_MODEL and the appropriate API key env var."
         )
 
     if need_ticktick and not cfg.ticktick.is_configured:
         warnings.append(
             "TickTick: Missing one or more of TICKTICK_CLIENT_ID, TICKTICK_CLIENT_SECRET, "
-            "TICKTICK_USERNAME, TICKTICK_PASSWORD — task creation will be skipped."
+            "TICKTICK_USERNAME, TICKTICK_PASSWORD - task creation will be skipped."
         )
 
     return warnings
