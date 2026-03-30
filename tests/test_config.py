@@ -20,7 +20,7 @@ class TestConfigLoading:
             cfg = load_config()
             assert cfg.telegram.api_id == 0
             assert cfg.telegram.session == "harvest_session"
-            assert "claude" in cfg.llm.model
+            assert cfg.llm.model == "gpt-4o-mini"
             assert cfg.days_back == 7
             assert cfg.telegram_channels == []
 
@@ -30,7 +30,7 @@ class TestConfigLoading:
             "TELEGRAM_API_HASH": "abc123",
             "TELEGRAM_PHONE": "+1555",
             "LLM_MODEL": "anthropic/claude-3.5-sonnet",
-            "OPENROUTER_API_KEY": "sk-test",
+            "OPENAI_API_KEY": "sk-test",
             "DAYS_BACK": "14",
             "TELEGRAM_CHANNELS": "chat-a, chat-b",
             "TELEGRAM_EXCLUDE": "spam",

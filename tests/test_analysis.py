@@ -3,7 +3,7 @@
 import json
 from unittest.mock import MagicMock, patch
 
-from event_harvester.analysis import analyse_and_extract_tasks, build_prompt
+from event_harvester.analysis import extract_events_llm, build_prompt
 from event_harvester.config import LLMConfig
 
 
@@ -67,57 +67,38 @@ class TestBuildPrompt:
 class TestAnalyseAndExtractTasks:
     def test_returns_empty_when_not_configured(self):
         cfg = LLMConfig(model="")
-        summary, tasks = analyse_and_extract_tasks([], 7, cfg)
+        summary, tasks = extract_events_llm([], 7, cfg)
         assert summary == ""
         assert tasks == []
 
     def test_parses_valid_response(self, sample_messages):
-        response_data = {
-            "summary": "Test summary",
-            "tasks": [
-                {
-                    "title": "Review auth PR",
-                    "notes": "Discord / 123456, alice asked",
-                    "priority": 3,
-                    "due_in_days": 1,
-                }
-            ],
-        }
-
-        mock_choice = MagicMock()
-        mock_choice.message.content = json.dumps(response_data)
-        mock_resp = MagicMock()
-        mock_resp.choices = [mock_choice]
+        llm_response = "[Event.1]\ntitle = Team Standup\ndate = 2026-04-01\ntime = 10:00\nlocation = online\nlink = TBD\nsource = @alice in #123456\ndetails = Daily standup meeting"
 
         cfg = LLMConfig(model="openrouter/test-model")
 
-        with patch(
-            "event_harvester.analysis.completion",
-            return_value=mock_resp,
-        ):
-            summary, tasks = analyse_and_extract_tasks(
-                sample_messages, 7, cfg,
-            )
+        with patch("event_harvester.classifier.has_trained_models", return_value=False):
+            with patch(
+                "event_harvester.analysis.chat_completion",
+                return_value=llm_response,
+            ):
+                summary, events = extract_events_llm(
+                    sample_messages, 7, cfg,
+                )
 
-        assert summary == "Test summary"
-        assert len(tasks) == 1
-        assert tasks[0]["title"] == "Review auth PR"
+        assert len(events) == 1
+        assert events[0]["title"] == "Team Standup"
+        assert events[0]["date"] == "2026-04-01"
 
-    def test_handles_malformed_json(self, sample_messages):
-        mock_choice = MagicMock()
-        mock_choice.message.content = "not valid json {"
-        mock_resp = MagicMock()
-        mock_resp.choices = [mock_choice]
-
+    def test_handles_no_events(self, sample_messages):
         cfg = LLMConfig(model="openrouter/test-model")
 
-        with patch(
-            "event_harvester.analysis.completion",
-            return_value=mock_resp,
-        ):
-            summary, tasks = analyse_and_extract_tasks(
-                sample_messages, 7, cfg,
-            )
+        with patch("event_harvester.classifier.has_trained_models", return_value=False):
+            with patch(
+                "event_harvester.analysis.chat_completion",
+                return_value="No events found in the messages.",
+            ):
+                summary, events = extract_events_llm(
+                    sample_messages, 7, cfg,
+                )
 
-        assert tasks == []
-        assert summary == "not valid json {"
+        assert events == []

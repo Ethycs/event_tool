@@ -23,6 +23,69 @@ TIME_RE = re.compile(
     r"|\b\d{1,2}(?::\d{2})\s*(?:ET|PT|PST|EST|UTC)\b"
 )
 
+# ── Gate regexes (intentionally loose — for filtering, not parsing) ────────
+
+GATE_DATE_RE = re.compile(
+    r"(?i)(?:"
+    # Month + day (with optional ordinal): "March 25", "April 1st", "dec 3rd"
+    r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2}(?:st|nd|rd|th)?"
+    # Day + month: "25 Jan", "1st April"
+    r"|\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*"
+    # Numeric: "3/25", "12/25/2021"
+    r"|\d{1,2}/\d{1,2}(?:/\d{2,4})?"
+    # ISO: "2026-04-02", "2026-04-02T18:00"
+    r"|\d{4}-\d{2}-\d{2}"
+    # Date ranges: "April 3-5", "March 28-30"
+    r"|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2}\s*[-–]\s*\d{1,2}"
+    # Ordinal alone: "the 15th", "the 3rd"
+    r"|the\s+\d{1,2}(?:st|nd|rd|th)"
+    # Prefix + month + day: "next Mar 21", "this April 5th"
+    r"|(?:next|this)\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2}(?:st|nd|rd|th)?"
+    # Year mentions: "in 2026", "January 2026"
+    r"|(?:in\s+)?20\d{2}"
+    # Relative: today, tonight, tomorrow
+    r"|(?:today|tonight|tomorrow)"
+    # this/next + day/week/weekend/month
+    r"|(?:this|next)\s+(?:week|weekend|month|sunday|monday|tuesday|wednesday|thursday|friday|saturday)"
+    # Bare weekdays
+    r"|(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
+    # Phrases: "this weekend", "end of month", "later today"
+    r"|this\s+weekend|end\s+of\s+(?:month|week)|later\s+today"
+    # "in X hours/days/weeks"
+    r"|in\s+\d+\s+(?:hour|day|week|minute|min)s?"
+    r")"
+)
+
+GATE_TIME_RE = re.compile(
+    r"(?i)(?:"
+    # 12-hour: "4pm", "4:30pm", "4:30 PM"
+    r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b"
+    # Time ranges: "2-6pm", "9:30-11am"
+    r"|\b\d{1,2}(?::\d{2})?\s*[-–]\s*\d{1,2}(?::\d{2})?\s*(?:am|pm)\b"
+    # Timezone (case-insensitive): "7:00 ET", "4:30 pst"
+    r"|\b\d{1,2}:\d{2}\s*(?:et|pt|pst|est|cst|mst|utc|ct|mt|pdt|edt|cdt|mdt)\b"
+    # 24-hour: "18:00", "09:30" (leading zero or 1x/2x hours)
+    r"|\b(?:[01]\d|2[0-3]):[0-5]\d\b"
+    r")"
+)
+
+
+def has_date_or_event_signal(text: str) -> bool:
+    """Fast check: does text contain any date, time, or event-link signal?
+
+    Used as a gate before expensive scoring. Intentionally loose —
+    false positives are fine, false negatives are not.
+    """
+    if GATE_DATE_RE.search(text):
+        return True
+    if GATE_TIME_RE.search(text):
+        return True
+    text_lower = text.lower()
+    if any(domain in text_lower for domain in _EVENT_LINK_DOMAINS):
+        return True
+    return False
+
+
 _SCHEDULING_KEYWORDS = [
     "rsvp", "meeting", "event", "join", "attend", "host",
     "starts", "session", "see you", "cancelled", "canceled",
@@ -100,8 +163,10 @@ def _resolve_date(
     try:
         dt = dateutil_parser.parse(date_str, default=datetime(ref.year, 1, 1))
         resolved = dt.date()
-        # If resolved date is in the past, try next year
-        if resolved < ref - timedelta(days=30):
+        # Only promote to next year if the input didn't have an explicit year
+        # (e.g., "March 25" → try next year, but "2023-10-31" stays 2023)
+        has_explicit_year = bool(re.search(r"\b\d{4}\b", date_str))
+        if not has_explicit_year and resolved < ref - timedelta(days=30):
             resolved = resolved.replace(year=ref.year + 1)
         return resolved
     except (ValueError, OverflowError):
@@ -117,10 +182,10 @@ def _event_proximity_score(
         return 0
     ref = now or date.today()
     days_until = (resolved_date - ref).days
-    if days_until < -1:
+    if days_until < 0:
         return 0  # already passed
-    if days_until <= 0:
-        return 10  # today or yesterday
+    if days_until == 0:
+        return 10  # today
     if days_until <= 3:
         return 9
     if days_until <= 7:
@@ -299,29 +364,36 @@ def prefilter_events(events: list[dict]) -> list[dict]:
     """Layer 1: Structural pre-filter for event candidates.
 
     Keeps events that have strong structural signals:
-    - Has a resolved future date (best_date is set), OR
-    - Has a scheduling keyword + date/time mention, OR
+    - Has a resolved date that is today or in the future, OR
+    - Has a scheduling keyword + date/time mention (no resolved date yet), OR
     - Contains an event platform link (eventbrite, luma, meetup, zoom, etc.)
 
-    Drops events that only have weak signals (bare weekday mention in
-    casual chat, old pinned messages with no future date).
+    Drops events whose resolved date is in the past and events with
+    only weak signals (bare weekday mention in casual chat, etc.).
     """
+    today = date.today()
     passed: list[dict] = []
     for ev in events:
-        has_future_date = ev.get("best_date") is not None
+        best = ev.get("best_date")
         has_sched = ev.get("scheduling", False)
         has_time = bool(ev.get("times"))
         has_date = bool(ev.get("dates"))
         content_lower = ev.get("content", "").lower()
         has_event_link = any(d in content_lower for d in _EVENT_LINK_DOMAINS)
 
-        # Pass if: future date, or scheduling+date/time, or event link
-        if has_future_date:
+        # If we resolved a date, only keep if it's today or future
+        if best is not None:
+            try:
+                resolved = date.fromisoformat(best)
+                if resolved < today:
+                    continue  # past event — drop
+            except ValueError:
+                pass
             passed.append(ev)
         elif has_sched and (has_date or has_time):
             passed.append(ev)
         elif has_event_link:
             passed.append(ev)
-        # else: drop — weak signal (bare "Monday" in casual chat, etc.)
+        # else: drop — weak signal
 
     return passed

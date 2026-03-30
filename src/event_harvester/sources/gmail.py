@@ -202,15 +202,21 @@ def fetch_messages(cfg: GmailConfig, since: datetime) -> list[dict]:
                         break
 
                 content = f"{subject}\n{snippet}" if subject else snippet
+                thread_id = msg.get("threadId", "")
+                is_read = "UNREAD" not in labels
+                is_sent = "SENT" in labels
 
                 messages.append(
                     {
                         "platform": "gmail",
                         "id": ref["id"],
+                        "thread_id": thread_id,
                         "timestamp": timestamp or "",
                         "author": from_addr,
                         "channel": channel,
                         "content": content,
+                        "is_read": is_read,
+                        "is_sent": is_sent,
                     }
                 )
             except Exception as e:
@@ -229,6 +235,38 @@ def fetch_messages(cfg: GmailConfig, since: datetime) -> list[dict]:
         since.strftime("%Y-%m-%d %H:%M"),
     )
     return messages
+
+
+def filter_read_sent(messages: list[dict]) -> list[dict]:
+    """Keep only Gmail messages that still need attention.
+
+    Filters out:
+    - Messages already read (no UNREAD label)
+    - Messages you sent yourself (SENT label)
+
+    Non-Gmail messages pass through unchanged.
+    """
+    result = []
+    n_read = 0
+    n_sent = 0
+    for m in messages:
+        if m.get("platform") != "gmail":
+            result.append(m)
+            continue
+        if m.get("is_sent"):
+            n_sent += 1
+            continue
+        if m.get("is_read"):
+            n_read += 1
+            continue
+        result.append(m)
+
+    if n_read or n_sent:
+        logger.info(
+            "Gmail: filtered %d read + %d sent, %d unread remain.",
+            n_read, n_sent, sum(1 for m in result if m.get("platform") == "gmail"),
+        )
+    return result
 
 
 # ── Full body fetch ─────────────────────────────────────────────────────

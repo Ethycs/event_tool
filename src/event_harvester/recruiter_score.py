@@ -393,7 +393,7 @@ def _llm_refine_borderline(
     cfg: LLMConfig,
 ) -> None:
     """Use LLM to refine scores for borderline recruiter emails (in-place)."""
-    from litellm import completion
+    from event_harvester.llm import chat_completion
 
     msg_map = {m["id"]: m for m in messages}
     items = []
@@ -416,26 +416,44 @@ def _llm_refine_borderline(
         "personalized content, full-time SF roles.\n"
         "Negative: mass-blast templates, staffing firms, contract-only, generic.\n\n"
         f"Emails:\n```json\n{json.dumps(items, indent=2)}\n```\n\n"
-        'Return JSON: {"grades": [{"id": "...", "score": N, "reason": "..."}]}'
+        "Output in INI format:\n\n"
+        "[Grade.message_id_here]\n"
+        "score = 72\n"
+        "reason = Direct meeting request, personalized\n\n"
+        "[Grade.another_id]\n"
+        "score = 18\n"
+        "reason = Body shop template\n\n"
+        "Use the actual message IDs from the emails above."
     )
 
     try:
-        resp = completion(
-            model=cfg.litellm_model,
+        raw = chat_completion(
             messages=[{"role": "user", "content": prompt}],
+            cfg=cfg,
             max_tokens=2048,
-            response_format={"type": "json_object"},
         )
-        data = json.loads(resp.choices[0].message.content)
-        llm_grades = {g["id"]: g for g in data.get("grades", [])}
+        from event_harvester.analysis import _parse_llm_ini
+        sections = _parse_llm_ini(raw)
+        llm_grades = {}
+        for section_name, fields in sections.items():
+            if not section_name.lower().startswith("grade"):
+                continue
+            # Extract ID from "Grade.msg_123"
+            msg_id = section_name.split(".", 1)[-1] if "." in section_name else ""
+            try:
+                score = int(fields.get("score", "50"))
+                reason = fields.get("reason", "")
+                llm_grades[msg_id] = {"score": score, "reason": reason}
+            except ValueError:
+                pass
 
         for grade in grades:
             if grade.message_id in llm_grades:
-                llm = llm_grades[grade.message_id]
-                grade.score = max(0, min(100, llm.get("score", grade.score)))
+                llm_data = llm_grades[grade.message_id]
+                grade.score = max(0, min(100, llm_data.get("score", grade.score)))
                 grade.action = _action_for_score(grade.score)
-                if llm.get("reason"):
-                    grade.reasons.append(f"LLM: {llm['reason']}")
+                if llm_data.get("reason"):
+                    grade.reasons.append(f"LLM: {llm_data['reason']}")
 
         logger.info("LLM refined %d borderline recruiter grades.", len(llm_grades))
     except Exception as e:

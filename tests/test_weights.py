@@ -153,3 +153,83 @@ class TestExtractEvents:
         events = extract_events(msgs, now)
         assert len(events) == 1
         assert "4:00pm" in events[0]["times"]
+
+
+class TestGateSignal:
+    """Test the has_date_or_event_signal() gate function."""
+
+    def test_ordinal_date(self):
+        from event_harvester.weights import has_date_or_event_signal
+        assert has_date_or_event_signal("Party on April 1st")
+        assert has_date_or_event_signal("Meet on the 15th")
+        assert has_date_or_event_signal("March 3rd meetup")
+
+    def test_in_x_time(self):
+        from event_harvester.weights import has_date_or_event_signal
+        assert has_date_or_event_signal("Starting in 2 hours")
+        assert has_date_or_event_signal("Event in 3 days")
+        assert has_date_or_event_signal("Launching in 1 week")
+
+    def test_24_hour_time(self):
+        from event_harvester.weights import has_date_or_event_signal
+        assert has_date_or_event_signal("Starts at 18:00")
+        assert has_date_or_event_signal("Doors open 09:30")
+
+    def test_iso_date(self):
+        from event_harvester.weights import has_date_or_event_signal
+        assert has_date_or_event_signal("Event on 2026-04-02")
+        assert has_date_or_event_signal("2026-04-02T18:00 kickoff")
+
+    def test_time_range(self):
+        from event_harvester.weights import has_date_or_event_signal
+        assert has_date_or_event_signal("Open 2-6pm")
+        assert has_date_or_event_signal("Available 9:30-11am")
+
+    def test_lowercase_timezone(self):
+        from event_harvester.weights import has_date_or_event_signal
+        assert has_date_or_event_signal("Call at 7:00 et")
+        assert has_date_or_event_signal("Doors at 9:00 pst")
+
+    def test_date_range(self):
+        from event_harvester.weights import has_date_or_event_signal
+        assert has_date_or_event_signal("April 3-5 convention")
+        assert has_date_or_event_signal("March 28-30")
+
+    def test_year_mention(self):
+        from event_harvester.weights import has_date_or_event_signal
+        assert has_date_or_event_signal("Coming in 2026")
+        assert has_date_or_event_signal("January 2026")
+
+    def test_phrases(self):
+        from event_harvester.weights import has_date_or_event_signal
+        assert has_date_or_event_signal("This weekend plans")
+        assert has_date_or_event_signal("Later today we meet")
+        assert has_date_or_event_signal("End of month deadline")
+
+    def test_event_links(self):
+        from event_harvester.weights import has_date_or_event_signal
+        assert has_date_or_event_signal("Register: lu.ma/event")
+        assert has_date_or_event_signal("Sign up eventbrite.com/e/123")
+        assert has_date_or_event_signal("Join zoom.us/j/12345")
+
+    def test_prefix_month_day(self):
+        from event_harvester.weights import has_date_or_event_signal
+        assert has_date_or_event_signal("next Mar 21 meetup")
+        assert has_date_or_event_signal("this April 5th")
+        assert has_date_or_event_signal("next January 15")
+
+    def test_existing_patterns_still_work(self):
+        from event_harvester.weights import has_date_or_event_signal
+        assert has_date_or_event_signal("March 25 meetup")
+        assert has_date_or_event_signal("3/25 party")
+        assert has_date_or_event_signal("See you tomorrow")
+        assert has_date_or_event_signal("This Friday drinks")
+        assert has_date_or_event_signal("Next Monday standup")
+        assert has_date_or_event_signal("4:30pm ET")
+
+    def test_no_signal(self):
+        from event_harvester.weights import has_date_or_event_signal
+        assert not has_date_or_event_signal("Nice weather outside")
+        assert not has_date_or_event_signal("Great code review")
+        assert not has_date_or_event_signal("lol that was funny")
+        assert not has_date_or_event_signal("THE MOUSE IS EVIL")

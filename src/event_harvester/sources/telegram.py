@@ -102,16 +102,20 @@ async def read_telegram_messages(
                 logger.debug("Telegram: skipping dialog '%s' (filtered)", name)
                 continue
 
-            # Pinned messages (regardless of cutoff date)
+            # Pinned messages (regardless of cutoff date, last 10 per channel)
             if include_pinned:
+                pinned_count = 0
                 try:
                     async for msg in client.iter_messages(
                         dialog.entity, filter=_PinnedFilter,
                     ):
+                        if pinned_count >= 10:
+                            break
                         d = _msg_to_dict(msg, name, pinned=True)
                         if d and d["id"] not in seen_ids:
                             seen_ids.add(d["id"])
                             messages.append(d)
+                            pinned_count += 1
                 except Exception as e:
                     logger.debug(
                         "Telegram: pinned msgs for '%s': %s", name, e,

@@ -5,21 +5,26 @@ import asyncio
 import json
 import logging
 import sys
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-from event_harvester.analysis import PRIORITY_LABEL, analyse_and_extract_tasks
+from event_harvester.analysis import extract_events_llm
 from event_harvester.config import LLMConfig, load_config, validate_config
-from event_harvester.display import BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW, print_message
-from event_harvester.llm_filter import validate_events
+from event_harvester.display import (
+    BOLD,
+    DIM,
+    GREEN,
+    RED,
+    RESET,
+    print_links,
+    print_message,
+    print_recruiter_grades,
+)
 from event_harvester.report import generate_report
-from event_harvester.sources.discord import read_discord_messages
-from event_harvester.sources.gmail import fetch_messages as fetch_gmail_messages
-from event_harvester.sources.telegram import read_telegram_messages
+from event_harvester.sources.gmail import filter_read_sent
 from event_harvester.ticktick import create_ticktick_tasks, get_ticktick_client
 from event_harvester.watch import watch_mode
-from event_harvester.weights import extract_events, extract_links, prefilter_events
+from event_harvester.weights import extract_links
 
 logger = logging.getLogger("event_harvester")
 
@@ -35,167 +40,6 @@ def _setup_logging(verbose: bool) -> None:
         format="  %(message)s",
         handlers=[logging.StreamHandler(sys.stderr)],
     )
-
-
-def _print_links(links: list[dict], max_links: int = 15) -> None:
-    """Print weighted links section."""
-    W = 64
-    if not links:
-        return
-    print(f"{'=' * W}")
-    print(f"  {BOLD}Links{RESET}  {DIM}(recency x type){RESET}")
-    print(f"{'=' * W}\n")
-    for i, lnk in enumerate(links[:max_links], 1):
-        score_color = GREEN if lnk["score"] >= 8 else YELLOW if lnk["score"] >= 5 else DIM
-        pin_tag = f" {YELLOW}[PIN]{RESET}" if lnk.get("pinned") else ""
-        print(
-            f"  {score_color}{lnk['score']:4.1f}{RESET}{pin_tag}  "
-            f"{lnk['url'][:90]}"
-        )
-        ctx = lnk["context"].strip()
-        url_only = ctx == lnk["url"][:120].strip()
-        meta = f"@{lnk['author']} {DIM}{lnk['timestamp']}{RESET}"
-        if not url_only and ctx:
-            ctx_short = ctx[:80]
-            if ctx_short != ctx:
-                ctx_short += "..."
-            print(f"         {DIM}\"{ctx_short}\"{RESET}")
-            print(f"         {meta}")
-        else:
-            print(f"         {meta}")
-        print()
-
-
-def _print_validated_events(events: list[dict], max_events: int = 20) -> None:
-    """Print LLM-validated events."""
-    W = 64
-    if not events:
-        print(f"{DIM}No validated events.{RESET}\n")
-        return
-    print(f"{'=' * W}")
-    print(f"  {BOLD}Validated Events{RESET}  {DIM}(LLM-filtered){RESET}")
-    print(f"{'=' * W}\n")
-    for i, evt in enumerate(events[:max_events], 1):
-        pin_tag = f" {YELLOW}[PIN]{RESET}" if evt.get("pinned") else ""
-        score = evt.get("score", 0)
-        score_color = GREEN if score >= 10 else YELLOW if score >= 6 else DIM
-
-        title = evt.get("title", "Untitled")
-        date = evt.get("date") or "TBD"
-        source = evt.get("source", "?")
-        author = evt.get("author", "?")
-        details = evt.get("details", "")
-
-        print(
-            f"  {score_color}{score:2}{RESET}{pin_tag}  "
-            f"{BOLD}{title}{RESET}"
-        )
-        print(f"         {CYAN}{date}{RESET} in {source} (@{author})")
-        if details:
-            print(f"         {DIM}{details[:120]}{RESET}")
-        print()
-
-
-def _print_raw_events(events: list[dict], max_events: int = 15) -> None:
-    """Print raw weighted events (fallback when LLM is unavailable)."""
-    W = 64
-    if not events:
-        return
-    print(f"{'=' * W}")
-    print(f"  {BOLD}Events & Dates{RESET}  {DIM}(recency + scheduling){RESET}")
-    print(f"{'=' * W}\n")
-    for i, evt in enumerate(events[:max_events], 1):
-        sched_tag = f" {CYAN}[SCHED]{RESET}" if evt["scheduling"] else ""
-        pin_tag = f" {YELLOW}[PIN]{RESET}" if evt.get("pinned") else ""
-        score_color = GREEN if evt["score"] >= 10 else YELLOW if evt["score"] >= 6 else DIM
-        print(
-            f"  {score_color}{evt['score']:2d}{RESET}{sched_tag}{pin_tag}  "
-            f"@{evt['author']} {DIM}{evt['timestamp']}{RESET}"
-        )
-        dates_str = ", ".join(evt["dates"])
-        times_str = ", ".join(evt["times"])
-        refs = []
-        if dates_str:
-            refs.append(f"dates=[{dates_str}]")
-        if times_str:
-            refs.append(f"times=[{times_str}]")
-        if refs:
-            print(f"         {BOLD}{' '.join(refs)}{RESET}")
-        content = evt["content"][:120]
-        if content != evt["content"][:200]:
-            content += "..."
-        print(f"         {DIM}\"{content}\"{RESET}")
-        print()
-
-
-def _print_weighted_analysis(
-    messages: list[dict],
-    llm_cfg: Optional["LLMConfig"] = None,
-    max_links: int = 15,
-    max_events: int = 20,
-) -> tuple[list[dict], list[dict], list[dict]]:
-    """Extract, weight, validate, and print links and events.
-
-    Returns (validated_or_raw_events, raw_events, links).
-    """
-    links = extract_links(messages)
-    events = extract_events(messages)
-    validated: list[dict] = []
-
-    _print_links(links, max_links)
-
-    if events:
-        # Layer 1: Structural pre-filter (future date, scheduling+date, event link)
-        candidates = prefilter_events(events)
-        logger.info(
-            "Layer 1 (structural): %d / %d events passed pre-filter.",
-            len(candidates), len(events),
-        )
-
-        if not candidates:
-            # Nothing passed structural filter — show raw events
-            _print_raw_events(events, max_events)
-        else:
-            # Layer 2: LLM validation — is it actually an event?
-            validated = validate_events(candidates[:max_events], cfg=llm_cfg)
-
-            if validated and isinstance(validated[0], dict) and "title" in validated[0]:
-                _print_validated_events(validated, max_events)
-            else:
-                validated = []
-                _print_raw_events(candidates, max_events)
-
-    if not links and not events:
-        print(f"{DIM}No links or date references found.{RESET}\n")
-
-    return validated, events, links
-
-
-def _print_recruiter_grades(grades: list, max_items: int = 30) -> None:
-    """Print graded recruiter emails with color-coded scores."""
-    W = 64
-    print(f"{'=' * W}")
-    print(f"  {BOLD}Recruiter Email Grades{RESET}  {DIM}(0-100){RESET}")
-    print(f"{'=' * W}\n")
-
-    for grade in grades[:max_items]:
-        if grade.score >= 66:
-            color, tag = GREEN, "[RESPOND]"
-        elif grade.score >= 46:
-            color, tag = YELLOW, "[REVIEW] "
-        elif grade.score >= 21:
-            color, tag = DIM, "[IGNORE] "
-        else:
-            color, tag = RED, "[TRASH]  "
-
-        print(
-            f"  {color}{grade.score:3d}{RESET} {color}{tag}{RESET}  "
-            f"{BOLD}{grade.subject[:60]}{RESET}"
-        )
-        print(f"       From: {grade.sender[:50]}")
-        for reason in grade.reasons[:3]:
-            print(f"       {DIM}- {reason}{RESET}")
-        print()
 
 
 def _run_recruiter_grading(all_messages, cfg, args) -> list:
@@ -218,7 +62,7 @@ def _run_recruiter_grading(all_messages, cfg, args) -> list:
         bodies=bodies,
         llm_cfg=cfg.llm if not args.no_analysis else None,
     )
-    _print_recruiter_grades(grades)
+    print_recruiter_grades(grades)
 
     # Auto-trash
     if args.auto_trash:
@@ -237,7 +81,7 @@ def _run_recruiter_grading(all_messages, cfg, args) -> list:
     return grades
 
 
-async def main() -> None:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Harvest Discord + Telegram messages, extract tasks "
@@ -305,10 +149,34 @@ async def main() -> None:
         help="Interactively act on a recruiter report (open/reply/trash)",
     )
     parser.add_argument(
+        "--train-classifier", action="store_true",
+        help="Label messages with LLM and train a local binary classifier",
+    )
+    parser.add_argument(
+        "--save-labels", metavar="FILE",
+        help="Save labeled data as JSON for review/correction",
+    )
+    parser.add_argument(
+        "--load-labels", metavar="FILE",
+        help="Train classifier from previously saved/corrected labels JSON",
+    )
+    parser.add_argument(
+        "--eval-classifier", action="store_true",
+        help="Evaluate classifier accuracy on post-filter messages using LLM as ground truth",
+    )
+    parser.add_argument(
+        "--save-eval", metavar="DIR",
+        help="Save eval samples to DIR for manual review (500 per stage)",
+    )
+    parser.add_argument(
         "-v", "--verbose", action="store_true",
         help="Enable debug logging",
     )
-    args = parser.parse_args()
+    return parser
+
+
+async def main() -> None:
+    args = _build_parser().parse_args()
 
     _setup_logging(args.verbose)
 
@@ -340,48 +208,29 @@ async def main() -> None:
         await watch_mode(cfg, args.interval, args.no_telegram, args.no_discord)
         return
 
+    # ── Eval classifier from saved labels (no fetching needed) ─────────────
+    if args.eval_classifier and args.load_labels:
+        from event_harvester.eval_classifier import run_eval
+
+        run_eval(args.load_labels, save_eval=args.save_eval)
+        return
+
     # ── One-shot mode ───────────────────────────────────────────────────────
-    cutoff = datetime.now(timezone.utc) - timedelta(days=cfg.days_back)
+    from event_harvester.harvest import harvest_messages, save_messages
+
     W = 64
     print(f"\n{'=' * W}")
     print(f"  Event Harvester - last {cfg.days_back} day(s)")
     print(f"{'=' * W}\n")
 
-    all_messages: list[dict] = []
-
-    if args.load:
-        # Load from previously saved JSON
-        try:
-            all_messages = json.loads(Path(args.load).read_text())
-            logger.info("Loaded %d messages from %s", len(all_messages), args.load)
-        except Exception as e:
-            logger.error("Failed to load %s: %s", args.load, e)
-            return
-    else:
-        # Harvest from sources
-        if not args.no_discord:
-            print("[ Discord ]")
-            all_messages.extend(
-                read_discord_messages(cutoff, override_path=cfg.discord.cache_path)
-            )
-            print()
-
-        if not args.no_telegram:
-            print("[ Telegram ]")
-            all_messages.extend(
-                await read_telegram_messages(
-                    cutoff,
-                    cfg.telegram,
-                    channels_allowlist=cfg.telegram_channels,
-                    channels_blocklist=cfg.telegram_exclude,
-                )
-            )
-            print()
-
-        if not args.no_gmail:
-            print("[ Gmail ]")
-            all_messages.extend(fetch_gmail_messages(cfg.gmail, cutoff))
-            print()
+    all_messages = await harvest_messages(
+        cfg,
+        load_path=args.load,
+        no_discord=args.no_discord,
+        no_telegram=args.no_telegram,
+        no_gmail=args.no_gmail,
+        skip_cache=bool(args.save),
+    )
 
     if not all_messages:
         print("No messages found. Check credentials / cache and try again.")
@@ -400,44 +249,63 @@ async def main() -> None:
     )
 
     if args.save:
-        Path(args.save).write_text(
-            json.dumps(all_messages, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        print(f"Raw messages saved -> {args.save}\n")
+        save_messages(all_messages, args.save)
 
-    # ── Local weighted analysis ─────────────────────────────────────────────
-    validated, raw_events, links = _print_weighted_analysis(
-        all_messages, llm_cfg=cfg.llm,
-    )
+    # ── Train classifier (skip if eval mode) ────────────────────────────────
+    if (args.train_classifier or args.load_labels) and not args.eval_classifier:
+        from event_harvester.classifier import train as train_classifier
+
+        if args.load_labels:
+            # Train from previously saved labels
+            try:
+                labeled = json.loads(Path(args.load_labels).read_text(encoding="utf-8"))
+                print(f"Loaded {len(labeled)} labeled messages from {args.load_labels}")
+            except Exception as e:
+                logger.error("Failed to load labels: %s", e)
+                return
+        else:
+            # Label with LLM then train
+            from event_harvester.label import label_messages
+
+            print(f"\n{'=' * W}")
+            print("[ Labeling messages with LLM ]")
+            print(f"{'=' * W}\n")
+
+            labeled = label_messages(all_messages, cfg.llm)
+
+        # Optionally save labels for review
+        if args.save_labels:
+            Path(args.save_labels).write_text(
+                json.dumps(labeled, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            print(f"Labels saved -> {args.save_labels}\n")
+
+        # Train the classifier
+        msgs_for_train = [{k: v for k, v in m.items() if k != "label"} for m in labeled]
+        labels_for_train = [m["label"] for m in labeled]
+
+        print(f"\n{'=' * W}")
+        print("[ Training classifier ]")
+        print(f"{'=' * W}\n")
+
+        train_classifier(msgs_for_train, labels_for_train)
+        return
+
+    # ── Filter out already-read/sent Gmail messages for LLM steps ──────────
+    actionable = filter_read_sent(all_messages)
+    n_filtered = len(all_messages) - len(actionable)
+    if n_filtered:
+        print(
+            f"{DIM}Filtered {n_filtered} read/sent messages, "
+            f"{len(actionable)} remain for analysis.{RESET}\n"
+        )
+
+    # ── Extract links ──────────────────────────────────────────────────────
+    links = extract_links(actionable)
+    print_links(links)
 
     source_counts = {"discord": n_d, "telegram": n_t, "gmail": n_g}
-
-    # ── Markdown report ──────────────────────────────────────────────────────
-    if args.report:
-        report_path = generate_report(
-            validated_events=validated,
-            raw_events=raw_events,
-            links=links,
-            source_counts=source_counts,
-            total_messages=len(all_messages),
-            output_path=args.report,
-        )
-        print(f"Report saved -> {report_path}\n")
-
-    # ── Obsidian events report ────────────────────────────────────────────────
-    if args.obsidian and cfg.obsidian_events_dir:
-        from event_harvester.obsidian import write_events_report
-
-        path = write_events_report(
-            validated_events=validated,
-            raw_events=raw_events,
-            links=links,
-            source_counts=source_counts,
-            total_messages=len(all_messages),
-            output_dir=cfg.obsidian_events_dir,
-        )
-        print(f"Obsidian events -> {path}\n")
 
     # ── Recruiter email grading ──────────────────────────────────────────────
     grades = []
@@ -451,39 +319,99 @@ async def main() -> None:
         path = write_recruiter_report(grades, cfg.obsidian_recruiters_dir)
         print(f"Obsidian recruiters -> {path}\n")
 
-    # ── OpenRouter analysis + task extraction ───────────────────────────────
+    # ── LLM event extraction (unified path: classifier → reranker → LLM) ──
     if args.no_analysis:
         return
 
     print(f"{'=' * W}")
-    print("[ OpenRouter - extracting action items ]")
+    print("[ LLM - extracting events ]")
     print(f"{'=' * W}\n")
 
-    summary, tasks = analyse_and_extract_tasks(all_messages, cfg.days_back, cfg.llm)
+    summary, events = extract_events_llm(actionable, cfg.days_back, cfg.llm)
 
-    if summary:
-        print(f"\n{BOLD}Summary{RESET}")
-        print(f"{DIM}{summary}{RESET}\n")
-
-    if not tasks:
-        print("No action items extracted.")
+    if not events:
+        print("No events extracted.")
         return
 
-    print(f"\n{BOLD}Suggested tasks ({len(tasks)}){RESET}")
-    for i, t in enumerate(tasks, 1):
-        prio = PRIORITY_LABEL.get(t.get("priority", 0), "none")
-        due = f"  due in {t['due_in_days']}d" if t.get("due_in_days") else ""
-        title = t.get("title") or t.get("name") or t.get("task", "Untitled")
-        notes = t.get("notes") or t.get("description", "")
-        print(f"  {i}. {BOLD}{title}{RESET}{DIM}  [{prio}]{due}{RESET}")
-        print(f"     {DIM}{notes}{RESET}")
+    # Check which events are already fingerprinted (in TickTick)
+    from event_harvester.event_match import find_fingerprint
 
-    # ── TickTick task creation ──────────────────────────────────────────────
+    print(f"\n{BOLD}Events ({len(events)}){RESET}")
+    for i, t in enumerate(events, 1):
+        title = t.get("title") or "Untitled"
+        date_str = t.get("date") or ""
+        time_str = t.get("time") or ""
+        location = t.get("location") or ""
+        source = t.get("source") or ""
+        notes = t.get("notes") or ""
+
+        fp = find_fingerprint(t)
+        status = "in TickTick" if fp else "new"
+
+        print(f"  [{i}] {BOLD}{title}{RESET} {DIM}({status}){RESET}")
+        if date_str:
+            print(f"     date: {date_str}")
+        if time_str:
+            print(f"     time: {time_str}")
+        if location:
+            print(f"     location: {location}")
+        if notes:
+            print(f"     {DIM}details: {notes}{RESET}")
+        if source:
+            print(f"     {DIM}source: {source}{RESET}")
+        print()
+
+    # ── Reports (use LLM-extracted events) ────────────────────────────────
+    validated_events = []
+    for t in events:
+        source = t.get("source", "")
+        # Strip leading @ from source to avoid double-@ in report
+        author = source.split(" in ")[0].strip().lstrip("@") if " in " in source else ""
+        channel = source.split(" in ")[1].strip().lstrip("#") if " in " in source else ""
+
+        validated_events.append({
+            "title": t.get("title", "Untitled"),
+            "date": t.get("date"),
+            "time": t.get("time"),
+            "location": t.get("location"),
+            "link": t.get("link"),
+            "details": t.get("notes", ""),
+            "score": t.get("priority", 3),
+            "source": source,
+            "author": author,
+            "channel": channel,
+        })
+
+    if args.report:
+        report_path = generate_report(
+            validated_events=validated_events,
+            raw_events=[],
+            links=links,
+            source_counts=source_counts,
+            total_messages=len(all_messages),
+            output_path=args.report,
+        )
+        print(f"\nReport saved -> {report_path}\n")
+
+    if args.obsidian and cfg.obsidian_events_dir:
+        from event_harvester.obsidian import write_events_report
+
+        path = write_events_report(
+            validated_events=validated_events,
+            raw_events=[],
+            links=links,
+            source_counts=source_counts,
+            total_messages=len(all_messages),
+            output_dir=cfg.obsidian_events_dir,
+        )
+        print(f"Obsidian events -> {path}\n")
+
+    # ── TickTick event sync ─────────────────────────────────────────────────
     if args.no_ticktick:
         return
 
     print(f"\n{'=' * W}")
-    mode_label = "[ TickTick - dry run ]" if args.dry_run else "[ TickTick - creating tasks ]"
+    mode_label = "[ TickTick - dry run ]" if args.dry_run else "[ TickTick - syncing events ]"
     print(mode_label)
     print(f"{'=' * W}\n")
 
@@ -491,12 +419,19 @@ async def main() -> None:
     if tt is None:
         return
 
-    created = create_ticktick_tasks(
-        tt, tasks, project_name=cfg.ticktick.project, dry_run=args.dry_run,
+    result = create_ticktick_tasks(
+        tt, events, project_name=cfg.ticktick.project, dry_run=args.dry_run,
     )
 
-    if not args.dry_run:
-        print(f"\n{GREEN}{BOLD}{len(created)} task(s) created in TickTick.{RESET}\n")
+    n_created = len(result["created"])
+    n_updated = len(result["updated"])
+    n_skipped = len(result["skipped"])
+    print(
+        f"\n{BOLD}Summary:{RESET} "
+        f"{GREEN}{n_created} created{RESET}, "
+        f"{n_updated} updated, "
+        f"{DIM}{n_skipped} skipped{RESET}\n"
+    )
 
 
 def main_sync() -> None:
@@ -505,6 +440,9 @@ def main_sync() -> None:
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nStopped.")
+    finally:
+        from event_harvester.llm import shutdown_local
+        shutdown_local()
 
 
 if __name__ == "__main__":

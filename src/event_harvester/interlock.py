@@ -75,11 +75,13 @@ class RyzenSession:
         device: str = "npu",
         cache_dir: Path | str = "agent/cache",
         cache_key: str | None = None,
+        tokenizer_path: Path | str | None = None,
     ) -> None:
         self.model_path = Path(model_path).resolve()
         self.device = device
         self.cache_dir = Path(cache_dir).resolve()
         self.cache_key = cache_key
+        self.tokenizer_path = str(Path(tokenizer_path).resolve()) if tokenizer_path else None
 
         self._proc: subprocess.Popen[str] | None = None
         self._io_dir: Path | None = None
@@ -90,12 +92,15 @@ class RyzenSession:
     # -- context manager -----------------------------------------------------
 
     def __enter__(self) -> "RyzenSession":
-        if not self.model_path.is_file():
+        if not self.model_path.exists():
             raise FileNotFoundError(f"Model not found: {self.model_path}")
 
-        # Compute cache key lazily.
+        # Compute cache key lazily (skip for directories / OGA models).
         if self.cache_key is None:
-            self.cache_key = _model_cache_key(self.model_path)
+            if self.model_path.is_file():
+                self.cache_key = _model_cache_key(self.model_path)
+            else:
+                self.cache_key = self.model_path.name
 
         # Create a temp directory for .npy exchange.
         self._io_dir = Path(tempfile.mkdtemp(prefix="ryzenai_io_"))
@@ -112,16 +117,17 @@ class RyzenSession:
         )
 
         # Send init command.
-        self._send(
-            {
-                "cmd": "init",
-                "model_path": str(self.model_path),
-                "device": self.device,
-                "cache_dir": str(self.cache_dir),
-                "cache_key": self.cache_key,
-                "io_dir": str(self._io_dir),
-            }
-        )
+        init_msg: dict[str, Any] = {
+            "cmd": "init",
+            "model_path": str(self.model_path),
+            "device": self.device,
+            "cache_dir": str(self.cache_dir),
+            "cache_key": self.cache_key,
+            "io_dir": str(self._io_dir),
+        }
+        if self.tokenizer_path:
+            init_msg["tokenizer_path"] = self.tokenizer_path
+        self._send(init_msg)
 
         # Wait for ready.
         resp = self._recv()
@@ -181,6 +187,42 @@ class RyzenSession:
 
         result["_elapsed_s"] = np.float64(resp.get("elapsed_s", 0.0))
         return result
+
+    def generate(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int = 2048,
+        temperature: float = 0.0,
+    ) -> dict[str, Any]:
+        """Run autoregressive text generation with chat messages.
+
+        ``messages`` uses the OpenAI chat format::
+
+            [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}]
+
+        Returns a dict with keys: ``text``, ``elapsed_s``, ``tokens_generated``.
+        Requires ``tokenizer_path`` to have been set during init.
+        """
+        if self._proc is None or self._proc.poll() is not None:
+            raise InterlockError("Worker process is not running.")
+
+        self._send({
+            "cmd": "generate",
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        })
+        resp = self._recv()
+
+        if resp.get("status") != "ok":
+            raise InterlockError(f"Generation failed: {resp.get('error', 'unknown')}")
+
+        return {
+            "text": resp["text"],
+            "elapsed_s": resp.get("elapsed_s", 0.0),
+            "tokens_generated": resp.get("tokens_generated", 0),
+        }
 
     def get_providers(self) -> list[str]:
         """Return the ONNX Runtime execution providers reported by the worker."""

@@ -30,10 +30,26 @@ class TelegramConfig:
 class LLMConfig:
     model: str = "gpt-4o-mini"
     api_key: str = ""
+    backend: str = "litellm"  # "litellm" or "local"
+
+    # Local backend settings (used when backend="local")
+    model_path: str = ""  # path to .onnx model
+    tokenizer_path: str = ""  # path to tokenizer directory (HF format)
+    device: str = "npu"  # "npu", "gpu", or "cpu"
 
     @property
     def is_configured(self) -> bool:
+        if self.backend == "local":
+            return bool(self.model_path)
         return bool(self.model)
+
+    @property
+    def display_name(self) -> str:
+        """Human-readable model name for logging."""
+        if self.backend == "local":
+            from pathlib import Path
+            return Path(self.model_path).name or self.model_path
+        return self.model
 
     @property
     def litellm_model(self) -> str:
@@ -138,8 +154,12 @@ def load_config() -> AppConfig:
             token_file=os.getenv("GMAIL_TOKEN_FILE", "token.json"),
         ),
         llm=LLMConfig(
-            model=os.getenv("LLM_MODEL", "openrouter/anthropic/claude-3.5-haiku"),
-            api_key=os.getenv("OPENROUTER_API_KEY", ""),
+            model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
+            api_key=os.getenv("OPENAI_API_KEY", ""),
+            backend=os.getenv("LLM_BACKEND", "litellm"),
+            model_path=os.getenv("LLM_MODEL_PATH", ""),
+            tokenizer_path=os.getenv("LLM_TOKENIZER_PATH", ""),
+            device=os.getenv("LLM_DEVICE", "npu"),
         ),
         ticktick=TickTickConfig(
             client_id=os.getenv("TICKTICK_CLIENT_ID", ""),

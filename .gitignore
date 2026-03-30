@@ -34,6 +34,20 @@ Thumbs.db
 *.bak
 .pytest_cache/
 
+# Message cache and watermarks
+.message_cache.json
+data/.message_cache.json
+data/.watermarks.json
+data/.event_fingerprints.json
+
+# Trained classifier models
+classifiers/*.pkl
+
+# Data artifacts
+data/*.json
+data/eval_samples/
+data/.message_cache.json
+
 # pixi environments
 .pixi
 *.egg-info

@@ -1,6 +1,5 @@
 """TickTick OAuth2 authentication and task creation."""
 
-import hashlib
 import json
 import logging
 from datetime import datetime, timedelta, timezone
@@ -10,31 +9,9 @@ from typing import Optional
 from event_harvester.analysis import PRIORITY_LABEL
 from event_harvester.config import TickTickConfig
 from event_harvester.display import BOLD, DIM, GREEN, RED, RESET
+from event_harvester.event_match import save_fingerprint
 
 logger = logging.getLogger("event_harvester.ticktick")
-
-_DEDUP_FILE = Path.home() / ".event_harvester" / "created_tasks.json"
-
-
-def _load_created_hashes() -> set[str]:
-    """Load previously created task title hashes."""
-    if not _DEDUP_FILE.exists():
-        return set()
-    try:
-        data = json.loads(_DEDUP_FILE.read_text())
-        return set(data)
-    except Exception:
-        return set()
-
-
-def _save_created_hashes(hashes: set[str]) -> None:
-    """Persist created task title hashes."""
-    _DEDUP_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _DEDUP_FILE.write_text(json.dumps(sorted(hashes)))
-
-
-def _hash_task(title: str) -> str:
-    return hashlib.sha256(title.strip().lower().encode()).hexdigest()[:16]
 
 
 def get_ticktick_client(cfg: TickTickConfig):
@@ -71,21 +48,94 @@ def _find_project_id(tt, name: str) -> Optional[str]:
     return None
 
 
-def create_ticktick_tasks(
-    tt,
-    tasks: list[dict],
-    project_name: str = "",
-    dry_run: bool = False,
-) -> list[dict]:
-    """Create tasks in TickTick. Returns list of created/proposed task dicts."""
-    if not tasks:
+def sync_tasks(tt, project_name: str = "") -> list[dict]:
+    """Sync TickTick state and return existing tasks from the target project."""
+    try:
+        tt.sync()
+    except Exception as e:
+        logger.warning("TickTick sync failed: %s", e)
         return []
 
-    # Load dedup hashes
-    existing_hashes = _load_created_hashes()
-    new_hashes: set[str] = set()
+    project_id = None
+    if project_name:
+        project_id = _find_project_id(tt, project_name)
 
-    # Resolve optional target project
+    tasks = tt.state.get("tasks", [])
+    if project_id:
+        tasks = [t for t in tasks if t.get("projectId") == project_id]
+
+    logger.info("TickTick: synced %d existing tasks.", len(tasks))
+    return tasks
+
+
+def update_task_details(tt, task: dict, new_event: dict) -> dict | None:
+    """Merge new event details into an existing TickTick task."""
+    existing_content = task.get("content") or ""
+
+    # Build new info to append
+    new_parts = []
+    for field in ("notes", "link", "location", "time"):
+        val = new_event.get(field)
+        if val and val.lower() not in existing_content.lower():
+            new_parts.append(val)
+
+    source = new_event.get("source", "")
+    if source:
+        new_parts.append(f"(via {source})")
+
+    if not new_parts:
+        return None
+
+    # Append with separator
+    separator = "\n---\n" if existing_content else ""
+    task["content"] = existing_content + separator + " | ".join(new_parts)
+
+    # Update due date if existing has none
+    if not task.get("dueDate") and new_event.get("date"):
+        try:
+            from dateutil import parser as dateutil_parser
+            dt = dateutil_parser.parse(new_event["date"])
+            task["dueDate"] = dt.strftime("%Y-%m-%dT%H:%M:%S+0000")
+        except (ValueError, OverflowError):
+            pass
+
+    # Keep higher priority
+    new_prio = new_event.get("priority", 0)
+    if new_prio > (task.get("priority") or 0):
+        task["priority"] = new_prio
+
+    try:
+        result = tt.task.update(task)
+        return result
+    except Exception as e:
+        logger.error("Failed to update task '%s': %s", task.get("title"), e)
+        return None
+
+
+def create_ticktick_tasks(
+    tt,
+    events: list[dict],
+    project_name: str = "",
+    dry_run: bool = False,
+) -> dict[str, list]:
+    """Create/update/skip events in TickTick with dedup.
+
+    Returns {"created": [...], "updated": [...], "skipped": [...]}.
+    """
+    if not events:
+        return {"created": [], "updated": [], "skipped": []}
+
+    # Sync existing tasks for dedup
+    existing_tasks = sync_tasks(tt, project_name)
+
+    # Run dedup if we have existing tasks
+    if existing_tasks:
+        from event_harvester.dedup import dedup_events_against_ticktick
+        to_create, to_update, to_skip = dedup_events_against_ticktick(events, existing_tasks)
+    else:
+        to_create, to_update, to_skip = events, [], []
+
+    # Resolve project
     project_id = None
     if project_name:
         project_id = _find_project_id(tt, project_name)
@@ -94,36 +144,55 @@ def create_ticktick_tasks(
         else:
             logger.warning("TickTick project '%s' not found - using Inbox", project_name)
 
-    created = []
-    now = datetime.now(timezone.utc)
+    result = {"created": [], "updated": [], "skipped": [t.get("title", "") for t in to_skip]}
 
-    for task in tasks:
-        title = task.get("title", "Untitled task")[:80]
-        notes = task.get("notes", "")
-        priority = task.get("priority", 0)
-        due_days = task.get("due_in_days")
+    # Log skips
+    for event in to_skip:
+        logger.info("Skipping (fingerprint match): %s", event.get("title", "Untitled"))
+        print(f"  {DIM}= {event.get('title', 'Untitled')} (already tracked){RESET}")
 
-        # Deduplication check
-        task_hash = _hash_task(title)
-        if task_hash in existing_hashes:
-            logger.info("Skipping duplicate task: %s", title)
+    # Handle updates
+    for event, matched_task in to_update:
+        title = matched_task.get("title", "Untitled")
+        if dry_run:
+            print(f"  {DIM}[dry-run] ~ {title} (would merge new details){RESET}")
+            result["updated"].append(title)
             continue
 
+        updated = update_task_details(tt, matched_task, event)
+        if updated:
+            save_fingerprint(event, matched_task.get("id"))
+            print(f"  {GREEN}~{RESET} {BOLD}{title}{RESET} {DIM}(merged new details){RESET}")
+            result["updated"].append(title)
+        else:
+            print(f"  {DIM}= {title} (nothing new to merge){RESET}")
+            result["skipped"].append(title)
+
+    # Handle creates
+    now = datetime.now(timezone.utc)
+    for event in to_create:
+        title = event.get("title", "Untitled")[:80]
+        notes = event.get("notes", "")
+        priority = event.get("priority", 0)
+
+        # Build due date from event date field
         due_date = None
-        if due_days is not None:
-            due_date = (now + timedelta(days=due_days)).strftime("%Y-%m-%dT%H:%M:%S+0000")
+        if event.get("date"):
+            try:
+                from dateutil import parser as dateutil_parser
+                dt = dateutil_parser.parse(event["date"])
+                due_date = dt.strftime("%Y-%m-%dT%H:%M:%S+0000")
+            except (ValueError, OverflowError):
+                pass
 
         prio_label = PRIORITY_LABEL.get(priority, "none")
 
         if dry_run:
             print(
-                f"  {DIM}[dry-run]{RESET} {BOLD}{title}{RESET}\n"
-                f"    priority={prio_label}"
-                + (f"  due_in={due_days}d" if due_days is not None else "")
-                + f"\n    {DIM}{notes}{RESET}\n"
+                f"  {DIM}[dry-run]{RESET} {GREEN}+{RESET} {BOLD}{title}{RESET}\n"
+                f"    {DIM}{notes}{RESET}\n"
             )
-            created.append(task)
-            new_hashes.add(task_hash)
+            result["created"].append(title)
             continue
 
         try:
@@ -134,20 +203,11 @@ def create_ticktick_tasks(
                 priority=priority,
                 dueDate=due_date,
             )
-            result = tt.task.create(task_obj)
-            created.append(result)
-            new_hashes.add(task_hash)
-            print(
-                f"  {GREEN}+{RESET} {BOLD}{title}{RESET} "
-                f"{DIM}(priority={prio_label}"
-                + (f", due in {due_days}d" if due_days else "")
-                + f"){RESET}"
-            )
+            created_task = tt.task.create(task_obj)
+            save_fingerprint(event, created_task.get("id") if isinstance(created_task, dict) else None)
+            result["created"].append(title)
+            print(f"  {GREEN}+{RESET} {BOLD}{title}{RESET} {DIM}({prio_label}){RESET}")
         except Exception as e:
             print(f"  {RED}x Failed to create '{title}': {e}{RESET}")
 
-    # Persist dedup hashes
-    if new_hashes:
-        _save_created_hashes(existing_hashes | new_hashes)
-
-    return created
+    return result

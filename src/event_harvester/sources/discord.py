@@ -165,16 +165,19 @@ def read_discord_messages(
                         if ts < cutoff:
                             continue
                         seen_ids.add(msg_id)
-                        messages.append(
-                            {
-                                "platform": "discord",
-                                "id": msg_id,
-                                "timestamp": ts.isoformat(),
-                                "author": author,
-                                "channel": channel,
-                                "content": content,
-                            }
-                        )
+                        d = {
+                            "platform": "discord",
+                            "id": msg_id,
+                            "timestamp": ts.isoformat(),
+                            "author": author,
+                            "channel": channel,
+                            "content": content,
+                        }
+                        if msg.get("pinned"):
+                            d["pinned"] = True
+                        if msg.get("mention_everyone"):
+                            d["mention_everyone"] = True
+                        messages.append(d)
                     except Exception:
                         continue
 
