@@ -6,8 +6,12 @@ from datetime import datetime, timedelta, timezone
 
 from event_harvester.config import AppConfig
 from event_harvester.display import BOLD, DIM, RESET, print_message
-from event_harvester.sources.discord import find_discord_cache, read_discord_messages
-from event_harvester.sources.telegram import create_persistent_client, read_telegram_messages
+from event_harvester.sources import (
+    create_persistent_client,
+    find_discord_cache,
+    read_discord_messages,
+    read_telegram_messages,
+)
 
 logger = logging.getLogger("event_harvester.watch")
 

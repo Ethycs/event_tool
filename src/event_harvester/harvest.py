@@ -7,9 +7,13 @@ from pathlib import Path
 
 from event_harvester.config import AppConfig
 from event_harvester.display import DIM, RESET
-from event_harvester.sources.discord import read_discord_messages
-from event_harvester.sources.gmail import fetch_messages as fetch_gmail_messages
-from event_harvester.sources.telegram import read_telegram_messages
+from event_harvester.sources import (
+    fetch_event_pages,
+    fetch_gmail_messages,
+    read_discord_messages,
+    read_signal_messages,
+    read_telegram_messages,
+)
 
 logger = logging.getLogger("event_harvester")
 
@@ -103,6 +107,12 @@ def filter_seen(messages: list[dict], watermarks: dict[str, dict]) -> list[dict]
     return new
 
 
+_WEB_EVENT_DOMAINS = (
+    r"eventbrite|lu\.ma|luma|meetup\.com|partiful"
+    r"|facebook\.com/events|calendar\.google"
+)
+
+
 async def harvest_messages(
     cfg: AppConfig,
     *,
@@ -110,6 +120,8 @@ async def harvest_messages(
     no_discord: bool = False,
     no_telegram: bool = False,
     no_gmail: bool = False,
+    no_signal: bool = False,
+    no_web: bool = False,
     skip_cache: bool = False,
 ) -> list[dict]:
     """Fetch messages from sources, with auto-caching.
@@ -121,6 +133,8 @@ async def harvest_messages(
             ("discord", no_discord),
             ("telegram", no_telegram),
             ("gmail", no_gmail),
+            ("signal", no_signal),
+            ("web", no_web),
         ] if not skip
     )
 
@@ -182,6 +196,17 @@ async def harvest_messages(
     if not no_gmail:
         print("[ Gmail ]")
         messages.extend(fetch_gmail_messages(cfg.gmail, cutoff))
+        print()
+
+    if not no_signal:
+        print("[ Signal ]")
+        messages.extend(read_signal_messages(cutoff, override_path=cfg.signal.db_path))
+        print()
+
+    if not no_web:
+        print("[ Web (Playwright + Chrome cookies) ]")
+        web_pages = fetch_event_pages()
+        messages.extend(web_pages)
         print()
 
     # ── Filter already-seen messages ──────────────────────────────────────

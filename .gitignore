@@ -39,6 +39,8 @@ Thumbs.db
 data/.message_cache.json
 data/.watermarks.json
 data/.event_fingerprints.json
+data/.playwright_state.json
+data/.chrome_profile/
 
 # Trained classifier models
 classifiers/*.pkl

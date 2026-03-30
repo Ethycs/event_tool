@@ -14,7 +14,7 @@ from event_harvester.classifier import (
     predict,
 )
 from event_harvester.display import DIM, RED, RESET
-from event_harvester.sources.gmail import filter_read_sent as gmail_filter
+from event_harvester.sources import filter_read_sent as gmail_filter
 from event_harvester.weights import extract_events, prefilter_events
 
 logger = logging.getLogger("event_harvester")

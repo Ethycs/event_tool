@@ -92,6 +92,16 @@ class GmailConfig:
 
 
 @dataclass
+class SignalConfig:
+    db_path: Optional[str] = None  # env override; auto-detected if None
+
+    @property
+    def is_configured(self) -> bool:
+        # Auto-detected — always "configured" on systems with Signal Desktop
+        return True
+
+
+@dataclass
 class DiscordConfig:
     cache_path: Optional[str] = None  # env override; auto-detected if None
 
@@ -105,6 +115,7 @@ class AppConfig:
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     discord: DiscordConfig = field(default_factory=DiscordConfig)
     gmail: GmailConfig = field(default_factory=GmailConfig)
+    signal: SignalConfig = field(default_factory=SignalConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     ticktick: TickTickConfig = field(default_factory=TickTickConfig)
     days_back: int = 7
@@ -152,6 +163,9 @@ def load_config() -> AppConfig:
         gmail=GmailConfig(
             credentials_file=os.getenv("GMAIL_CREDENTIALS_FILE", "credentials.json"),
             token_file=os.getenv("GMAIL_TOKEN_FILE", "token.json"),
+        ),
+        signal=SignalConfig(
+            db_path=os.getenv("SIGNAL_DB_PATH"),
         ),
         llm=LLMConfig(
             model=os.getenv("LLM_MODEL", "gpt-4o-mini"),

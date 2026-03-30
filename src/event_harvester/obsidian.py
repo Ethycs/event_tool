@@ -316,8 +316,7 @@ def reparse_recruiter_report(filepath: str, gmail_cfg) -> None:
     Reads the markdown, finds actionable items (respond/review), and prompts
     the user for each one.
     """
-    from event_harvester.sources.gmail import reply as gmail_reply
-    from event_harvester.sources.gmail import trash as gmail_trash
+    from event_harvester.sources import gmail_reply, gmail_trash
 
     path = Path(filepath)
     if not path.exists():

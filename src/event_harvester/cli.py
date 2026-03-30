@@ -21,7 +21,7 @@ from event_harvester.display import (
     print_recruiter_grades,
 )
 from event_harvester.report import generate_report
-from event_harvester.sources.gmail import filter_read_sent
+from event_harvester.sources import filter_read_sent
 from event_harvester.ticktick import create_ticktick_tasks, get_ticktick_client
 from event_harvester.watch import watch_mode
 from event_harvester.weights import extract_links
@@ -45,7 +45,7 @@ def _setup_logging(verbose: bool) -> None:
 def _run_recruiter_grading(all_messages, cfg, args) -> list:
     """Grade Gmail recruiter emails and optionally auto-trash."""
     from event_harvester.recruiter_score import grade_emails_batch
-    from event_harvester.sources.gmail import fetch_full_bodies, trash
+    from event_harvester.sources import fetch_full_bodies, gmail_trash as trash
 
     gmail_msgs = [m for m in all_messages if m["platform"] == "gmail"]
     if not gmail_msgs:
@@ -108,6 +108,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--no-gmail", action="store_true", help="Skip Gmail",
+    )
+    parser.add_argument(
+        "--no-signal", action="store_true", help="Skip Signal",
+    )
+    parser.add_argument(
+        "--no-web", action="store_true", help="Skip web page fetching",
+    )
+    parser.add_argument(
+        "--web-login", action="store_true",
+        help="Open browser to log into event sites, save session for future runs",
     )
     parser.add_argument(
         "--no-analysis", action="store_true",
@@ -196,6 +206,12 @@ async def main() -> None:
     for w in warnings:
         logger.warning(w)
 
+    # ── Web login mode ─────────────────────────────────────────────────────
+    if args.web_login:
+        from event_harvester.sources.web_fetch import web_login
+        web_login()
+        return
+
     # ── Reparse mode ────────────────────────────────────────────────────────
     if args.reparse:
         from event_harvester.obsidian import reparse_recruiter_report
@@ -229,6 +245,8 @@ async def main() -> None:
         no_discord=args.no_discord,
         no_telegram=args.no_telegram,
         no_gmail=args.no_gmail,
+        no_signal=args.no_signal,
+        no_web=args.no_web,
         skip_cache=bool(args.save),
     )
 
@@ -243,10 +261,12 @@ async def main() -> None:
     n_d = sum(1 for m in all_messages if m["platform"] == "discord")
     n_t = sum(1 for m in all_messages if m["platform"] == "telegram")
     n_g = sum(1 for m in all_messages if m["platform"] == "gmail")
-    print(
-        f"{DIM}Total: {len(all_messages)}  "
-        f"(Discord: {n_d}, Telegram: {n_t}, Gmail: {n_g}){RESET}\n"
-    )
+    n_s = sum(1 for m in all_messages if m["platform"] == "signal")
+    n_w = sum(1 for m in all_messages if m["platform"] == "web")
+    counts = f"Discord: {n_d}, Telegram: {n_t}, Gmail: {n_g}, Signal: {n_s}"
+    if n_w:
+        counts += f", Web: {n_w}"
+    print(f"{DIM}Total: {len(all_messages)}  ({counts}){RESET}\n")
 
     if args.save:
         save_messages(all_messages, args.save)
@@ -305,7 +325,7 @@ async def main() -> None:
     links = extract_links(actionable)
     print_links(links)
 
-    source_counts = {"discord": n_d, "telegram": n_t, "gmail": n_g}
+    source_counts = {"discord": n_d, "telegram": n_t, "gmail": n_g, "signal": n_s, "web": n_w}
 
     # ── Recruiter email grading ──────────────────────────────────────────────
     grades = []
