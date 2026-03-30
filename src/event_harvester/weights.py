@@ -86,10 +86,20 @@ def has_date_or_event_signal(text: str) -> bool:
     return False
 
 
-_SCHEDULING_KEYWORDS = [
-    "rsvp", "meeting", "event", "join", "attend", "host",
-    "starts", "session", "see you", "cancelled", "canceled",
+SCHEDULING_KEYWORDS = [
+    # Shared across classifier, weights, and analysis modules.
+    # Meeting/call types
+    "meeting", "schedule", "rsvp", "call", "interview",
+    "zoom", "teams", "webex", "calendar", "appointment",
+    "standup", "sync", "1:1", "one-on-one", "sprint",
+    "demo", "retro", "check-in", "check in", "huddle",
+    "office hours", "session",
+    # Event types
+    "event", "join", "attend", "host", "see you",
+    # Time references
     "deadline", "due", "tonight", "tomorrow", "next week",
+    # Status
+    "starts", "cancelled", "canceled",
 ]
 
 _LINK_EVENT_DOMAINS = [
@@ -296,7 +306,7 @@ def extract_events(
             continue
 
         rec = _recency_score(m["timestamp"], ref_dt)
-        has_sched = any(k in content.lower() for k in _SCHEDULING_KEYWORDS)
+        has_sched = any(k in content.lower() for k in SCHEDULING_KEYWORDS)
         is_pinned = m.get("pinned", False)
 
         # Resolve dates: relative dates ("tonight", "next Friday") use the

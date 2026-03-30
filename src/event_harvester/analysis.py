@@ -141,7 +141,7 @@ def _prioritize(messages: list[dict], max_messages: int = 150) -> list[dict]:
             s += 2
         if m.get("pinned"):
             s += 2
-        if any(kw in content.lower() for kw in _ACTIONABLE_SIGNALS):
+        if any(kw in content.lower() for kw in _get_actionable_signals()):
             s += 1
         return s
 
@@ -155,11 +155,15 @@ def _prioritize(messages: list[dict], max_messages: int = 150) -> list[dict]:
 _ACTIONABLE_SIGNALS = [
     "action required", "action needed", "action item",
     "please", "could you", "can you", "let me know",
-    "schedule", "rsvp", "respond", "reply",
-    "deadline", "due", "reminder", "follow up",
-    "interview", "meeting", "call", "zoom",
+    "respond", "reply", "reminder", "follow up",
     "?",  # questions
 ]
+
+# Merge in shared scheduling keywords to avoid maintaining two lists.
+# Import is deferred to avoid circular import at module load.
+def _get_actionable_signals() -> list[str]:
+    from event_harvester.weights import SCHEDULING_KEYWORDS
+    return _ACTIONABLE_SIGNALS + SCHEDULING_KEYWORDS
 
 
 def extract_events_llm(

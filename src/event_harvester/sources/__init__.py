@@ -19,7 +19,8 @@ from event_harvester.sources.telegram import (
     create_persistent_client,
     read_telegram_messages,
 )
-from event_harvester.sources.web_fetch import fetch_event_pages
+from event_harvester.sources.uc_browser import UCBrowser
+from event_harvester.sources.web_fetch import fetch_event_pages, fetch_feeds
 
 __all__ = [
     # Generic Chromium cache reader
@@ -41,4 +42,6 @@ __all__ = [
     "create_persistent_client",
     "read_telegram_messages",
     "fetch_event_pages",
+    "fetch_feeds",
+    "UCBrowser",
 ]

@@ -120,6 +120,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Open browser to log into event sites, save session for future runs",
     )
     parser.add_argument(
+        "--test-url", metavar="URL",
+        help="Fetch a single URL with Playwright and display extracted text (test mode)",
+    )
+    parser.add_argument(
         "--no-analysis", action="store_true",
         help="Skip OpenRouter analysis + task extraction",
     )
@@ -210,6 +214,21 @@ async def main() -> None:
     if args.web_login:
         from event_harvester.sources.web_fetch import web_login
         web_login()
+        return
+
+    # ── Test URL mode ─────────────────────────────────────────────────────
+    if args.test_url:
+        from event_harvester.sources.web_fetch import fetch_event_pages
+        print(f"Testing: {args.test_url}\n")
+        msgs = fetch_event_pages(urls=[{"url": args.test_url, "headless": False}])
+        if msgs:
+            print(f"  {len(msgs)} message(s) extracted.\n")
+            for i, m in enumerate(msgs):
+                print(f"  --- [{i+1}/{len(msgs)}] {m['channel'][:80]} ---")
+                print(f"  {m['content'][:500]}")
+                print()
+        else:
+            print("  No content extracted.")
         return
 
     # ── Reparse mode ────────────────────────────────────────────────────────

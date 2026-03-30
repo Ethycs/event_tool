@@ -48,6 +48,7 @@ platforms = ["win-64"]
 
 [tool.pixi.dependencies]
 python = ">=3.12,<3.13"
+playwright-stealth = ">=2.0.2,<3"
 
 [tool.pixi.pypi-dependencies]
 event-harvester = { path = ".", editable = true }

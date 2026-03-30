@@ -40,10 +40,10 @@ def run_eval(
     print("[ Evaluating classifier ]")
     print(f"{'=' * W}\n")
 
-    try:
-        all_labeled = json.loads(Path(load_labels).read_text(encoding="utf-8"))
-    except Exception as e:
-        logger.error("Failed to load labels: %s", e)
+    from event_harvester.utils import load_json
+    all_labeled = load_json(load_labels, default=None)
+    if all_labeled is None:
+        logger.error("Failed to load labels from %s", load_labels)
         return
 
     eval_msgs = [{k: v for k, v in m.items() if k != "label"} for m in all_labeled]

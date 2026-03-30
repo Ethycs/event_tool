@@ -9,6 +9,7 @@ from event_harvester.config import AppConfig
 from event_harvester.display import DIM, RESET
 from event_harvester.sources import (
     fetch_event_pages,
+    fetch_feeds,
     fetch_gmail_messages,
     read_discord_messages,
     read_signal_messages,
@@ -33,21 +34,14 @@ def _load_watermarks() -> dict[str, dict]:
         }
     }
     """
-    if not WATERMARK_FILE.exists():
-        return {}
-    try:
-        return json.loads(WATERMARK_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    from event_harvester.utils import load_json
+    return load_json(WATERMARK_FILE)
 
 
 def _save_watermarks(watermarks: dict[str, dict]) -> None:
     """Save per-channel watermarks."""
-    WATERMARK_FILE.parent.mkdir(parents=True, exist_ok=True)
-    WATERMARK_FILE.write_text(
-        json.dumps(watermarks, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    from event_harvester.utils import save_json
+    save_json(WATERMARK_FILE, watermarks)
 
 
 _MAX_IDS_PER_CHANNEL = 500  # Keep last N IDs to avoid unbounded growth
@@ -82,6 +76,11 @@ def filter_seen(messages: list[dict], watermarks: dict[str, dict]) -> list[dict]
     if not watermarks:
         return messages
 
+    # Pre-convert seen_ids lists to sets for O(1) lookup
+    seen_sets: dict[str, set] = {}
+    for wm_key, wm in watermarks.items():
+        seen_sets[wm_key] = set(wm.get("seen_ids", []))
+
     new = []
     n_skipped = 0
     for m in messages:
@@ -95,7 +94,7 @@ def filter_seen(messages: list[dict], watermarks: dict[str, dict]) -> list[dict]
         ts = m.get("timestamp", "")
 
         # Skip if ID already seen OR timestamp is at/before the watermark
-        if mid in wm.get("seen_ids", []) or ts <= wm.get("last_ts", ""):
+        if mid in seen_sets.get(key, set()) or ts <= wm.get("last_ts", ""):
             n_skipped += 1
             continue
 
@@ -204,9 +203,14 @@ async def harvest_messages(
         print()
 
     if not no_web:
-        print("[ Web (Playwright + Chrome cookies) ]")
+        print("[ Web Pages ]")
         web_pages = fetch_event_pages()
         messages.extend(web_pages)
+        print()
+
+        print("[ Web Feeds ]")
+        feed_msgs = fetch_feeds()
+        messages.extend(feed_msgs)
         print()
 
     # ── Filter already-seen messages ──────────────────────────────────────

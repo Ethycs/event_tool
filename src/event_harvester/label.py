@@ -7,7 +7,7 @@ A (actionable) or N (noise) labels for each message.
 import logging
 
 from event_harvester.config import LLMConfig
-from event_harvester.llm import _complete_litellm
+from event_harvester.llm import chat_completion
 
 logger = logging.getLogger("event_harvester.label")
 
@@ -81,7 +81,7 @@ def label_messages(
         try:
             # Always use litellm for labeling — it's a one-time bulk operation
             # where speed and accuracy matter more than cost.
-            raw = _complete_litellm(
+            raw = chat_completion(
                 messages=[
                     {"role": "system", "content": _LABEL_SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},

@@ -4,12 +4,12 @@ Compares events by normalized structured fields (title, date, location, link)
 and maintains a fingerprint store for cross-run dedup.
 """
 
-import json
 import logging
-import re
 import string
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
+
+from event_harvester.utils import load_json, save_json
 
 logger = logging.getLogger("event_harvester.event_match")
 
@@ -103,11 +103,8 @@ def events_match(a: dict, b: dict) -> tuple[bool, int]:
 
 def load_fingerprints() -> list[dict]:
     """Load fingerprints from JSON, auto-prune expired entries."""
-    if not FINGERPRINT_FILE.exists():
-        return []
-    try:
-        data = json.loads(FINGERPRINT_FILE.read_text())
-    except Exception:
+    data = load_json(FINGERPRINT_FILE, default=[])
+    if not data:
         return []
 
     today = date.today()
@@ -150,8 +147,7 @@ def save_fingerprint(event: dict, ticktick_id: str | None = None) -> None:
     }
 
     fps.append(entry)
-    FINGERPRINT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    FINGERPRINT_FILE.write_text(json.dumps(fps, indent=2))
+    save_json(FINGERPRINT_FILE, fps)
 
 
 def find_fingerprint(event: dict) -> dict | None:
@@ -165,15 +161,50 @@ def find_fingerprint(event: dict) -> dict | None:
 
 
 def dedup_events(events: list[dict]) -> list[dict]:
-    """Within-run dedup using events_match. Returns unique events."""
+    """Within-run dedup using events_match. Returns unique events.
+
+    Uses a link index for O(1) exact-link dedup and caches signatures
+    to avoid recomputing them in the fuzzy-match inner loop.
+    """
     unique: list[dict] = []
+    unique_sigs: list[dict] = []
+    seen_links: set[str] = set()
+
     for event in events:
+        sig = event_signature(event)
+
+        # Fast path: exact link match
+        link = sig["link"]
+        if link and link in seen_links:
+            continue
+
+        # Slow path: fuzzy match against existing unique events
         matched = False
-        for existing in unique:
-            is_match, _ = events_match(event, existing)
-            if is_match:
+        for existing_sig in unique_sigs:
+            score = _sig_match_score(sig, existing_sig)
+            if score >= 2:
                 matched = True
                 break
+
         if not matched:
             unique.append(event)
+            unique_sigs.append(sig)
+            if link:
+                seen_links.add(link)
+
     return unique
+
+
+def _sig_match_score(sig_a: dict, sig_b: dict) -> int:
+    """Compare two pre-computed signatures. Returns match score."""
+    score = 0
+    if _titles_overlap(sig_a["title_words"], sig_b["title_words"]):
+        score += 1
+    if sig_a["date"] and sig_b["date"] and sig_a["date"] == sig_b["date"]:
+        score += 1
+    loc_a, loc_b = sig_a["location_words"], sig_b["location_words"]
+    if loc_a and loc_b and _titles_overlap(loc_a, loc_b):
+        score += 1
+    if sig_a["link"] and sig_b["link"] and sig_a["link"] == sig_b["link"]:
+        score += 2
+    return score

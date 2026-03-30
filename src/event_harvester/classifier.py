@@ -11,6 +11,8 @@ import logging
 import re
 from pathlib import Path
 
+from event_harvester.weights import SCHEDULING_KEYWORDS
+
 logger = logging.getLogger("event_harvester.classifier")
 
 _CLASSIFIERS_DIR = Path(__file__).resolve().parent.parent.parent / "classifiers"
@@ -19,13 +21,6 @@ CHAT_MODEL_PATH = _CLASSIFIERS_DIR / "classifier_chat.pkl"
 _LEGACY_MODEL_PATH = _CLASSIFIERS_DIR / "classifier.pkl"
 
 # ── Shared keywords ──────────────────────────────────────────────────────
-
-_SCHEDULING_KEYWORDS = [
-    "meeting", "schedule", "rsvp", "deadline", "call", "interview",
-    "zoom", "teams", "webex", "calendar", "appointment", "standup",
-    "sync", "1:1", "one-on-one", "sprint", "demo", "retro",
-    "check-in", "check in", "huddle", "office hours",
-]
 
 _QUESTION_PHRASES = [
     "could you", "can you", "please", "let me know", "would you",
@@ -57,7 +52,7 @@ def extract_email_features(message: dict) -> dict[str, float]:
         "num_questions": float(content.count("?")),
         "has_unsubscribe": 1.0 if "unsubscribe" in content_lower else 0.0,
         "is_reply": 1.0 if content_lower.startswith("re:") else 0.0,
-        "has_scheduling": 1.0 if any(kw in content_lower for kw in _SCHEDULING_KEYWORDS) else 0.0,
+        "has_scheduling": 1.0 if any(kw in content_lower for kw in SCHEDULING_KEYWORDS) else 0.0,
         "has_question_words": 1.0 if any(p in content_lower for p in _QUESTION_PHRASES) else 0.0,
         "is_noreply_sender": 1.0 if ("noreply" in author or "no-reply" in author) else 0.0,
         "is_notification": 1.0 if any(pat in author for pat in _NOTIFICATION_SENDERS) else 0.0,
@@ -82,7 +77,7 @@ def extract_chat_features(message: dict) -> dict[str, float]:
         "word_count": float(len(words)),
         "num_links": float(len(_URL_PATTERN.findall(content))),
         "num_questions": float(content.count("?")),
-        "has_scheduling": 1.0 if any(kw in content_lower for kw in _SCHEDULING_KEYWORDS) else 0.0,
+        "has_scheduling": 1.0 if any(kw in content_lower for kw in SCHEDULING_KEYWORDS) else 0.0,
         "has_question_words": 1.0 if any(p in content_lower for p in _QUESTION_PHRASES) else 0.0,
         "has_mention": 1.0 if "@" in content else 0.0,
         "has_everyone": 1.0 if "@everyone" in content or "@here" in content else 0.0,
@@ -209,6 +204,18 @@ def _train_one(messages, labels, feature_fn, model_path):
 # 0.5 = default, 0.3 = aggressive recall (prefer false positives over false negatives)
 ACTIONABLE_THRESHOLD = 0.3
 
+_model_cache: dict[str, dict] = {}
+
+
+def _load_model(path) -> dict:
+    """Load a classifier model, caching in memory after first load."""
+    import joblib
+
+    key = str(path)
+    if key not in _model_cache:
+        _model_cache[key] = joblib.load(path)
+    return _model_cache[key]
+
 
 def predict(
     messages: list[dict],
@@ -220,10 +227,8 @@ def predict(
     Uses predict_proba with a low threshold to favor recall — better to
     let some noise through than miss real action items.
     """
-    import joblib
-
     if model_path:
-        data = joblib.load(model_path)
+        data = _load_model(model_path)
         clf, feature_names = data["model"], data["feature_names"]
         all_feats = [extract_features(m) for m in messages]
         X = [[f[name] for name in feature_names] for f in all_feats]
@@ -253,7 +258,7 @@ def predict(
                 results[i] = True
             continue
 
-        data = joblib.load(path)
+        data = _load_model(path)
         clf, feature_names = data["model"], data["feature_names"]
         feats = [feat_fn(m) for _, m in items]
         X = [[f[name] for name in feature_names] for f in feats]

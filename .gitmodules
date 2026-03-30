@@ -1,0 +1,3 @@
+[submodule "ext/universal_controller"]
+	path = ext/universal_controller
+	url = https://github.com/Ethycs/universal_controller.git
