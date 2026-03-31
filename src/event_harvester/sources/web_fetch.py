@@ -23,7 +23,6 @@ _EXT_DIR = Path(__file__).resolve().parent.parent.parent.parent / "ext" / "uc_ex
 # Default event pages to fetch — override with WEB_EVENT_URLS env var
 DEFAULT_EVENT_URLS = [
     {"url": "https://lu.ma/discover", "headless": True},
-    {"url": "https://www.meetup.com/find/?source=EVENTS&eventType=inPerson&sortField=RELEVANCE", "headless": True},
     {"url": "https://www.instagram.com/", "headless": True},
     {"url": "https://www.erobay.com/", "headless": False, "cooldown_hours": 4},
     {"url": "https://business.sfchamber.com/events/calendar", "headless": True},
@@ -217,12 +216,17 @@ def _extension_args() -> list[str]:
 
 
 def _wait_for_uc(page, timeout_ms: int = 5000) -> Optional[dict]:
-    """Wait for UC extension to detect patterns, return window.__UC or None."""
+    """Wait for UC extension, run detection, return window.__UC or None.
+
+    UC doesn't auto-detect — it needs an explicit detectAll() call.
+    """
     try:
         page.wait_for_function(
             "window.__UC && window.__UC.ready === true",
             timeout=timeout_ms,
         )
+        # Trigger static three-signal detection for all pattern types
+        page.evaluate("window.__UC_detectAll()")
         return page.evaluate("window.__UC")
     except Exception:
         return None
@@ -311,6 +315,147 @@ def web_login(urls: list[str] | None = None) -> None:
     # Run in a thread to avoid conflict with asyncio event loop
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         pool.submit(_do_login).result()
+
+
+# ── UC-driven perceptual harvest ──────────────────────────────────────
+
+DEFAULT_UC_SOURCES = [
+    {
+        "url": "https://www.meetup.com/find/?source=EVENTS&eventType=inPerson&sortField=RELEVANCE",
+        "query": "AI meetup",
+        "scroll_seconds": 10,
+        "name": "meetup",
+    },
+]
+
+
+def uc_harvest(
+    sources: list[dict] | None = None,
+    max_events: int = 30,
+) -> list[dict]:
+    """Perceptually discover and harvest events from any website.
+
+    Uses UC extension to detect page components (search bars, feeds,
+    cookie banners, modals, login walls), interact with them, and
+    extract event data — turning any event site into an API.
+
+    Flow per source:
+      1. Open → detectAll → clear obstacles (cookies, modals, login walls)
+      2. If query: detect search → fill + submit → scan-diff the results
+      3. Scroll to load more content
+      4. Extract event links from page → fetch each detail page
+      5. Fallback: use detected feed items as messages
+
+    Source config keys:
+        url:             page to open
+        query:           search text (optional — skip search if absent)
+        scroll_seconds:  how long to scroll (default 10)
+        name:            source label for logging
+    """
+    if sources is None:
+        sources = DEFAULT_UC_SOURCES
+    if not sources:
+        return []
+
+    import concurrent.futures
+
+    def _do_harvest():
+        from event_harvester.sources.uc_browser import UCBrowser
+        from urllib.parse import urlparse
+
+        all_messages = []
+
+        with UCBrowser(headless=False) as uc:
+            for cfg in sources:
+                url = cfg["url"]
+                query = cfg.get("query")
+                scroll_secs = cfg.get("scroll_seconds", 10)
+                name = cfg.get("name", urlparse(url).netloc)
+                messages = []
+
+                logger.info("UC harvest: %s", name)
+
+                # ── 1. Open + detect + clear obstacles ───────────
+                page = uc.open(url)
+                patterns = uc.detect_all(page)
+                uc.dismiss_cookies(page)
+                uc.close_modal(page)
+
+                if uc.has_login_wall(page):
+                    logger.warning("%s: login wall — skipping", name)
+                    page.close()
+                    continue
+
+                # ── 2. Search if query provided ──────────────────
+                if query:
+                    uc.first_scan(page)
+                    searched = uc.search(page, query)
+                    if searched:
+                        page.wait_for_timeout(3000)
+                        diff = uc.next_scan(page)
+                        detected = uc.auto_detect(page)
+                        if diff:
+                            logger.info(
+                                "%s: search → %d changed, %d added, %d patterns",
+                                name, diff.get("changed", 0),
+                                diff.get("added", 0), len(detected),
+                            )
+                    else:
+                        logger.info("%s: no search bar — using page as-is", name)
+
+                # ── 3. Scroll to load more ───────────────────────
+                for _ in range(scroll_secs):
+                    page.evaluate("window.scrollBy(0, window.innerHeight)")
+                    page.wait_for_timeout(1000)
+
+                # ── 4. Score and extract event links ─────────────
+                event_links = _extract_event_links(page)
+
+                event_links = event_links[:max_events]
+
+                if event_links:
+                    logger.info("%s: %d event links, fetching details...", name, len(event_links))
+                    for lnk in event_links:
+                        text = _fetch_event_detail(
+                            uc._context, uc._stealth_plugin,
+                            lnk["url"], uc.timeout_ms,
+                        )
+                        if text:
+                            domain = urlparse(lnk["url"]).netloc
+                            messages.append({
+                                "platform": "web",
+                                "id": f"web:{hash(lnk['url'])}",
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "author": domain,
+                                "channel": lnk["url"][:120],
+                                "content": text[:5000],
+                            })
+                else:
+                    # ── 5. Fallback: feed items as messages ──────
+                    items = uc.get_feed_items(page)
+                    domain = urlparse(url).netloc
+                    for i, item_text in enumerate(items):
+                        if len(item_text) > 30:
+                            messages.append({
+                                "platform": "web",
+                                "id": f"web:{hash(url + str(i))}",
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "author": domain,
+                                "channel": f"{name}-feed",
+                                "content": item_text[:5000],
+                            })
+
+                logger.info("%s: %d messages harvested.", name, len(messages))
+                all_messages.extend(messages)
+                page.close()
+
+        return all_messages
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        messages = pool.submit(_do_harvest).result()
+
+    logger.info("UC harvest: %d message(s) from %d source(s).", len(messages), len(sources))
+    return messages
 
 
 # ── Feed scrolling with API interception ───────────────────────────────
@@ -604,36 +749,197 @@ def _extract_text(html: str) -> str:
     return re.sub(r"\s+", " ", html).strip()
 
 
-_EVENT_LINK_RE = re.compile(
-    r"(?i)/events?/(?:details|show|view|popup|info|calendar)"
-    r"|/calendar/.*(?:id=|event)"
-    r"|eventbrite\.com/e/"
-    r"|lu\.ma/[a-z0-9]"
-    r"|meetup\.com/.+/events/"
-)
-
-
 def _extract_event_links(page) -> list[dict]:
-    """Extract event detail links from a calendar page.
+    """Extract event links by associating dates with links via DOM locality.
 
-    Returns list of {url, text} for links that look like event detail pages.
+    Treats the DOM as a graph. For each date/time text node on the page,
+    walks up to find the containing "card" (nearest ancestor with siblings),
+    then finds the primary link in that same card. The date and link are
+    associated because they share a common ancestor subtree.
+
+    Returns list of {url, text, date_hint} — links co-located with dates.
+    Falls back to primary links from repeated-child containers if no
+    date associations are found.
     """
-    return page.evaluate("""() => {
-        const links = document.querySelectorAll('a[href]');
-        const events = [];
-        const seen = new Set();
-        for (const a of links) {
-            const href = a.href;
-            const text = a.innerText.trim();
-            if (!href || !text || text.length < 5 || seen.has(href)) continue;
-            // Skip nav/pagination links
-            if (/^\\d{1,2}$/.test(text)) continue;
-            if (/ShowIt|NavType|Amount=Month/.test(href) && !/ID=/.test(href)) continue;
-            seen.add(href);
-            events.push({url: href, text: text.substring(0, 200)});
+    raw = page.evaluate("""() => {
+        const DATE_RE = /(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\\.?\\s+\\d{1,2}(?:st|nd|rd|th)?|\\d{1,2}(?:st|nd|rd|th)?\\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*|\\d{4}-\\d{2}-\\d{2}|(?:mon|tue|wed|thu|fri|sat|sun)(?:day)?(?:\\s*,)?\\s*(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\\.?\\s+\\d{1,2}/i;
+        const TIME_RE = /\\b\\d{1,2}(?::\\d{2})?\\s*(?:am|pm)\\b|\\b(?:[01]\\d|2[0-3]):[0-5]\\d\\b/i;
+        const domain = location.hostname;
+
+        // ── Step 1: Walk the DOM tree to find all text nodes with dates ──
+        const dateNodes = [];
+        const walker = document.createTreeWalker(
+            document.body, NodeFilter.SHOW_TEXT, null
+        );
+        while (walker.nextNode()) {
+            const text = walker.currentNode.textContent.trim();
+            if (text.length > 3 && text.length < 200 && DATE_RE.test(text)) {
+                dateNodes.push({
+                    node: walker.currentNode,
+                    text: text,
+                    dateMatch: text.match(DATE_RE)?.[0] || '',
+                    hasTime: TIME_RE.test(text),
+                });
+            }
         }
-        return events;
+
+        // ── Step 2: For each date node, walk up to find its "card" ──────
+        // A card is the nearest ancestor that has siblings of the same type
+        // (indicating it's an item in a repeated list/grid)
+        function findCard(node) {
+            let cur = node.parentElement;
+            let bestCard = null;
+            while (cur && cur !== document.body) {
+                const parent = cur.parentElement;
+                if (parent) {
+                    const cn = typeof cur.className === 'string' ? cur.className : '';
+                    const tag = cur.tagName + '.' + cn.split(' ')[0];
+                    let sibCount = 0;
+                    for (const sib of parent.children) {
+                        const scn = typeof sib.className === 'string' ? sib.className : '';
+                        if (sib.tagName + '.' + scn.split(' ')[0] === tag) sibCount++;
+                    }
+                    if (sibCount >= 2) {
+                        bestCard = cur;
+                        // Keep walking if this card has no links (too narrow)
+                        if (cur.querySelectorAll('a[href]').length > 0) return cur;
+                    }
+                }
+                cur = cur.parentElement;
+            }
+            return bestCard;
+        }
+
+        // ── Step 3: From each card, find the primary link ───────────────
+        const results = [];
+        const seenUrls = new Set();
+        const seenCards = new Set();
+
+        for (const dn of dateNodes) {
+            const card = findCard(dn.node);
+            if (!card || seenCards.has(card)) continue;
+            seenCards.add(card);
+
+            // Find the best link in this card (longest text = likely title)
+            const links = card.querySelectorAll('a[href]');
+            let bestLink = null;
+            let bestLen = 0;
+            for (const a of links) {
+                const href = a.href;
+                if (!href || seenUrls.has(href)) continue;
+                try { if (new URL(href).hostname !== domain) continue; } catch { continue; }
+                const linkText = a.innerText.trim();
+                if (linkText.length > bestLen) {
+                    bestLink = a;
+                    bestLen = linkText.length;
+                }
+            }
+
+            // Accept link with text, or image-wrapped link (empty text but long slug)
+            if (bestLink && bestLen >= 5) {
+                seenUrls.add(bestLink.href);
+                results.push({
+                    url: bestLink.href,
+                    text: bestLink.innerText.trim().substring(0, 200) || card.innerText.trim().substring(0, 200),
+                    date_hint: dn.dateMatch,
+                });
+            } else if (bestLink && bestLen < 5) {
+                // Image-wrapped link — use card text as the title
+                const cardTitle = card.innerText.trim().split('\\n').filter(l => l.length > 5)[0] || '';
+                if (cardTitle.length >= 5) {
+                    seenUrls.add(bestLink.href);
+                    results.push({
+                        url: bestLink.href,
+                        text: cardTitle.substring(0, 200),
+                        date_hint: dn.dateMatch,
+                    });
+                }
+            }
+        }
+
+        // ── Step 4: Fallback — if few date associations, try repeated ───
+        // containers and extract primary links from each child item
+        if (results.length < 3) {
+            const containers = [];
+            document.querySelectorAll('main, [role="main"], section, div, ul, ol, table, tbody').forEach(el => {
+                if (el.children.length < 3) return;
+                const tags = {};
+                for (const c of el.children) {
+                    const cn = typeof c.className === 'string' ? c.className : '';
+                    tags[c.tagName + '.' + cn.split(' ')[0]] = (tags[c.tagName + '.' + cn.split(' ')[0]] || 0) + 1;
+                }
+                const max = Math.max(...Object.values(tags));
+                if (max >= 3) containers.push({ el, count: max });
+            });
+            containers.sort((a, b) => b.count - a.count);
+
+            // Use top container, skip if it's a parent of an already-used one
+            for (const { el: cont } of containers.slice(0, 2)) {
+                for (const item of cont.children) {
+                    const links = item.querySelectorAll('a[href]');
+                    let best = null, bestLen = 0;
+                    for (const a of links) {
+                        if (!a.href || seenUrls.has(a.href)) continue;
+                        try { if (new URL(a.href).hostname !== domain) continue; } catch { continue; }
+                        const t = a.innerText.trim();
+                        if (t.length > bestLen) { best = a; bestLen = t.length; }
+                    }
+                    if (best && bestLen >= 5) {
+                        seenUrls.add(best.href);
+                        // Check if this item has a date too
+                        const itemText = item.innerText || '';
+                        const dateMatch = itemText.match(DATE_RE);
+                        results.push({
+                            url: best.href,
+                            text: best.innerText.trim().substring(0, 200),
+                            date_hint: dateMatch ? dateMatch[0] : '',
+                        });
+                    }
+                }
+            }
+        }
+
+        // ── Step 5: Last resort — links near dates (walk up 5 ancestors) ──
+        if (results.length < 3) {
+            const allLinks = document.querySelectorAll('a[href]');
+            for (const a of allLinks) {
+                if (seenUrls.has(a.href)) continue;
+                const text = a.innerText.trim();
+                if (text.length < 5) continue;
+                try { if (new URL(a.href).hostname !== domain) continue; } catch { continue; }
+                if (/^(home|about|contact|login|sign|help|privacy|terms|\\d{1,2})$/i.test(text)) continue;
+
+                // Walk up 5 ancestors looking for date context
+                let dateMatch = text.match(DATE_RE)?.[0] || '';
+                if (!dateMatch) {
+                    let cur = a.parentElement;
+                    for (let depth = 0; cur && depth < 5; depth++, cur = cur.parentElement) {
+                        const ct = (cur.childNodes.length <= 5)
+                            ? (cur.innerText || '').substring(0, 300)
+                            : '';
+                        const m = ct.match(DATE_RE);
+                        if (m) { dateMatch = m[0]; break; }
+                    }
+                }
+
+                // Accept if date found nearby, or if the URL pattern suggests event detail
+                const urlPath = new URL(a.href).pathname;
+                const looksLikeDetail = /\\/\\w{5,}.*\\d/.test(urlPath) && urlPath.split('/').length >= 3;
+                if (!dateMatch && !looksLikeDetail) continue;
+
+                seenUrls.add(a.href);
+                results.push({
+                    url: a.href,
+                    text: text.substring(0, 200),
+                    date_hint: dateMatch,
+                });
+            }
+        }
+
+        return results;
     }""")
+
+    return raw or []
 
 
 def _fetch_event_detail(context, stealth, url: str, timeout_ms: int) -> str | None:
@@ -658,12 +964,7 @@ def _try_calendar_extraction(
 
     Returns list of message dicts (one per event), or None if not a calendar.
     """
-    links = _extract_event_links(page)
-    # Filter to event-looking links
-    event_links = [
-        lnk for lnk in links
-        if _EVENT_LINK_RE.search(lnk["url"])
-    ]
+    event_links = _extract_event_links(page)
 
     if len(event_links) < 3:
         return None

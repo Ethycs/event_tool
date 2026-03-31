@@ -41,6 +41,7 @@ data/.watermarks.json
 data/.event_fingerprints.json
 data/.playwright_state.json
 data/.chrome_profile/
+data/*
 
 # Trained classifier models
 classifiers/*.pkl
@@ -54,3 +55,7 @@ data/.message_cache.json
 .pixi
 *.egg-info
 pixi.lock
+
+# UC extension build artifacts
+ext/uc_extension/node_modules/
+ext/uc_extension/dist/

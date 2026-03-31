@@ -1,19 +1,34 @@
 """Programmatic browser API powered by Universal Controller + Playwright.
 
 Provides a high-level Python interface for interacting with any website
-using auto-detected UI patterns. The UC Chrome extension detects search bars,
-feeds, forms, modals, cookie banners, and login walls — this module wraps
-those detections into Playwright actions.
+using auto-detected UI patterns. The UC Chrome extension runs in two modes:
+
+**Scan-diff-bind** (Cheat Engine style) — interaction-based:
+    1. first_scan(page)        — baseline DOM snapshot
+    2. (perform action via Playwright)
+    3. next_scan(page)         — diff against baseline
+    4. auto_detect(page)       — infer patterns from what changed
+
+**Static detect** (three-signal scoring) — no interaction needed:
+    detect(page, "search")     — structural + phrasal + semantic + behavioral
+    detect_all(page)           — detect all pattern types at once
 
 Usage::
 
     from event_harvester.sources.uc_browser import UCBrowser
 
-    with UCBrowser() as browser:
-        page = browser.open("https://lu.ma/discover")
-        browser.search(page, "AI meetup San Francisco")
-        results = browser.get_feed_text(page)
-        print(results)
+    with UCBrowser() as uc:
+        page = uc.open("https://lu.ma/discover")
+
+        # Static detect — quick, no interaction required
+        uc.detect_all(page)
+        uc.search(page, "AI meetup San Francisco")
+
+        # Scan-diff — interaction-based, higher confidence
+        uc.first_scan(page)
+        page.click("button.filter")           # perform an action
+        diff = uc.next_scan(page)             # see what changed
+        patterns = uc.auto_detect(page)       # infer what pattern it was
 """
 
 import logging
@@ -41,11 +56,13 @@ class UCBrowser:
         channel: str = "chrome",
         stealth: bool = True,
         timeout_ms: int = 30000,
+        use_extension: bool = False,
     ):
         self.headless = headless
         self.channel = channel
         self.use_stealth = stealth
         self.timeout_ms = timeout_ms
+        self.use_extension = use_extension
         self._pw = None
         self._context = None
         self._browser = None
@@ -59,24 +76,16 @@ class UCBrowser:
         self.close()
 
     def start(self) -> None:
-        """Launch the browser with the UC extension loaded."""
+        """Launch the browser.
+
+        Default: installed Chrome + logged-in profile (data/.chrome_profile).
+        With use_extension=True: Playwright Chromium + UC extension + separate profile.
+        """
         from playwright.sync_api import sync_playwright
 
         self._pw = sync_playwright().start()
 
-        ext_args = []
-        if not self.headless and _EXT_DIR.is_dir() and (_EXT_DIR / "manifest.json").exists():
-            ext_path = str(_EXT_DIR.resolve())
-            ext_args = [
-                f"--load-extension={ext_path}",
-                f"--disable-extensions-except={ext_path}",
-            ]
-            logger.info("Loading UC extension from %s", ext_path)
-        elif not self.headless:
-            logger.warning("UC extension not found at %s — running without it", _EXT_DIR)
-
         if self.headless:
-            # Extensions don't work in headless — use plain browser
             self._browser = self._pw.chromium.launch(
                 headless=True, channel=self.channel,
             )
@@ -86,16 +95,37 @@ class UCBrowser:
                 )
             else:
                 self._context = self._browser.new_context()
+        elif self.use_extension:
+            # Chromium + extension (branded Chrome blocks --load-extension)
+            ext_args = []
+            if _EXT_DIR.is_dir() and (_EXT_DIR / "manifest.json").exists():
+                ext_path = str(_EXT_DIR.resolve())
+                ext_args = [
+                    f"--load-extension={ext_path}",
+                    f"--disable-extensions-except={ext_path}",
+                ]
+                logger.info("Loading UC extension from %s", ext_path)
+            else:
+                logger.warning("UC extension not found at %s", _EXT_DIR)
+            profile_dir = str((_CHROME_PROFILE.parent / ".uc_chromium_profile").resolve())
+            Path(profile_dir).mkdir(parents=True, exist_ok=True)
+            self._context = self._pw.chromium.launch_persistent_context(
+                profile_dir,
+                headless=False,
+                channel=None,  # Playwright's bundled Chromium
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    *ext_args,
+                ],
+            )
         else:
+            # Installed Chrome + logged-in profile (same as fetch_event_pages)
             _CHROME_PROFILE.parent.mkdir(parents=True, exist_ok=True)
             self._context = self._pw.chromium.launch_persistent_context(
                 str(_CHROME_PROFILE),
                 headless=False,
                 channel=self.channel,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    *ext_args,
-                ],
+                args=["--disable-blink-features=AutomationControlled"],
             )
 
         if self.use_stealth:
@@ -135,38 +165,154 @@ class UCBrowser:
         page.wait_for_timeout(wait_ms)
         return page
 
-    def detect(self, page, timeout_ms: int = 5000) -> Optional[dict]:
-        """Wait for UC detection and return the patterns dict, or None."""
+    def _wait_ready(self, page, timeout_ms: int = 5000) -> bool:
+        """Wait for the UC extension to be loaded on this page."""
         try:
             page.wait_for_function(
                 "window.__UC && window.__UC.ready === true",
                 timeout=timeout_ms,
             )
-            uc = page.evaluate("window.__UC")
-            # Log detections
-            if uc and uc.get("patterns"):
-                for ptype, hits in uc["patterns"].items():
-                    if hits:
-                        logger.info(
-                            "UC detected %s: %d hit(s), best=%.2f",
-                            ptype, len(hits), hits[0].get("confidence", 0),
-                        )
-            return uc
+            return True
         except Exception:
-            logger.debug("UC detection timed out on %s", page.url)
+            logger.debug("UC extension not ready on %s", page.url)
+            return False
+
+    # ── Scan-diff-bind workflow (interaction-based) ─────────────────────
+
+    def first_scan(self, page) -> Optional[dict]:
+        """Take a baseline DOM snapshot. Call before performing an action.
+
+        Returns scan summary: {elements, timestamp} or None.
+        """
+        if not self._wait_ready(page):
+            return None
+        try:
+            result = page.evaluate("window.__UC_firstScan()")
+            logger.info("First scan: %d elements captured", result.get("elements", 0))
+            return result
+        except Exception as e:
+            logger.error("first_scan failed: %s", e)
             return None
 
-    def rescan(self, page) -> Optional[dict]:
-        """Re-run UC detection (useful after SPA navigation or DOM changes)."""
+    def next_scan(self, page) -> Optional[dict]:
+        """Diff against the baseline after an action was performed.
+
+        Returns diff summary: {changed, added, removed, increased, decreased} or None.
+        """
         try:
-            return page.evaluate("window.__UC_rescan()")
-        except Exception:
+            result = page.evaluate("window.__UC_nextScan()")
+            logger.info(
+                "Next scan: %d changed, %d added, %d removed",
+                result.get("changed", 0), result.get("added", 0), result.get("removed", 0),
+            )
+            return result
+        except Exception as e:
+            logger.error("next_scan failed: %s", e)
             return None
+
+    def auto_detect(self, page) -> list[dict]:
+        """Infer patterns from the last diff (Cheat Engine style).
+
+        Must be called after first_scan() → action → next_scan().
+        Returns list of detected patterns: [{pattern, confidence, proof, selector}].
+        """
+        try:
+            results = page.evaluate("window.__UC_autoDetect()")
+            for r in results:
+                logger.info(
+                    "Auto-detected %s (%.0f%%): %s",
+                    r.get("pattern"), r.get("confidence", 0) * 100, r.get("proof"),
+                )
+            return results
+        except Exception as e:
+            logger.error("auto_detect failed: %s", e)
+            return []
+
+    def scan_action(self, page, action: callable) -> list[dict]:
+        """Convenience: first_scan → action → next_scan → auto_detect.
+
+        Args:
+            page: Playwright page.
+            action: Callable that performs the interaction (receives page as arg).
+
+        Returns:
+            List of detected patterns from the diff.
+
+        Example::
+
+            patterns = uc.scan_action(page, lambda p: p.click("button.filter"))
+        """
+        self.first_scan(page)
+        action(page)
+        page.wait_for_timeout(500)
+        self.next_scan(page)
+        return self.auto_detect(page)
+
+    # ── Static detection (three-signal, no interaction needed) ──────────
+
+    def detect(self, page, pattern_name: str, guarantee: str = "BEHAVIORAL") -> list[dict]:
+        """Detect a specific pattern type using three-signal scoring.
+
+        Args:
+            page: Playwright page.
+            pattern_name: One of: search, feed, form, modal, login, cookie, chat, dropdown.
+            guarantee: Confidence level: STRUCTURAL, SEMANTIC, BEHAVIORAL, VERIFIED.
+
+        Returns:
+            List of detected candidates sorted by confidence.
+        """
+        if not self._wait_ready(page):
+            return []
+        try:
+            results = page.evaluate(
+                "(args) => window.__UC_detect(args[0], args[1])",
+                [pattern_name, guarantee],
+            )
+            if results:
+                logger.info(
+                    "Detected %d %s candidate(s), best=%.2f",
+                    len(results), pattern_name, results[0].get("confidence", 0),
+                )
+            return results or []
+        except Exception as e:
+            logger.error("detect(%s) failed: %s", pattern_name, e)
+            return []
+
+    def detect_all(self, page, guarantee: str = "BEHAVIORAL") -> dict:
+        """Detect all pattern types at once using three-signal scoring.
+
+        Returns dict mapping pattern name → list of candidates.
+        """
+        if not self._wait_ready(page):
+            return {}
+        try:
+            results = page.evaluate(
+                "(g) => window.__UC_detectAll(g)", guarantee,
+            )
+            for ptype, hits in (results or {}).items():
+                if hits:
+                    logger.info(
+                        "Detected %s: %d hit(s), best=%.2f",
+                        ptype, len(hits), hits[0].get("confidence", 0),
+                    )
+            return results or {}
+        except Exception as e:
+            logger.error("detect_all failed: %s", e)
+            return {}
+
+    def get_patterns(self, page) -> dict:
+        """Read current detected patterns from window.__UC (no new detection)."""
+        try:
+            uc = page.evaluate("window.__UC")
+            return (uc or {}).get("patterns", {})
+        except Exception:
+            return {}
 
     # ── Pattern-driven actions ──────────────────────────────────────────
 
     def dismiss_cookies(self, page) -> bool:
-        """Click the detected cookie consent accept button."""
+        """Detect and click the cookie consent accept button."""
+        self.detect(page, "cookie")
         try:
             return page.evaluate("window.__UC_dismiss()") is True
         except Exception:
@@ -175,59 +321,49 @@ class UCBrowser:
     def search(self, page, query: str, submit: bool = True) -> bool:
         """Type a query into the detected search bar.
 
-        Args:
-            page: Playwright page.
-            query: The search text.
-            submit: If True, press Enter after filling.
-
-        Returns:
-            True if a search bar was found and filled.
+        Runs static detection for search first, then fills the best match.
         """
-        uc = self.detect(page)
-        if not uc or not uc.get("patterns", {}).get("search"):
+        hits = self.detect(page, "search")
+        if not hits:
             logger.warning("No search bar detected on %s", page.url)
             return False
 
-        best = uc["patterns"]["search"][0]
-        selector = best["selector"]
-        logger.info("Filling search bar: %s (confidence=%.2f)", selector, best["confidence"])
+        best = hits[0]
+        selector = best.get("input_selector") or best["selector"]
+        logger.info("Filling search: %s (confidence=%.2f)", selector, best["confidence"])
 
         try:
-            # Use Playwright's fill for reliable input (handles React, etc.)
             page.fill(selector, query)
             if submit:
                 page.press(selector, "Enter")
                 page.wait_for_timeout(2000)
             return True
         except Exception as e:
-            # Fallback to the JS-based approach
-            logger.debug("Playwright fill failed (%s), trying JS approach", e)
+            logger.debug("Playwright fill failed (%s), trying JS", e)
             try:
-                filled = page.evaluate(
-                    "(q) => window.__UC_fillSearch(q)", query,
-                )
+                filled = page.evaluate("(q) => window.__UC_fillSearch(q)", query)
                 if filled and submit:
                     page.press(selector, "Enter")
                     page.wait_for_timeout(2000)
-                return filled
+                return bool(filled)
             except Exception:
                 return False
 
     def get_feed_text(self, page) -> str:
-        """Extract text from the detected feed container, or full page text."""
+        """Extract text from the detected feed container, or full page."""
+        self.detect(page, "feed")
         try:
             return page.evaluate("window.__UC_getVisibleText()") or ""
         except Exception:
             return page.evaluate("document.body.innerText") or ""
 
     def get_feed_items(self, page) -> list[str]:
-        """Extract individual feed item texts using the detected item selector."""
-        uc = self.detect(page)
-        if not uc or not uc.get("patterns", {}).get("feed"):
+        """Extract individual feed item texts using detected item selector."""
+        hits = self.detect(page, "feed")
+        if not hits:
             return [page.evaluate("document.body.innerText") or ""]
 
-        best = uc["patterns"]["feed"][0]
-        item_sel = best.get("item_selector")
+        item_sel = hits[0].get("item_selector")
         if not item_sel:
             return [self.get_feed_text(page)]
 
@@ -242,30 +378,19 @@ class UCBrowser:
         except Exception:
             return [self.get_feed_text(page)]
 
-    def scroll_feed(
-        self, page, seconds: int = 15, on_item: callable = None,
-    ) -> list[str]:
+    def scroll_feed(self, page, seconds: int = 15, on_item: callable = None) -> list[str]:
         """Scroll the detected feed container, collecting item texts.
 
-        Args:
-            page: Playwright page.
-            seconds: How long to scroll.
-            on_item: Optional callback called with each new item text.
-
-        Returns:
-            List of item texts collected during scrolling.
+        Uses static detection to find the feed, then scrolls it.
         """
-        uc = self.detect(page)
-        feed_selector = None
-        if uc and uc.get("patterns", {}).get("feed"):
-            feed_selector = uc["patterns"]["feed"][0].get("selector")
+        hits = self.detect(page, "feed")
+        feed_selector = hits[0]["selector"] if hits else None
 
         seen_texts = set()
         all_items = []
         end_time = time.time() + seconds
 
         while time.time() < end_time:
-            # Scroll
             if feed_selector:
                 page.evaluate(
                     """(sel) => {
@@ -280,7 +405,6 @@ class UCBrowser:
 
             page.wait_for_timeout(800)
 
-            # Collect new items
             current = self.get_feed_items(page)
             for text in current:
                 if text not in seen_texts:
@@ -289,33 +413,24 @@ class UCBrowser:
                     if on_item:
                         on_item(text)
 
-        logger.info("Scroll complete: %d items collected in %ds", len(all_items), seconds)
+        logger.info("Scroll complete: %d items in %ds", len(all_items), seconds)
         return all_items
 
     def fill_form(self, page, fields: dict[str, str]) -> bool:
         """Fill a detected form with field values.
 
-        Args:
-            page: Playwright page.
-            fields: Mapping of field name/label → value.
-                    Keys are matched against input name, placeholder,
-                    aria-label, or type (best effort).
-
-        Returns:
-            True if at least one field was filled.
+        Keys are matched against input name, type, or placeholder.
         """
-        uc = self.detect(page)
-        if not uc or not uc.get("patterns", {}).get("form"):
+        hits = self.detect(page, "form")
+        if not hits:
             logger.warning("No form detected on %s", page.url)
             return False
 
-        best = uc["patterns"]["form"][0]
-        form_fields = best.get("fields", [])
+        form_fields = hits[0].get("fields", [])
         filled_any = False
 
         for key, value in fields.items():
             key_lower = key.lower()
-            # Find matching field
             matched = None
             for f in form_fields:
                 if (
@@ -325,27 +440,25 @@ class UCBrowser:
                 ):
                     matched = f
                     break
-
             if matched:
                 try:
                     page.fill(matched["selector"], value)
                     filled_any = True
                 except Exception as e:
-                    logger.debug("Failed to fill field %s: %s", key, e)
+                    logger.debug("Failed to fill %s: %s", key, e)
 
         return filled_any
 
     def submit_form(self, page) -> bool:
         """Click the submit button on the detected form."""
-        uc = self.detect(page)
-        if not uc or not uc.get("patterns", {}).get("form"):
+        hits = self.detect(page, "form")
+        if not hits:
             return False
-
-        best = uc["patterns"]["form"][0]
         try:
-            # Try to find a submit button within the form
-            form_sel = best["selector"]
-            btn = page.query_selector(f"{form_sel} button[type='submit'], {form_sel} button, {form_sel} [type='submit']")
+            form_sel = hits[0]["selector"]
+            btn = page.query_selector(
+                f"{form_sel} button[type='submit'], {form_sel} button, {form_sel} [type='submit']"
+            )
             if btn:
                 btn.click()
                 page.wait_for_timeout(2000)
@@ -356,12 +469,10 @@ class UCBrowser:
 
     def close_modal(self, page) -> bool:
         """Dismiss the detected modal/dialog."""
-        uc = self.detect(page)
-        if not uc or not uc.get("patterns", {}).get("modal"):
+        hits = self.detect(page, "modal")
+        if not hits:
             return False
-
-        best = uc["patterns"]["modal"][0]
-        dismiss_sel = best.get("dismiss_selector")
+        dismiss_sel = hits[0].get("dismiss_selector")
         if dismiss_sel:
             try:
                 page.click(dismiss_sel)
@@ -373,62 +484,484 @@ class UCBrowser:
 
     def has_login_wall(self, page) -> bool:
         """Check if the page has a blocking login wall."""
-        uc = self.detect(page)
-        if not uc or not uc.get("patterns", {}).get("login_wall"):
-            return False
-        return any(lw.get("blocking") for lw in uc["patterns"]["login_wall"])
+        hits = self.detect(page, "login")
+        return any(h.get("blocking") for h in hits)
 
-    def get_patterns(self, page) -> dict:
-        """Return all detected patterns as a dict."""
-        uc = self.detect(page)
-        if not uc:
+    # ── Full UC action APIs (requires bind) ───────────────────────────
+
+    def bind(self, page, pattern_name: str) -> Optional[dict]:
+        """Detect and bind a pattern, creating a UC action API for it."""
+        try:
+            return page.evaluate("(p) => window.__UC_bind(p)", pattern_name)
+        except Exception:
+            return None
+
+    def chat_send(self, page, text: str) -> bool:
+        """Send a chat message using UC's framework-aware setText."""
+        try:
+            return page.evaluate("(t) => window.__UC_chatSend(t)", text) is True
+        except Exception:
+            return False
+
+    def chat_get_messages(self, page) -> list:
+        """Get all visible chat messages."""
+        try:
+            return page.evaluate("window.__UC_chatGetMessages()") or []
+        except Exception:
+            return []
+
+    def form_fill_uc(self, page, data: dict) -> bool:
+        """Fill form using UC's priority-based field matching (name > id > type > placeholder)."""
+        try:
+            return page.evaluate("(d) => window.__UC_formFill(d)", data) is not False
+        except Exception:
+            return False
+
+    def form_get_values(self, page) -> dict:
+        """Get current form field values."""
+        try:
+            return page.evaluate("window.__UC_formGetValues()") or {}
+        except Exception:
             return {}
-        return uc.get("patterns", {})
+
+    def dropdown_toggle(self, page) -> bool:
+        """Toggle detected dropdown."""
+        try:
+            return page.evaluate("window.__UC_dropdownToggle()") is True
+        except Exception:
+            return False
+
+    def dropdown_select(self, page, value: str) -> bool:
+        """Select a dropdown option by text."""
+        try:
+            return page.evaluate("(v) => window.__UC_dropdownSelect(v)", value) is True
+        except Exception:
+            return False
+
+    def modal_close_uc(self, page) -> bool:
+        """Close modal using UC's method (button click + Escape fallback)."""
+        try:
+            return page.evaluate("window.__UC_modalClose()") is True
+        except Exception:
+            return False
+
+    # ── Advanced: LLM context, heap scan, passive, signatures ──────────
+
+    def get_llm_context(self, page, pattern_name: str = "search") -> Optional[str]:
+        """Extract LLM-formatted context for a detected pattern."""
+        try:
+            return page.evaluate("(p) => window.__UC_getLLMContext(p)", pattern_name)
+        except Exception:
+            return None
+
+    def heap_scan(self, page, pattern_name: str = None) -> Optional[dict]:
+        """Scan React/Vue/Angular internals for the detected element."""
+        try:
+            return page.evaluate("(p) => window.__UC_heapScan(p)", pattern_name)
+        except Exception:
+            return None
+
+    def scan_framework(self, page) -> Optional[dict]:
+        """Detect which frontend framework the page uses."""
+        try:
+            return page.evaluate("window.__UC_scanFramework()")
+        except Exception:
+            return None
+
+    def start_passive(self, page) -> bool:
+        """Start passive detection (MutationObserver + event correlation)."""
+        try:
+            return page.evaluate("window.__UC_startPassive()") is True
+        except Exception:
+            return False
+
+    def stop_passive(self, page) -> bool:
+        """Stop passive detection."""
+        try:
+            return page.evaluate("window.__UC_stopPassive()") is True
+        except Exception:
+            return False
+
+    def get_passive_results(self, page) -> list:
+        """Get patterns inferred by passive detection."""
+        try:
+            return page.evaluate("window.__UC_getPassiveResults()") or []
+        except Exception:
+            return []
+
+    def save_signature(self, page, pattern_name: str) -> Optional[dict]:
+        """Save a confirmed-working pattern binding for future auto-bind."""
+        try:
+            return page.evaluate("(p) => window.__UC_saveSignature(p)", pattern_name)
+        except Exception:
+            return None
+
+    def load_signatures(self, page) -> list:
+        """Load saved signatures for the current site."""
+        try:
+            return page.evaluate("window.__UC_loadSignatures()") or []
+        except Exception:
+            return []
+
+    def auto_bind_signatures(self, page) -> list:
+        """Auto-bind patterns from saved signatures."""
+        try:
+            return page.evaluate("window.__UC_autoBindSignatures()") or []
+        except Exception:
+            return []
+
+    # ── Generic input/button discovery ────────────────────────────────
+
+    def find_inputs(self, page) -> list[dict]:
+        """Find all interactive inputs on the page, scored by chat-likelihood."""
+        if not self._wait_ready(page):
+            return []
+        try:
+            return page.evaluate("window.__UC_findInputs()") or []
+        except Exception:
+            return []
+
+    def find_buttons(self, page, input_selector: str = None) -> list[dict]:
+        """Find submit/send buttons near an input element."""
+        if not self._wait_ready(page):
+            return []
+        try:
+            return page.evaluate("(s) => window.__UC_findButtons(s)", input_selector) or []
+        except Exception:
+            return []
+
+    def set_text(self, page, selector: str, text: str) -> dict:
+        """Set text using UC's framework-aware setText (handles React/Slate/etc)."""
+        try:
+            return page.evaluate(
+                "(args) => window.__UC_setText(args[0], args[1])", [selector, text],
+            ) or {"success": False}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def find_new_content(self, page) -> list[dict]:
+        """After a scan-diff, find where new content appeared (children-added, text-grew)."""
+        try:
+            return page.evaluate("window.__UC_findNewContent()") or []
+        except Exception:
+            return []
+
+    # ── Dynamic chat interaction (full UC toolbox) ──────────────────────
+
+    def chat(
+        self, page, message: str, timeout_s: int = 30,
+    ) -> Optional[str]:
+        """Send a message to any chat interface and return the response.
+
+        Uses the full UC toolbox:
+        - __UC_findInputs (scored input discovery)
+        - __UC_setText (framework-aware: React, Slate, ProseMirror)
+        - __UC_findButtons (proximity-based button finding)
+        - __UC_startPassive (background MutationObserver correlation)
+        - __UC_captureBaseline + __UC_firstScan (trigram + scan-diff baselines)
+        - __UC_watchContainer (real-time MutationObserver on response area)
+        - __UC_extractResponse (trigram set difference for filtering)
+        - __UC_findNewContent (scan-diff for container discovery)
+        - __UC_saveSignature (persist working patterns per domain)
+        """
+        # ── Start passive detection in background ────────────────
+        self.start_passive(page)
+
+        # ── Find the input ───────────────────────────────────────
+        inputs = self.find_inputs(page)
+        if not inputs:
+            logger.warning("No interactive input found on page.")
+            return None
+
+        best_input = inputs[0]
+        selector = best_input["selector"]
+        logger.info(
+            "Input: %s (score=%.1f, ce=%s, ph='%s')",
+            selector, best_input["score"],
+            best_input["contentEditable"],
+            best_input.get("placeholder", "")[:30],
+        )
+
+        # ── Capture baselines BEFORE typing ──────────────────────
+        # Trigram baseline (for text filtering)
+        try:
+            bl = page.evaluate("window.__UC_captureBaseline()")
+            logger.info("Trigram baseline: %d trigrams", bl.get("trigrams", 0))
+        except Exception:
+            pass
+        # Scan-diff baseline (for container discovery)
+        self.first_scan(page)
+
+        # ── Type with UC's setText (handles contenteditable/React) ─
+        result = self.set_text(page, selector, message)
+        if not result.get("success"):
+            logger.warning("setText failed (%s), Playwright fallback", result.get("error"))
+            try:
+                page.click(selector)
+                if best_input.get("contentEditable"):
+                    page.type(selector, message, delay=10)
+                else:
+                    page.fill(selector, message)
+            except Exception as e:
+                logger.error("Failed to type: %s", e)
+                return None
+        else:
+            logger.info("setText OK (method=%s)", result.get("method"))
+
+        # ── Find send button (only appears after text entry on some sites) ─
+        page.wait_for_timeout(300)
+        buttons = self.find_buttons(page, selector)
+        btn_sel = buttons[0]["selector"] if buttons else None
+        if btn_sel:
+            logger.info("Send button: %s (score=%.1f)", btn_sel, buttons[0]["score"])
+
+        # ── Set up real-time response watcher before submitting ──
+        # Find the likely response container (parent of the conversation area)
+        watch_started = page.evaluate("""(inputSel) => {
+            // Look for a scrollable ancestor that holds messages
+            const input = document.querySelector(inputSel);
+            if (!input) return false;
+            let cur = input;
+            for (let i = 0; i < 15 && cur; i++) {
+                cur = cur.parentElement;
+                if (!cur) break;
+                // A main/article/section container, or one with role
+                const tag = cur.tagName.toLowerCase();
+                const role = cur.getAttribute('role') || '';
+                if (tag === 'main' || role === 'main' || role === 'presentation' || role === 'region') {
+                    return window.__UC_watchContainer(
+                        cur.id ? '#' + cur.id : tag + (role ? '[role="' + role + '"]' : '')
+                    );
+                }
+                // Or a scrollable container
+                const style = getComputedStyle(cur);
+                if (cur.scrollHeight > cur.clientHeight + 100 &&
+                    (style.overflowY === 'auto' || style.overflowY === 'scroll')) {
+                    return window.__UC_watchContainer(
+                        cur.id ? '#' + cur.id : window.__UC_findNewContent.toString() ? 'body' : 'body'
+                    );
+                }
+            }
+            // Fallback: watch body
+            return window.__UC_watchContainer('body');
+        }""", selector)
+        if watch_started:
+            logger.info("Response watcher active")
+
+        # ── Submit ───────────────────────────────────────────────
+        if btn_sel:
+            try:
+                page.click(btn_sel)
+            except Exception:
+                page.press(selector, "Enter")
+        else:
+            page.press(selector, "Enter")
+
+        # ── Verify send: check if input cleared (postcondition) ──
+        page.wait_for_timeout(500)
+        input_cleared = page.evaluate("""(sel) => {
+            const el = document.querySelector(sel);
+            if (!el) return true;
+            const val = el.value || el.textContent || '';
+            return val.trim().length === 0;
+        }""", selector)
+        if input_cleared:
+            logger.info("Send verified: input cleared")
+        else:
+            logger.warning("Input not cleared — send may have failed")
+
+        # ── Wait for response ────────────────────────────────────
+        response = self._wait_chat_response(page, timeout_s, sent_message=message)
+
+        # ── Save working pattern for this domain ─────────────────
+        if response and len(response) > 10:
+            try:
+                # Try to bind and save signature for next visit
+                self.bind(page, "chat")
+                self.save_signature(page, "chat")
+                logger.info("Signature saved for %s", page.url)
+            except Exception:
+                pass
+
+        # ── Check passive detection results ──────────────────────
+        try:
+            passive = self.get_passive_results(page)
+            if passive:
+                logger.info("Passive detected %d pattern(s)", len(passive))
+        except Exception:
+            pass
+
+        return response
+
+    def _wait_chat_response(
+        self, page, timeout_s: int = 30, sent_message: str = "",
+    ) -> Optional[str]:
+        """Wait for response using the full UC toolbox:
+
+        Layer 1 — Real-time MutationObserver (__UC_getObserved):
+            Captures new nodes/text as they stream in. Fastest signal.
+        Layer 2 — Scan-diff (__UC_findNewContent):
+            Discovers the response container via DOM diffing. Most reliable
+            for deeply nested content (ChatGPT depth=16).
+        Layer 3 — Trigram set difference (inline):
+            Filters response text from boilerplate by comparing trigrams
+            against the pre-send baseline. Eliminates nav/sidebar/footer.
+
+        Response is complete when text stabilises for 3 polls (1.5s at
+        500ms intervals) or streaming indicators disappear after 5s.
+        """
+        logger.info("Waiting for response (up to %ds)...", timeout_s)
+
+        response_selector = None
+        last_text = ""
+        stable_count = 0
+        poll_ms = 500  # Faster polling than before (was 1000)
+
+        for tick in range(timeout_s * 2):  # 2 ticks per second
+            page.wait_for_timeout(poll_ms)
+
+            # ── Layer 1: Check real-time observer for new content ──
+            current_text = ""
+            try:
+                observed = page.evaluate("window.__UC_getObserved()")
+                if observed:
+                    # Concatenate all non-own-message observed texts
+                    parts = []
+                    for obs in observed:
+                        t = obs.get("text", "").strip()
+                        if not t or len(t) < 5:
+                            continue
+                        # Skip if it contains the sent message
+                        if sent_message and sent_message.lower()[:40] in t.lower():
+                            continue
+                        parts.append(t)
+                    if parts:
+                        # Use the longest observed part as the response
+                        current_text = max(parts, key=len)
+            except Exception:
+                pass
+
+            # ── Layer 2: Scan-diff container discovery (first 10 ticks) ──
+            if not response_selector and tick < 20:
+                try:
+                    self.next_scan(page)
+                    new_content = self.find_new_content(page)
+                    if new_content:
+                        response_selector = new_content[0].get("selector")
+                        if response_selector:
+                            logger.info("Container (scan-diff): %s", response_selector)
+                            # Also start watching this specific container
+                            page.evaluate(
+                                "(s) => window.__UC_watchContainer(s)", response_selector,
+                            )
+                except Exception:
+                    pass
+
+            # ── Layer 3: Trigram-filtered extraction from container ──
+            if response_selector and not current_text:
+                try:
+                    current_text = page.evaluate(
+                        """(args) => {
+                            const el = document.querySelector(args[0]);
+                            if (!el) return '';
+                            const sentMsg = args[1];
+                            if (!window._baselineTrigrams) return el.innerText.trim();
+
+                            const _tri = (t) => {
+                                const s = new Set();
+                                const lc = t.toLowerCase();
+                                for (let i = 0; i <= lc.length - 3; i++) s.add(lc.slice(i, i + 3));
+                                return s;
+                            };
+                            const bl = window._baselineTrigrams;
+                            if (sentMsg) { for (const t of _tri(sentMsg)) bl.add(t); }
+
+                            let best = '', bestR = 0;
+                            for (const c of el.querySelectorAll('*')) {
+                                const ct = (c.innerText || '').trim();
+                                if (ct.length < 10 || ct.length > 5000 || c.children.length > 15) continue;
+                                if (sentMsg && ct.toLowerCase().includes(sentMsg.toLowerCase().slice(0, 40))) continue;
+                                const tris = _tri(ct);
+                                if (!tris.size) continue;
+                                let n = 0;
+                                for (const t of tris) { if (!bl.has(t)) n++; }
+                                const r = n / tris.size;
+                                if (r > bestR) { bestR = r; best = ct; }
+                            }
+                            return best && bestR > 0.3 ? best : el.innerText.trim();
+                        }""",
+                        [response_selector, sent_message],
+                    )
+                except Exception:
+                    pass
+
+            # ── Stability check ──────────────────────────────────
+            if not current_text or len(current_text) < 15:
+                continue
+
+            if current_text == last_text:
+                stable_count += 1
+                if stable_count >= 3:
+                    logger.info("Response stabilised (%d chars).", len(current_text))
+                    return current_text
+            else:
+                stable_count = 0
+                last_text = current_text
+
+            # ── Streaming indicator check (after 5s minimum) ─────
+            if tick >= 10:  # 5 seconds at 500ms
+                streaming = page.evaluate("""() => {
+                    return document.querySelectorAll(
+                        '[class*="streaming"], [class*="typing"], '
+                        + '[class*="loading"], [data-testid*="stop"]'
+                    ).length > 0;
+                }""")
+                if not streaming and last_text and stable_count >= 2:
+                    logger.info("Streaming done (%d chars).", len(last_text))
+                    return last_text
+
+        # Stop observer
+        try:
+            page.evaluate("window.__UC_stopWatching()")
+        except Exception:
+            pass
+
+        if last_text:
+            logger.warning("Timed out, partial response (%d chars).", len(last_text))
+            return last_text
+        logger.warning("No response detected after %ds.", timeout_s)
+        return None
 
     # ── Convenience: open + detect + act ────────────────────────────────
 
     def navigate_and_search(self, url: str, query: str) -> tuple:
-        """Open a URL, handle obstacles, search, and return (page, results_text).
+        """Open URL → detect → clear obstacles → search → return (page, text).
 
-        This is the high-level "do everything" method:
-        1. Opens the URL
-        2. Detects patterns
-        3. Dismisses cookie banners
-        4. Closes blocking modals
-        5. Fills the search bar and submits
-        6. Returns the page and visible results text
+        High-level convenience method that handles the full workflow.
         """
         page = self.open(url)
-        uc = self.detect(page)
+        self.detect_all(page)
+        self.dismiss_cookies(page)
+        self.close_modal(page)
 
-        if uc:
-            self.dismiss_cookies(page)
-            self.close_modal(page)
-
-            if self.has_login_wall(page):
-                logger.warning("Login wall detected on %s", url)
+        if self.has_login_wall(page):
+            logger.warning("Login wall detected on %s", url)
 
         self.search(page, query)
-        # Rescan after search results load
-        self.rescan(page)
+        page.wait_for_timeout(1000)
+        # Re-detect after search results load
+        self.detect(page, "feed")
         text = self.get_feed_text(page)
         return page, text
 
     def navigate_and_scrape(self, url: str, scroll_seconds: int = 15) -> tuple:
-        """Open a URL, handle obstacles, scroll the feed, return (page, items).
+        """Open URL → detect → clear obstacles → scroll feed → return (page, items).
 
-        1. Opens the URL
-        2. Detects patterns
-        3. Dismisses cookie banners / modals
-        4. Scrolls the feed for the given duration
-        5. Returns the page and list of item texts
+        High-level convenience method for feed scraping.
         """
         page = self.open(url)
-        uc = self.detect(page)
-
-        if uc:
-            self.dismiss_cookies(page)
-            self.close_modal(page)
-
+        self.detect_all(page)
+        self.dismiss_cookies(page)
+        self.close_modal(page)
         items = self.scroll_feed(page, seconds=scroll_seconds)
         return page, items

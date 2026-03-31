@@ -1,0 +1,976 @@
+/**
+ * extension-entry.js — Chrome MV3 entry point for Universal Controller.
+ *
+ * Replaces UC's index.js (which uses Tampermonkey APIs + injects a UI panel).
+ * This version:
+ *  - Creates a UniversalController instance
+ *  - Exposes the full API on window.__UC and window.__UC_* functions
+ *  - Exposes window.UniversalController and window.UC for direct access
+ *  - No UI panel, no GM_addStyle, no GM_registerMenuCommand
+ *  - Starts passive detection and frame scanning automatically
+ *
+ * Built by Rollup from UC submodule source + this entry point.
+ */
+
+import { UniversalController } from '../../universal_controller/src/detection/universal-controller.js';
+import { FrameRPCChild, isInIframe } from '../../universal_controller/src/iframe/frame-rpc.js';
+import { chatSend, chatGetMessages, chatOnMessage } from '../../universal_controller/src/actions/chat-api.js';
+import { formFill, formSubmit, formGetValues } from '../../universal_controller/src/actions/form-api.js';
+import { dropdownToggle, dropdownSelect } from '../../universal_controller/src/actions/dropdown-api.js';
+import { modalClose } from '../../universal_controller/src/actions/modal-api.js';
+import { setText } from '../../universal_controller/src/actions/text-input.js';
+import { extractLLMContext, generateCopyContext } from '../../universal_controller/src/llm/context-extractor.js';
+import { fullHeapScan, scanFramework } from '../../universal_controller/src/llm/heap-scanner.js';
+import { PatternVerifier } from '../../universal_controller/src/llm/state-machine.js';
+
+// ── Self-detection nonce ───────────────────────────────────────────────
+const UC_NONCE = crypto.getRandomValues(new Uint32Array(1))[0].toString(36);
+const UC_ATTR = 'data-uc-nonce';
+
+// ── Controller instance ────────────────────────────────────────────────
+const controller = new UniversalController({ nonce: UC_NONCE, nonceAttr: UC_ATTR });
+const verifier = new PatternVerifier();
+const logFn = (type, msg) => controller.log(type, msg);
+
+// ── State object ───────────────────────────────────────────────────────
+window.__UC = {
+  version: '1.0.0',
+  ready: false,
+  mode: null,
+  timestamp: 0,
+  url: location.href,
+  scan: null,
+  diff: null,
+  patterns: {},
+};
+
+// ── Scan-diff workflow ─────────────────────────────────────────────────
+
+window.__UC_firstScan = function () {
+  const snap = controller.firstScan();
+  window.__UC.scan = { elements: snap.elements.size, timestamp: snap.timestamp };
+  window.__UC.diff = null;
+  window.__UC.mode = 'scan';
+  window.__UC.timestamp = Date.now();
+  return window.__UC.scan;
+};
+
+window.__UC_nextScan = function () {
+  const diff = controller.nextScan();
+  // If firstScan was never called, nextScan returns a snapshot (no .summary)
+  if (!diff || !diff.summary) {
+    console.warn('[UC] nextScan returned a snapshot, not a diff. Call __UC_firstScan() first.');
+    window.__UC.mode = 'scan';
+    window.__UC.timestamp = Date.now();
+    return { changed: 0, added: 0, removed: 0, increased: 0, decreased: 0 };
+  }
+  window.__UC.diff = diff.summary;
+  window.__UC.mode = 'diffed';
+  window.__UC.timestamp = Date.now();
+  return diff.summary;
+};
+
+window.__UC_autoDetect = function () {
+  const detected = controller.autoDetect();
+  for (const d of detected) {
+    const pats = window.__UC.patterns[d.pattern] || [];
+    pats.push({
+      selector: _safeSelector(d.components?.container || d.components?.input),
+      confidence: d.confidence,
+      proof: d.proof,
+      source: 'scan-diff',
+    });
+    window.__UC.patterns[d.pattern] = pats;
+  }
+  window.__UC.mode = 'detected';
+  window.__UC.timestamp = Date.now();
+  return detected.map(d => ({
+    pattern: d.pattern,
+    confidence: d.confidence,
+    proof: d.proof,
+    selector: _safeSelector(d.components?.container || d.components?.input),
+  }));
+};
+
+// ── Three-signal static detection ──────────────────────────────────────
+
+window.__UC_detect = function (patternName, guarantee) {
+  const results = controller.detect(patternName, guarantee || 'BEHAVIORAL');
+  window.__UC.patterns[patternName] = results.map(_serializeResult);
+  window.__UC.mode = 'detected';
+  window.__UC.timestamp = Date.now();
+  return window.__UC.patterns[patternName];
+};
+
+window.__UC_detectAll = function (guarantee) {
+  const patterns = ['chat', 'form', 'dropdown', 'modal', 'login', 'search', 'cookie', 'feed'];
+  const all = {};
+  for (const name of patterns) {
+    const results = controller.detect(name, guarantee || 'BEHAVIORAL');
+    all[name] = results.map(_serializeResult);
+  }
+  window.__UC.patterns = all;
+  window.__UC.mode = 'detected';
+  window.__UC.timestamp = Date.now();
+  window.__UC.ready = true;
+  return all;
+};
+
+// ── Binding ────────────────────────────────────────────────────────────
+
+window.__UC_bind = function (patternName) {
+  // Find the best detected result for this pattern
+  const results = controller.detect(patternName, 'STRUCTURAL');
+  if (results.length === 0) return null;
+  const best = results[0];
+  const api = controller.bind(patternName, best.path);
+  return api ? { pattern: patternName, path: best.path } : null;
+};
+
+window.__UC_unbind = function (patternName) {
+  return controller.unbind(patternName);
+};
+
+window.__UC_listBound = function () {
+  return controller.listBoundAPIs();
+};
+
+// ── Action APIs (work on bound patterns) ───────────────────────────────
+
+window.__UC_chatSend = function (text) {
+  const api = controller.getAPI('chat');
+  if (!api) { _autoBind('chat'); }
+  const api2 = controller.getAPI('chat');
+  if (!api2) return false;
+  return api2.send(text);
+};
+
+window.__UC_chatGetMessages = function () {
+  const api = controller.getAPI('chat');
+  if (!api) return [];
+  return api.getMessages();
+};
+
+window.__UC_chatOnMessage = function (callback) {
+  const api = controller.getAPI('chat');
+  if (!api) return null;
+  return api.onMessage(callback);
+};
+
+window.__UC_formFill = function (data) {
+  const api = controller.getAPI('form');
+  if (!api) { _autoBind('form'); }
+  const api2 = controller.getAPI('form');
+  if (!api2) return false;
+  return api2.fill(data);
+};
+
+window.__UC_formSubmit = function () {
+  const api = controller.getAPI('form');
+  if (!api) return false;
+  return api.submit();
+};
+
+window.__UC_formGetValues = function () {
+  const api = controller.getAPI('form');
+  if (!api) return {};
+  return api.getValues();
+};
+
+window.__UC_dropdownToggle = function () {
+  const api = controller.getAPI('dropdown');
+  if (!api) { _autoBind('dropdown'); }
+  const api2 = controller.getAPI('dropdown');
+  if (!api2) return false;
+  api2.toggle();
+  return true;
+};
+
+window.__UC_dropdownSelect = function (value) {
+  const api = controller.getAPI('dropdown');
+  if (!api) { _autoBind('dropdown'); }
+  const api2 = controller.getAPI('dropdown');
+  if (!api2) return false;
+  api2.select(value);
+  return true;
+};
+
+window.__UC_modalClose = function () {
+  const api = controller.getAPI('modal');
+  if (!api) { _autoBind('modal'); }
+  const api2 = controller.getAPI('modal');
+  if (!api2) return false;
+  api2.close();
+  return true;
+};
+
+// ── Convenience helpers (kept from previous version) ───────────────────
+
+window.__UC_dismiss = function () {
+  const cookies = window.__UC.patterns.cookie || [];
+  for (const cc of cookies) {
+    if (cc.accept_selector) {
+      const btn = document.querySelector(cc.accept_selector);
+      if (btn) { btn.click(); return true; }
+    }
+  }
+  // Fallback: try detecting and binding
+  const results = controller.detect('cookie', 'STRUCTURAL');
+  if (results.length > 0 && results[0].components) {
+    const comp = results[0].components;
+    const acceptBtn = comp.container?.querySelector(
+      'button[class*="accept" i], button[class*="agree" i]'
+    ) || Array.from(comp.container?.querySelectorAll('button, a') || []).find(b => {
+      const t = (b.textContent || '').toLowerCase().trim();
+      return t.includes('accept') || t.includes('agree') || t.includes('got it') || t.includes('allow') || t === 'ok';
+    });
+    if (acceptBtn) { acceptBtn.click(); return true; }
+  }
+  return false;
+};
+
+window.__UC_fillSearch = function (query) {
+  // Try bound API first
+  const api = controller.getAPI('search');
+  if (api && api.components?.input) {
+    setText(api.components.input, query);
+    return true;
+  }
+  // Fallback: detect and use
+  const results = controller.detect('search', 'STRUCTURAL');
+  if (results.length === 0) return false;
+  const input = results[0].components?.input;
+  if (!input) return false;
+  setText(input, query);
+  return true;
+};
+
+window.__UC_getVisibleText = function () {
+  const feeds = window.__UC.patterns.feed || [];
+  if (feeds.length > 0 && feeds[0].selector) {
+    const el = document.querySelector(feeds[0].selector);
+    if (el) return el.innerText;
+  }
+  return document.body.innerText;
+};
+
+// ── Generic input/button discovery (pattern-agnostic) ──────────────────
+
+/**
+ * Find ALL interactive inputs on the page, scored by chat-likelihood.
+ * Works on ChatGPT, Claude, Slack, Discord, etc. without needing
+ * pattern-specific selectors.
+ */
+window.__UC_findInputs = function () {
+  const candidates = [
+    ...document.querySelectorAll(
+      '[contenteditable="true"], textarea, '
+      + 'input[type="text"], input[type="search"], input:not([type])'
+    ),
+  ];
+
+  return candidates
+    .map(el => {
+      const rect = el.getBoundingClientRect();
+      const style = getComputedStyle(el);
+
+      // Skip invisible / inert
+      if (rect.width === 0 || rect.height === 0) return null;
+      if (style.display === 'none' || style.visibility === 'hidden') return null;
+      if (el.closest('[inert]') || el.closest('[aria-hidden="true"]')) return null;
+
+      let score = 0;
+
+      // Tag type scoring
+      const isCE = el.contentEditable === 'true';
+      if (isCE) score += 3;
+      else if (el.tagName === 'TEXTAREA') score += 2;
+      else score += 1;
+
+      // Size scoring — larger inputs are more likely primary
+      score += Math.min(rect.width / 400, 1.5);
+      score += Math.min(rect.height / 100, 1);
+
+      // Position — lower on page = more likely chat input (vs header search)
+      const yRatio = rect.top / window.innerHeight;
+      if (yRatio > 0.6) score += 2;
+      else if (yRatio > 0.3) score += 1;
+
+      // Placeholder / aria-label text signals
+      const hint = (
+        (el.getAttribute('placeholder') || '') + ' ' +
+        (el.getAttribute('aria-label') || '') + ' ' +
+        (el.getAttribute('data-testid') || '') + ' ' +
+        (el.id || '')
+      ).toLowerCase();
+
+      const chatSignals = ['message', 'ask', 'type', 'prompt', 'chat', 'send', 'compose', 'reply'];
+      const searchSignals = ['search', 'find', 'query', 'filter', 'keyword'];
+
+      for (const s of chatSignals) { if (hint.includes(s)) { score += 2; break; } }
+      for (const s of searchSignals) { if (hint.includes(s)) { score -= 1; break; } }
+
+      return {
+        selector: _safeSelector(el),
+        tag: el.tagName,
+        contentEditable: isCE,
+        placeholder: el.getAttribute('placeholder') || '',
+        ariaLabel: el.getAttribute('aria-label') || '',
+        score: Math.round(score * 100) / 100,
+        rect: { x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height) },
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score);
+};
+
+/**
+ * Find submit/send buttons near a given input element.
+ * Walks up the DOM through form, fieldset, composer containers.
+ */
+window.__UC_findButtons = function (inputSelector) {
+  const input = inputSelector ? document.querySelector(inputSelector) : null;
+
+  // Build search roots: walk up from input through likely containers
+  const roots = [];
+  if (input) {
+    let cur = input;
+    for (let i = 0; i < 6 && cur && cur !== document.body; i++) {
+      roots.push(cur);
+      cur = cur.parentElement;
+    }
+  }
+  // Also search form, fieldset, and common composer containers
+  if (input) {
+    const extra = [
+      input.closest('form'),
+      input.closest('fieldset'),
+      input.closest('[class*="composer" i]'),
+      input.closest('[class*="chat" i]'),
+      input.closest('[class*="prompt" i]'),
+      input.closest('[data-testid]'),
+    ].filter(Boolean);
+    for (const e of extra) {
+      if (!roots.includes(e)) roots.push(e);
+    }
+  }
+  if (roots.length === 0) roots.push(document.body);
+
+  const seen = new Set();
+  const results = [];
+
+  const skipPatterns = /toggle|menu|attach|upload|expand|close|collapse|emoji|format|more/i;
+  const sendPatterns = /send|submit|post|enter|go/i;
+  const searchPatterns = /search|find/i;
+
+  for (const root of roots) {
+    for (const btn of root.querySelectorAll('button, [role="button"], input[type="submit"]')) {
+      const key = _safeSelector(btn);
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      const rect = btn.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) continue;
+
+      const label = (
+        (btn.innerText || '') + ' ' +
+        (btn.getAttribute('aria-label') || '') + ' ' +
+        (btn.getAttribute('data-testid') || '') + ' ' +
+        (btn.title || '')
+      ).toLowerCase().trim();
+
+      let score = 0;
+
+      // Label scoring
+      if (sendPatterns.test(label)) score += 4;
+      else if (searchPatterns.test(label)) score += 2;
+      if (skipPatterns.test(label)) score -= 3;
+      if (btn.getAttribute('aria-haspopup')) score -= 2;
+
+      // Type scoring
+      if (btn.type === 'submit') score += 2;
+
+      // Proximity to input (lower = closer = better)
+      if (input) {
+        const inputRect = input.getBoundingClientRect();
+        const dist = Math.abs(rect.x - inputRect.x) + Math.abs(rect.y - inputRect.y);
+        score += Math.max(0, 3 - dist / 200);
+      }
+
+      if (score > 0) {
+        results.push({
+          selector: key,
+          label: label.slice(0, 60),
+          type: btn.type || '',
+          score: Math.round(score * 100) / 100,
+        });
+      }
+    }
+  }
+
+  return results.sort((a, b) => b.score - a.score);
+};
+
+/**
+ * Framework-aware text input using UC's setText().
+ * Handles contenteditable (Slate, ProseMirror, TipTap), React synthetic
+ * events, execCommand, paste simulation, and native inputs.
+ */
+window.__UC_setText = function (selector, text) {
+  const el = document.querySelector(selector);
+  if (!el) return { success: false, error: 'Element not found' };
+  try {
+    el.focus();
+    const result = setText(el, text);
+    return { success: true, method: result?.method || 'unknown' };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+};
+
+/**
+ * Click a button by selector, with optional pre-focus.
+ */
+window.__UC_clickButton = function (selector) {
+  const el = document.querySelector(selector);
+  if (!el) return false;
+  el.click();
+  return true;
+};
+
+/**
+ * After a scan-diff, find where new content appeared.
+ * Returns elements that had children-added or text-grew changes,
+ * sorted by text length (largest = most likely response container).
+ */
+window.__UC_findNewContent = function () {
+  if (!controller.lastDiff) return [];
+  const diff = controller.lastDiff;
+
+  const results = [];
+
+  // Skip non-content elements
+  function _isContent(el) {
+    if (!el || !el.tagName) return false;
+    const tag = el.tagName.toLowerCase();
+    // Skip head, script, style, nav, header elements
+    if (['head', 'script', 'style', 'noscript', 'link', 'meta'].includes(tag)) return false;
+    // Skip nav/sidebar containers
+    if (el.getAttribute('role') === 'navigation') return false;
+    if (el.tagName === 'NAV') return false;
+    // Skip if it's inside <head>
+    if (el.closest('head')) return false;
+    // Skip invisible
+    try {
+      const style = getComputedStyle(el);
+      if (style.display === 'none' || style.visibility === 'hidden') return false;
+    } catch (e) {}
+    return true;
+  }
+
+  // Newly added elements with text content
+  for (const item of diff.added || []) {
+    if (item.el && _isContent(item.el)) {
+      const text = (item.el.innerText || '').trim();
+      if (text.length > 20) {
+        results.push({
+          selector: _safeSelector(item.el),
+          change: 'added',
+          textLength: text.length,
+          text: text.slice(0, 500),
+        });
+      }
+    }
+  }
+
+  // Elements where children were added (response container)
+  for (const item of diff.increased || []) {
+    if (item.key === 'childCount' && item.el && _isContent(item.el)) {
+      const text = (item.el.innerText || '').trim();
+      if (text.length > 10) {
+        results.push({
+          selector: _safeSelector(item.el),
+          change: 'children-added',
+          childDelta: (item.after || 0) - (item.before || 0),
+          textLength: text.length,
+          text: text.slice(0, 500),
+        });
+      }
+    }
+  }
+
+  // Elements where text grew
+  for (const item of (diff.changed || [])) {
+    for (const ch of (item.changes || [])) {
+      if (ch.type === 'text-grew' && item.el && _isContent(item.el)) {
+        const text = (item.el.innerText || '').trim();
+        if (text.length > 20) {
+          results.push({
+            selector: _safeSelector(item.el),
+            change: 'text-grew',
+            textLength: text.length,
+            text: text.slice(0, 500),
+          });
+        }
+      }
+    }
+  }
+
+  // Deduplicate and sort by text length
+  const seen = new Set();
+  return results
+    .filter(r => { if (seen.has(r.selector)) return false; seen.add(r.selector); return true; })
+    .sort((a, b) => b.textLength - a.textLength);
+};
+
+// ── Trigram-based response extraction ──────────────────────────────────
+
+/**
+ * Compute character trigram set from text.
+ * Returns a Set of 3-character substrings.
+ */
+function _trigrams(text) {
+  const s = new Set();
+  const t = text.toLowerCase();
+  for (let i = 0; i <= t.length - 3; i++) {
+    s.add(t.slice(i, i + 3));
+  }
+  return s;
+}
+
+/** Stored baseline trigram set, captured before an action.
+ *  Exposed on window so page.evaluate() in Python can check it. */
+window._baselineTrigrams = null;
+
+/**
+ * Capture a trigram fingerprint of all visible text on the page.
+ * Call this BEFORE sending a message.
+ */
+window.__UC_captureBaseline = function () {
+  const text = document.body.innerText || '';
+  window._baselineTrigrams = _trigrams(text);
+  return { trigrams: window._baselineTrigrams.size, textLength: text.length };
+};
+
+/**
+ * Extract the response text by finding DOM elements whose trigrams
+ * are mostly NEW (not present in the baseline).
+ *
+ * For each visible text-bearing element, computes:
+ *   new_ratio = |element_trigrams - baseline_trigrams| / |element_trigrams|
+ *
+ * Elements with high new_ratio contain new text (the response).
+ * Elements with low new_ratio contain pre-existing text (nav, sidebar).
+ *
+ * Returns array of {selector, text, newRatio, trigramCount} sorted by
+ * newRatio * textLength descending (most new content first).
+ */
+window.__UC_extractResponse = function (minNewRatio) {
+  if (!window._baselineTrigrams) return [];
+  minNewRatio = minNewRatio || 0.5;
+
+  const candidates = [];
+
+  // Scan ALL elements in the body for text content.
+  // Use querySelectorAll instead of TreeWalker to reach deeply nested content.
+  const allEls = document.body.querySelectorAll('*');
+  for (const el of allEls) {
+    const tag = el.tagName.toLowerCase();
+    // Skip non-content elements
+    if (['script', 'style', 'noscript', 'link', 'meta', 'nav', 'head'].includes(tag)) continue;
+    if (el.closest('script, style, noscript, nav, head')) continue;
+    if (el.getAttribute('role') === 'navigation') continue;
+    try {
+      const s = getComputedStyle(el);
+      if (s.display === 'none' || s.visibility === 'hidden') continue;
+    } catch (e) { continue; }
+
+    const text = (el.innerText || '').trim();
+    if (text.length < 20 || text.length > 5000) continue;
+    // Prefer leaf-ish elements (fewer than 10 direct children with text)
+    if (el.children.length > 30) continue;
+
+    const elTrigrams = _trigrams(text);
+    if (elTrigrams.size === 0) continue;
+
+    // Count how many trigrams are NEW (not in baseline)
+    let newCount = 0;
+    for (const tri of elTrigrams) {
+      if (!window._baselineTrigrams.has(tri)) newCount++;
+    }
+    const newRatio = newCount / elTrigrams.size;
+
+    if (newRatio >= minNewRatio) {
+      candidates.push({
+        selector: _safeSelector(el),
+        text: text,
+        newRatio: Math.round(newRatio * 1000) / 1000,
+        trigramCount: elTrigrams.size,
+        newTrigrams: newCount,
+        textLength: text.length,
+        // Score: prefer high newRatio AND substantial text
+        _score: newRatio * Math.log(text.length + 1),
+      });
+    }
+  }
+
+  // Sort by score descending, deduplicate
+  candidates.sort((a, b) => b._score - a._score);
+  const seen = new Set();
+  return candidates
+    .filter(c => {
+      if (seen.has(c.selector)) return false;
+      // Also skip if text is a substring of an already-seen element
+      for (const prev of seen) {
+        if (c.text.length < 50) break;
+      }
+      seen.add(c.selector);
+      return true;
+    })
+    .slice(0, 10)
+    .map(c => ({ selector: c.selector, text: c.text, newRatio: c.newRatio, trigramCount: c.trigramCount, textLength: c.textLength }));
+};
+
+// ── LLM / Advanced ────────────────────────────────────────────────────
+
+window.__UC_getLLMContext = function (patternName) {
+  const results = controller.detect(patternName || 'search', 'STRUCTURAL');
+  if (results.length === 0) return null;
+  return extractLLMContext({
+    el: results[0].el,
+    patternName: patternName || results[0].patternName,
+    confidence: results[0].confidence,
+    evidence: results[0].evidence,
+    components: results[0].components,
+  });
+};
+
+window.__UC_heapScan = function (patternName) {
+  let targetEl = null;
+  if (patternName) {
+    const results = controller.detect(patternName, 'STRUCTURAL');
+    if (results.length > 0) targetEl = results[0].el;
+  }
+  return fullHeapScan(targetEl);
+};
+
+window.__UC_scanFramework = function () {
+  return scanFramework();
+};
+
+window.__UC_verify = function (actionName) {
+  // Returns the verifier spec — actual verification requires async action execution
+  return verifier.getTraces();
+};
+
+// ── Passive detection ──────────────────────────────────────────────────
+
+window.__UC_startPassive = function () {
+  controller.startPassive();
+  return true;
+};
+
+window.__UC_stopPassive = function () {
+  controller.stopPassive();
+  return true;
+};
+
+window.__UC_getPassiveResults = function () {
+  return controller.getPassiveResults();
+};
+
+// ── Signatures ─────────────────────────────────────────────────────────
+
+window.__UC_saveSignature = function (patternName) {
+  return controller.saveSignature(patternName);
+};
+
+window.__UC_loadSignatures = function () {
+  const sigs = controller.signatures.getForCurrentSite();
+  return sigs.map(s => ({ id: s.id, pattern: s.patternName, hostname: s.site?.hostname }));
+};
+
+window.__UC_autoBindSignatures = function () {
+  return controller.autoBind();
+};
+
+window.__UC_getAllSignatures = function () {
+  return controller.signatures.getAll();
+};
+
+// ── Frame scanning ─────────────────────────────────────────────────────
+
+window.__UC_startFrameScanning = async function () {
+  return controller.startFrameScanning();
+};
+
+window.__UC_stopFrameScanning = function () {
+  controller.stopFrameScanning();
+};
+
+// ── Generic MutationObserver for response streaming (no binding needed) ─
+
+/**
+ * Watch a container for new child nodes / text changes in real-time.
+ * Returns a handle to stop watching. Messages collected in window.__UC_observed.
+ *
+ * Unlike chatOnMessage, this works WITHOUT binding — just point it at
+ * any DOM element and it watches for mutations.
+ */
+window.__UC_observed = [];
+let _observerDisconnect = null;
+
+window.__UC_watchContainer = function (selector) {
+  // Disconnect any previous observer
+  if (_observerDisconnect) { _observerDisconnect(); _observerDisconnect = null; }
+  window.__UC_observed = [];
+
+  const el = document.querySelector(selector);
+  if (!el) return false;
+
+  const seen = new Set();
+  // Seed with existing text to avoid double-reporting
+  for (const child of el.querySelectorAll('*')) {
+    const t = (child.innerText || '').trim();
+    if (t.length > 5) seen.add(t.slice(0, 100));
+  }
+
+  const observer = new MutationObserver((mutations) => {
+    for (const mut of mutations) {
+      // New nodes added
+      for (const node of mut.addedNodes) {
+        if (node.nodeType !== 1) continue; // Skip text nodes
+        const text = (node.innerText || '').trim();
+        if (text.length < 5) continue;
+        const key = text.slice(0, 100);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        window.__UC_observed.push({
+          type: 'added',
+          text: text.slice(0, 2000),
+          tag: node.tagName,
+          timestamp: Date.now(),
+        });
+      }
+      // Character data changes (streaming tokens)
+      if (mut.type === 'characterData') {
+        const text = (mut.target.textContent || '').trim();
+        if (text.length > 5) {
+          // Update last observed entry if same parent
+          const last = window.__UC_observed[window.__UC_observed.length - 1];
+          if (last && last.type === 'streamed') {
+            last.text = text.slice(0, 2000);
+            last.timestamp = Date.now();
+          } else {
+            window.__UC_observed.push({
+              type: 'streamed',
+              text: text.slice(0, 2000),
+              tag: mut.target.parentElement?.tagName || '?',
+              timestamp: Date.now(),
+            });
+          }
+        }
+      }
+    }
+  });
+
+  observer.observe(el, { childList: true, subtree: true, characterData: true });
+  _observerDisconnect = () => observer.disconnect();
+  return true;
+};
+
+window.__UC_stopWatching = function () {
+  if (_observerDisconnect) { _observerDisconnect(); _observerDisconnect = null; }
+  return window.__UC_observed;
+};
+
+window.__UC_getObserved = function () {
+  return window.__UC_observed;
+};
+
+// ── DOMLocalityHash (structural fingerprinting) ───────────────────────
+
+/**
+ * Compute a structural fingerprint (MinHash LSH) of a DOM element.
+ * Used to identify similar DOM structures across pages/visits.
+ */
+window.__UC_computeSignature = function (selector) {
+  const el = selector === 'body' ? document.body : document.querySelector(selector);
+  if (!el) return null;
+  const sig = controller.lsh.signature(el);
+  return {
+    fingerprint: sig.fingerprint,
+    features: sig.features.slice(0, 20),
+    minhash: Array.from(sig.minhash),
+  };
+};
+
+/**
+ * Compare two structural signatures (Jaccard similarity via MinHash).
+ * Returns 0.0 (completely different) to 1.0 (structurally identical).
+ */
+window.__UC_compareSig = function (sig1, sig2) {
+  if (!sig1?.minhash || !sig2?.minhash) return 0;
+  return controller.lsh.similarity(
+    { minhash: new Uint32Array(sig1.minhash) },
+    { minhash: new Uint32Array(sig2.minhash) },
+  );
+};
+
+/**
+ * Index a signature for fast cross-session similarity queries.
+ */
+window.__UC_indexSignature = function (key, sig) {
+  if (!sig?.minhash) return false;
+  controller.lsh.addToIndex(key, { minhash: new Uint32Array(sig.minhash), fingerprint: sig.fingerprint, features: sig.features }, { key });
+  return true;
+};
+
+/**
+ * Query the LSH index for structurally similar elements.
+ */
+window.__UC_querySimilar = function (sig) {
+  if (!sig?.minhash) return [];
+  return controller.lsh.querySimilar({ minhash: new Uint32Array(sig.minhash), fingerprint: sig.fingerprint });
+};
+
+// ── Direct controller access ───────────────────────────────────────────
+
+window.UniversalController = controller;
+window.UC = {};
+
+// ── Serialization helpers ──────────────────────────────────────────────
+
+function _safeSelector(el) {
+  if (!el) return '';
+  try {
+    if (el.id) return '#' + CSS.escape(el.id);
+    const aria = el.getAttribute('aria-label');
+    if (aria) return el.tagName.toLowerCase() + '[aria-label="' + aria.replace(/"/g, '\\"') + '"]';
+    const name = el.getAttribute('name');
+    if (name) return el.tagName.toLowerCase() + '[name="' + name.replace(/"/g, '\\"') + '"]';
+    if (el.tagName === 'INPUT') {
+      const ph = el.getAttribute('placeholder');
+      if (ph) return 'input[placeholder="' + ph.replace(/"/g, '\\"') + '"]';
+    }
+    // Path-based fallback
+    const parts = [];
+    let cur = el;
+    while (cur && cur !== document.body && parts.length < 5) {
+      let seg = cur.tagName.toLowerCase();
+      if (cur.id) { parts.unshift('#' + CSS.escape(cur.id)); break; }
+      const parent = cur.parentElement;
+      if (parent) {
+        const sibs = Array.from(parent.children).filter(c => c.tagName === cur.tagName);
+        if (sibs.length > 1) seg += ':nth-child(' + (Array.from(parent.children).indexOf(cur) + 1) + ')';
+      }
+      parts.unshift(seg);
+      cur = parent;
+    }
+    return parts.join(' > ');
+  } catch (e) {
+    return '';
+  }
+}
+
+function _serializeResult(r) {
+  const out = {
+    selector: _safeSelector(r.el),
+    confidence: Math.round(r.confidence * 100) / 100,
+    path: r.path,
+    guarantee: r.guarantee,
+    evidence: r.evidence ? {
+      structural: Math.round((r.evidence.structural || 0) * 100) / 100,
+      phrasal: Math.round((r.evidence.phrasal || 0) * 100) / 100,
+      phrasalMatches: r.evidence.phrasalMatches,
+      semantic: r.evidence.semantic || 0,
+      behavioral: Math.round((r.evidence.behavioral || 0) * 100) / 100,
+    } : {},
+  };
+  // Add pattern-specific component data
+  if (r.components) {
+    if (r.components.input) {
+      out.input_selector = _safeSelector(r.components.input);
+      out.placeholder = r.components.input.getAttribute?.('placeholder') || '';
+    }
+    if (r.components.container) {
+      out.container_selector = _safeSelector(r.components.container);
+    }
+    if (r.components.fields) {
+      out.fields = r.components.fields.map?.(f => ({
+        name: f.name || f.getAttribute?.('name') || '',
+        type: f.type || f.getAttribute?.('type') || '',
+        selector: _safeSelector(f),
+      })) || [];
+    }
+    if (r.components.items) {
+      out.item_count = r.components.items.length;
+      out.scrollable = r.components.container ?
+        r.components.container.scrollHeight > r.components.container.clientHeight : false;
+    }
+    if (r.components.closeButton) {
+      out.dismissible = true;
+      out.dismiss_selector = _safeSelector(r.components.closeButton);
+    }
+    if (r.components.acceptButton) {
+      out.accept_selector = _safeSelector(r.components.acceptButton);
+    }
+    if (r.components.submitButton) {
+      out.submit_selector = _safeSelector(r.components.submitButton);
+    }
+    if (r.patternName === 'feed' && r.components.container) {
+      const cont = r.components.container;
+      out.item_count = cont.children.length;
+      out.scrollable = cont.scrollHeight > cont.clientHeight;
+      // Build item selector
+      if (cont.children.length >= 3) {
+        const tags = {};
+        for (const c of cont.children) {
+          const k = c.tagName.toLowerCase();
+          tags[k] = (tags[k] || 0) + 1;
+        }
+        const best = Object.entries(tags).sort((a, b) => b[1] - a[1])[0];
+        if (best) out.item_selector = _safeSelector(cont) + ' > ' + best[0];
+      }
+    }
+  }
+  return out;
+}
+
+function _autoBind(patternName) {
+  const results = controller.detect(patternName, 'STRUCTURAL');
+  if (results.length > 0) {
+    controller.bind(patternName, results[0].path);
+  }
+}
+
+// ── Initialize ─────────────────────────────────────────────────────────
+
+if (isInIframe()) {
+  const childRPC = new FrameRPCChild(controller);
+  console.log('[UC] Extension loaded (child frame)');
+} else {
+  console.log('[UC] Extension loaded. Call __UC_detectAll() or __UC_firstScan() to begin.');
+
+  // Auto-bind from saved signatures after page settles
+  setTimeout(() => {
+    const bound = controller.autoBind();
+    if (bound.length > 0) {
+      console.log('[UC] Auto-bound from saved signatures:', bound.join(', '));
+      // Expose bound APIs on window.UC
+      for (const name of bound) {
+        const api = controller.getAPI(name);
+        if (api) window.UC[name] = api;
+      }
+    }
+    // Start frame scanning
+    controller.startFrameScanning().then(info => {
+      if (info.sameOrigin > 0 || info.rpcActive > 0) {
+        console.log(`[UC] Frames: ${info.sameOrigin} agents, ${info.rpcActive} RPC`);
+      }
+    }).catch(() => {});
+  }, 2000);
+}
+
+window.__UC.ready = true;
+window.__UC.timestamp = Date.now();
