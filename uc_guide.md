@@ -2,41 +2,63 @@
 
 ## Overview
 
-This project integrates [Universal Controller](https://github.com/Ethycs/universal_controller) as a Chrome extension that provides two modes of UI pattern detection, both driven by Playwright:
+This project integrates [Universal Controller](https://github.com/Ethycs/universal_controller) as a Chrome extension that provides programmatic browser automation via Playwright. The full UC codebase (detection, actions, passive observer, LSH fingerprinting, signatures) is bundled into a single MV3 extension, with a Python API (`UCBrowser`) that orchestrates everything through `page.evaluate()`.
 
-1. **Scan-diff-bind** (Cheat Engine style) — Take a DOM snapshot, perform an action, take another snapshot, diff them to infer what pattern the UI implements
-2. **Static three-signal detect** — Score DOM elements using structural + phrasal + semantic + behavioral signals without requiring interaction
+**Three detection modes:**
+1. **Scan-diff-bind** (Cheat Engine style) — Snapshot DOM, perform action, diff, infer pattern
+2. **Static three-signal detect** — Structural + phrasal + semantic + behavioral scoring
+3. **Generic discovery** — Find inputs/buttons by scoring all visible elements (works without pattern detection)
 
-Detection is **not automatic** — Playwright orchestrates when and how detection runs.
+**Three browser modes:**
+- `UCBrowser()` — Installed Chrome + logged-in profile (best for sites needing auth)
+- `UCBrowser(use_extension=True)` — Playwright Chromium + UC extension (enables all UC features)
+- `UCBrowser(native_chrome=True)` — Real Chrome via CDP (bypasses Cloudflare)
 
 ## Architecture
 
 ```
 UCBrowser (Python)
   └─ Playwright launch_persistent_context(--load-extension)
-       └─ Chrome (headed, persistent profile)
-            └─ UC Extension content script (world: "MAIN")
+       └─ Chromium (headed, persistent profile)
+            └─ UC Extension (world: "MAIN", Rollup bundle from submodule)
                  ├─ ValueScanner: DOM snapshots + diffing
                  ├─ Three-signal detector: structural + phrasal + semantic + behavioral
-                 ├─ Writes results to window.__UC on demand
-                 └─ Exposes: __UC_firstScan(), __UC_nextScan(), __UC_detect(), etc.
-                      └─ Python calls via page.evaluate()
+                 ├─ PassiveDetector: MutationObserver + event correlation
+                 ├─ DOMLocalityHash: MinHash LSH structural fingerprinting
+                 ├─ SignatureStore: per-domain pattern persistence
+                 ├─ Actions: setText (React/Slate/ProseMirror), chatSend, formFill, etc.
+                 ├─ Generic discovery: __UC_findInputs, __UC_findButtons
+                 ├─ Trigram baseline: __UC_captureBaseline, __UC_extractResponse
+                 ├─ MutationObserver: __UC_watchContainer (real-time streaming)
+                 └─ All exposed on window.__UC_* → Python reads via page.evaluate()
 ```
-
-**Key constraint:** Chrome extensions require headed mode. Headless runs fall back to plain Playwright (no UC detection).
 
 ## Project Structure
 
 ```
 ext/
-├── universal_controller/    # Git submodule (upstream UC repo)
-└── uc_extension/            # Our MV3 Chrome extension wrapper
-    ├── manifest.json        # Manifest V3, world: "MAIN", <all_urls>
-    └── content.js           # ValueScanner + detection + window.__UC API
+├── universal_controller/        # Git submodule (upstream UC repo, untouched)
+│   ├── src/                     # UC source (ES modules)
+│   ├── rollup.config.js         # Tampermonkey build (npm run build → dist/*.user.js)
+│   └── package.json
+└── uc_extension/                # Our MV3 Chrome extension wrapper
+    ├── manifest.json            # MV3, world: "MAIN", <all_urls>
+    ├── package.json             # Rollup build for extension
+    ├── rollup.config.js         # Bundles UC source + entry point → dist/uc-extension.js
+    ├── src/
+    │   ├── extension-entry.js   # Entry point: creates controller, exposes window.__UC_*
+    │   ├── storage-adapter.js   # GM_getValue/GM_setValue → localStorage shim
+    │   └── background.js        # Minimal MV3 service worker
+    ├── dist/
+    │   └── uc-extension.js      # Built bundle (~5,700 lines, all UC modules)
+    └── findings.md              # ChatGPT-specific DOM findings
 
 src/event_harvester/sources/
-├── uc_browser.py            # UCBrowser class — high-level Python API
-└── web_fetch.py             # Modified to load extension + use UC patterns
+├── uc_browser.py                # UCBrowser class — full Python API
+└── web_fetch.py                 # Harvest pipeline integration
+
+tests/
+└── test_uc_chatgpt.py           # Incremental test script for ChatGPT
 ```
 
 ## Setup
@@ -48,67 +70,56 @@ git clone --recurse-submodules <repo-url>
 # Or if already cloned
 git submodule update --init --recursive
 
-# Install dependencies
+# Install Python dependencies
 pixi install
+
+# Build the extension bundle
+cd ext/uc_extension && npm install && npm run build
 ```
 
-No extension build step needed — Chrome loads `ext/uc_extension/` directly as an unpacked extension.
+The Tampermonkey userscript build is independent:
+```bash
+cd ext/universal_controller && npm install && npm run build
+# → dist/universal-controller.user.js
+```
 
 ## Quick Start
 
-### Static detect — no interaction needed
-
-The simplest path. Three-signal scoring finds patterns by examining the DOM:
+### Chat with any AI (ChatGPT, Copilot, Gemini, etc.)
 
 ```python
 from event_harvester.sources import UCBrowser
 
-with UCBrowser() as uc:
-    page = uc.open("https://lu.ma/discover")
-
-    # Detect all patterns at once
-    patterns = uc.detect_all(page)
-    # patterns = {search: [...], feed: [...], form: [...], ...}
-
-    # Or detect a single type
-    search_hits = uc.detect(page, "search")
-
-    # Use what was found
-    uc.dismiss_cookies(page)
-    uc.search(page, "AI meetup San Francisco")
-    text = uc.get_feed_text(page)
-    print(text)
+with UCBrowser(use_extension=True) as uc:
+    page = uc.open("https://chatgpt.com", wait_ms=5000)
+    response = uc.chat(page, "What is 2+2? Just the number.")
+    print(response)  # "4"
 ```
 
-### Scan-diff-bind — interaction-based, higher confidence
+The `chat()` method uses the full UC toolbox automatically:
+1. `__UC_findInputs` — finds the chat input (scored by chat-likelihood)
+2. `__UC_setText` — types using framework-aware methods (React, Slate, contenteditable)
+3. `__UC_findButtons` — finds the send button (proximity + label scoring)
+4. `__UC_captureBaseline` — trigram fingerprint of page text before send
+5. `__UC_firstScan` — scan-diff baseline before send
+6. `__UC_watchContainer` — MutationObserver on the conversation area
+7. Send verification — checks if input cleared (postcondition)
+8. `__UC_findNewContent` — scan-diff discovers the response container
+9. Trigram set difference — filters response from boilerplate (nav, sidebar, footer)
+10. `__UC_saveSignature` — persists working pattern for next visit
 
-The Cheat Engine workflow. Snapshots the DOM before and after an action to infer what changed:
-
-```python
-with UCBrowser() as uc:
-    page = uc.open("https://example.com/app")
-
-    # One-liner: scan → action → diff → detect
-    patterns = uc.scan_action(page, lambda p: p.click("button.filter"))
-    # patterns = [{pattern: "dropdown", confidence: 0.7, proof: "became-visible + expanded/listbox"}]
-
-    # Or step by step:
-    uc.first_scan(page)                # 1. baseline snapshot
-    page.fill("input.search", "test")  # 2. perform an action
-    page.press("input.search", "Enter")
-    diff = uc.next_scan(page)          # 3. diff: {changed: 5, added: 12, removed: 0}
-    detected = uc.auto_detect(page)    # 4. infer patterns from diff
-```
-
-### High-level convenience methods
+### Search event sites
 
 ```python
-with UCBrowser() as uc:
-    # Search: open → detect → dismiss cookies → close modals → search → return results
-    page, results = uc.navigate_and_search("https://lu.ma/discover", "hackathon SF")
+with UCBrowser(use_extension=True) as uc:
+    page, results = uc.navigate_and_search("https://lu.ma/discover", "AI meetup SF")
     print(results)
+```
 
-    # Scrape: open → detect → dismiss cookies → scroll feed → return items
+### Scrape feeds with smart scrolling
+
+```python
+with UCBrowser(use_extension=True) as uc:
     page, items = uc.navigate_and_scrape(
         "https://www.eventbrite.com/d/ca--san-francisco/events/",
         scroll_seconds=20,
@@ -117,51 +128,52 @@ with UCBrowser() as uc:
         print(item[:100])
 ```
 
-### Forms
+### Use installed Chrome with login sessions
 
 ```python
+# Default mode: uses installed Chrome + data/.chrome_profile
 with UCBrowser() as uc:
-    page = uc.open("https://example.com/register")
-    uc.fill_form(page, {"email": "user@example.com", "name": "Test User"})
-    uc.submit_form(page)
+    page = uc.open("https://www.instagram.com/")
+    # Already logged in from previous web_login() session
+    items = uc.scroll_feed(page, seconds=15)
 ```
 
-### Low-level: direct page.evaluate()
+### Step-by-step control
 
 ```python
-from playwright.sync_api import sync_playwright
+with UCBrowser(use_extension=True) as uc:
+    page = uc.open("https://example.com/app")
 
-with sync_playwright() as p:
-    context = p.chromium.launch_persistent_context(
-        "data/.chrome_profile",
-        headless=False,
-        args=[
-            "--load-extension=ext/uc_extension",
-            "--disable-extensions-except=ext/uc_extension",
-        ],
-    )
-    page = context.new_page()
-    page.goto("https://lu.ma/discover")
-    page.wait_for_function("window.__UC && window.__UC.ready")
+    # Detect all patterns
+    patterns = uc.detect_all(page)
 
-    # Static detect
-    page.evaluate('window.__UC_detect("search")')
-    page.evaluate('window.__UC_detectAll()')
+    # Handle obstacles
+    uc.dismiss_cookies(page)
+    uc.close_modal(page)
 
     # Scan-diff workflow
-    page.evaluate("window.__UC_firstScan()")
-    page.click("button.filter")     # action
-    page.evaluate("window.__UC_nextScan()")
-    page.evaluate("window.__UC_autoDetect()")
+    uc.first_scan(page)
+    page.click("button.filter")
+    diff = uc.next_scan(page)
+    detected = uc.auto_detect(page)
 
-    # Read results
-    uc = page.evaluate("window.__UC")
-    print(uc["patterns"])
+    # Generic discovery (no pattern detection needed)
+    inputs = uc.find_inputs(page)
+    buttons = uc.find_buttons(page, inputs[0]["selector"])
 
-    # Actions
-    page.evaluate("window.__UC_dismiss()")
-    page.evaluate("window.__UC_fillSearch('events this weekend')")
-    text = page.evaluate("window.__UC_getVisibleText()")
+    # Framework-aware text input
+    result = uc.set_text(page, "#my-input", "hello")
+    # result = {success: True, method: "execCommand"}
+
+    # Passive detection (background monitoring)
+    uc.start_passive(page)
+    page.click("button")
+    passive = uc.get_passive_results(page)
+
+    # Structural fingerprinting (LSH)
+    fw = uc.scan_framework(page)
+    ctx = uc.get_llm_context(page, "chat")
+    heap = uc.heap_scan(page, "chat")
 ```
 
 ## UCBrowser API Reference
@@ -170,216 +182,288 @@ with sync_playwright() as p:
 
 ```python
 UCBrowser(
-    headless=False,    # Must be False for extension support
-    channel="chrome",  # Browser channel
-    stealth=True,      # Apply playwright-stealth
-    timeout_ms=30000,  # Default navigation timeout
+    headless=False,        # Headless mode (no extension support)
+    channel="chrome",      # Browser channel ("chrome", "msedge", or None for Chromium)
+    stealth=True,          # Apply playwright-stealth
+    timeout_ms=30000,      # Default navigation timeout
+    use_extension=False,   # Load UC extension (requires Playwright Chromium)
+    native_chrome=False,   # Launch real Chrome via CDP (bypasses Cloudflare)
 )
 ```
+
+### Browser Modes
+
+| Mode | Channel | Profile | Extension | Best for |
+|---|---|---|---|---|
+| `UCBrowser()` | Chrome | `data/.chrome_profile` | No | Logged-in scraping (Instagram, etc.) |
+| `UCBrowser(use_extension=True)` | Chromium | `data/.uc_chromium_profile` | Yes | Chat, detection, all UC features |
+| `UCBrowser(native_chrome=True)` | Chrome (CDP) | Default Chrome profile | User's own | Cloudflare-protected sites |
+| `UCBrowser(headless=True)` | Chrome | State file | No | CI/headless scraping |
 
 ### Page Management
 
 | Method | Returns | Description |
 |---|---|---|
-| `start()` | None | Launch browser (called automatically by `__enter__`) |
-| `close()` | None | Shut down browser |
 | `open(url, wait_ms=2000)` | Page | Open URL in new tab |
+| `close()` | None | Shut down browser |
+
+### Chat (Generic — works on any chat site)
+
+| Method | Returns | Description |
+|---|---|---|
+| `chat(page, message, timeout_s=30)` | str or None | Full pipeline: find input → type → send → wait → extract response |
+| `find_inputs(page)` | list[dict] | All interactive inputs, scored by chat-likelihood |
+| `find_buttons(page, input_selector)` | list[dict] | Submit/send buttons near an input, scored |
+| `set_text(page, selector, text)` | dict | Framework-aware text input (React, Slate, contenteditable) |
+| `find_new_content(page)` | list[dict] | Elements with children-added or text-grew (after scan-diff) |
 
 ### Scan-Diff-Bind (Interaction-Based)
 
 | Method | Returns | Description |
 |---|---|---|
-| `first_scan(page)` | dict or None | Baseline DOM snapshot ({elements, timestamp}) |
-| `next_scan(page)` | dict or None | Diff against baseline ({changed, added, removed, ...}) |
+| `first_scan(page)` | dict or None | Baseline DOM snapshot |
+| `next_scan(page)` | dict or None | Diff against last snapshot |
 | `auto_detect(page)` | list[dict] | Infer patterns from last diff |
-| `scan_action(page, action)` | list[dict] | Convenience: scan → action → diff → detect |
+| `scan_action(page, action)` | list[dict] | scan → action → diff → detect in one call |
 
 ### Static Detection (Three-Signal)
 
 | Method | Returns | Description |
 |---|---|---|
 | `detect(page, pattern_name, guarantee)` | list[dict] | Detect one pattern type |
-| `detect_all(page, guarantee)` | dict | Detect all pattern types |
+| `detect_all(page, guarantee)` | dict | Detect all 8 pattern types |
 | `get_patterns(page)` | dict | Read current patterns (no new detection) |
 
-### Actions
+### Pattern Actions
 
 | Method | Returns | Description |
 |---|---|---|
-| `search(page, query, submit=True)` | bool | Fill detected search bar, optionally press Enter |
-| `scroll_feed(page, seconds=15, on_item=None)` | list[str] | Scroll feed, collect item texts |
-| `get_feed_text(page)` | str | Text from detected feed (or full page) |
+| `search(page, query, submit=True)` | bool | Fill detected search bar |
+| `scroll_feed(page, seconds, on_item)` | list[str] | Scroll feed, collect item texts |
+| `get_feed_text(page)` | str | Text from detected feed container |
 | `get_feed_items(page)` | list[str] | Individual feed item texts |
-| `fill_form(page, fields)` | bool | Fill detected form fields by name/type |
+| `fill_form(page, fields)` | bool | Fill form fields by name/type |
 | `submit_form(page)` | bool | Click form submit button |
 | `dismiss_cookies(page)` | bool | Click cookie consent accept button |
-| `close_modal(page)` | bool | Dismiss detected modal/dialog |
+| `close_modal(page)` | bool | Dismiss modal/dialog |
 | `has_login_wall(page)` | bool | Check for blocking login wall |
 
-### Convenience Methods
+### Bound UC Actions (requires detect + bind)
+
+| Method | Returns | Description |
+|---|---|---|
+| `bind(page, pattern_name)` | dict or None | Detect and bind a pattern to create UC action API |
+| `chat_send(page, text)` | bool | Send via bound chat API (async, framework-aware) |
+| `chat_get_messages(page)` | list | Get visible messages from bound chat |
+| `form_fill_uc(page, data)` | bool | UC priority-based fill (name > id > type > placeholder) |
+| `dropdown_toggle(page)` | bool | Toggle bound dropdown |
+| `dropdown_select(page, value)` | bool | Select dropdown option by text |
+| `modal_close_uc(page)` | bool | Close via button + Escape fallback |
+
+### Advanced / Diagnostics
+
+| Method | Returns | Description |
+|---|---|---|
+| `start_passive(page)` | bool | Start background MutationObserver + event correlation |
+| `stop_passive(page)` | bool | Stop passive detection |
+| `get_passive_results(page)` | list | Patterns inferred by passive detection |
+| `scan_framework(page)` | dict | Detect React/Vue/Angular/Svelte |
+| `heap_scan(page, pattern_name)` | dict | Inspect React fiber, Vue instances, Redux stores |
+| `get_llm_context(page, pattern_name)` | str | Extract DOM context formatted for LLM prompts |
+
+### Signatures (Per-Domain Persistence)
+
+| Method | Returns | Description |
+|---|---|---|
+| `save_signature(page, pattern_name)` | dict | Save working pattern for this domain |
+| `load_signatures(page)` | list | Load saved signatures for current domain |
+| `auto_bind_signatures(page)` | list | Auto-bind from saved signatures |
+
+### Convenience
 
 | Method | Returns | Description |
 |---|---|---|
 | `navigate_and_search(url, query)` | (Page, str) | Open → detect → clear obstacles → search → return results |
 | `navigate_and_scrape(url, scroll_seconds)` | (Page, list) | Open → detect → clear obstacles → scroll → return items |
 
-## How Detection Works
-
-### Mode 1: Scan-Diff-Bind (Cheat Engine Style)
-
-This is UC's core paradigm. It works by observing what changes when you perform an action:
+## How the Chat Pipeline Works
 
 ```
-first_scan()  →  DOM snapshot A (all element values, dimensions, ARIA state, etc.)
-     ↓
-(user/Playwright performs action)
-     ↓
-next_scan()   →  DOM snapshot B  →  diff(A, B)
-     ↓
-autoDetect()  →  Infer patterns from changes:
-                   • input-cleared + children-added → chat
-                   • became-visible + fixed/dialog → modal
-                   • became-visible + aria-expanded → dropdown
+chat(page, "What is 2+2?")
+  │
+  ├─ __UC_findInputs()          → #prompt-textarea (score=7.6, contenteditable)
+  ├─ __UC_captureBaseline()     → 324 trigrams of existing page text
+  ├─ __UC_firstScan()           → 592 elements baselined
+  │
+  ├─ __UC_setText(selector, msg)  → execCommand (React contenteditable)
+  ├─ __UC_findButtons(selector)   → #composer-submit-button (score=6.3)
+  ├─ __UC_watchContainer(area)    → MutationObserver active
+  ├─ page.click(button)           → Submit
+  ├─ Verify: input cleared?       → Yes ✓
+  │
+  ├─ _wait_chat_response() loop (500ms ticks):
+  │   ├─ Layer 1: __UC_getObserved()     → real-time MutationObserver data
+  │   ├─ Layer 2: __UC_findNewContent()  → scan-diff container discovery
+  │   ├─ Layer 3: trigram set difference → filter response from boilerplate
+  │   └─ Stability: 3 identical polls or streaming indicators gone
+  │
+  ├─ Response: "4"
+  └─ __UC_saveSignature("chat")  → persisted for next visit
 ```
 
-**When to use:** When you're exploring an unknown site and want to understand what UI patterns are present. Perform actions (click buttons, type in inputs) and see what UC detects.
+## Trigram Set Difference (Response Extraction)
 
-### Mode 2: Three-Signal Static Detect
+The key innovation for extracting clean response text from complex pages:
 
-Scores DOM elements without requiring interaction:
+**Before send:** `__UC_captureBaseline()` computes a trigram set of all visible page text.
 
+**After send:** For each candidate element in the response container, compute its trigram set and measure overlap with baseline:
 ```
-detect("search")  →  For each candidate element:
-                       ├─ Structural (25%): CSS selector match, rule checking
-                       ├─ Phrasal (30%): keyword scoring (strong/medium/placeholder/button/negative)
-                       ├─ Semantic (15%): ARIA roles
-                       └─ Behavioral (30%): component presence (has input? has button? is scrollable?)
-                       = confidence score (0.0 – 1.0)
+new_ratio = |element_trigrams − baseline_trigrams| / |element_trigrams|
 ```
 
-Guarantee levels control the confidence threshold:
-- `STRUCTURAL` (0.2) — lowest bar, most candidates
-- `SEMANTIC` (0.35)
-- `BEHAVIORAL` (0.5) — default, good balance
-- `VERIFIED` (0.7) — highest confidence only
+- Nav/sidebar: `new_ratio ≈ 0.05` (almost all existed before) → filtered out
+- User's message: filtered by checking if text contains `sent_message`
+- AI response: `new_ratio ≈ 0.95` (almost all new) → this is the response
 
-**When to use:** When you know what pattern you're looking for (e.g., "find the search bar on this page").
+## Test Results (March 2026)
 
-### Pattern types
+| Site | Input | setText | Send | Response | Status |
+|---|---|---|---|---|---|
+| **ChatGPT** | `#prompt-textarea` (ce) | execCommand | `#composer-submit-button` | Clean response | **Working** |
+| **Copilot** | `#userInput` | nativeSetter | `Submit message` btn | Clean response | **Working** |
+| **Gemini** | `div[aria-label="Enter a prompt"]` (ce) | execCommand | `Send message` btn | Sends OK, extraction partial | **Partial** |
+| **Perplexity** | `#ask-input` (ce) | directTextContent | `Submit` btn | Sends OK, response timeout | **Partial** |
+| **EaseMate** | `textarea` (8.5 score) | nativeSetter | `Send Message` btn | Response with encoding issue | **Partial** |
+| **Felo** | `#chat-input` | nativeSetter | Found btn | 401 Unauthorized | **Needs auth** |
+| **Claude/DeepSeek/etc.** | — | — | — | — | **Login required** |
 
-| Pattern | Key signals | Scan-diff detects via |
-|---|---|---|
-| `search` | `input[type="search"]`, `role="search"`, placeholder keywords | input-filled events |
-| `feed` | Repeated children, scrollable container, `role="feed"` | children-added on scroll |
-| `form` | `<form>` tag, multiple inputs, submit button | input-filled/cleared events |
-| `modal` | `role="dialog"`, `aria-modal`, fixed positioning | became-visible events |
-| `dropdown` | `aria-haspopup`, `aria-expanded` | expanded/collapsed events |
-| `cookie` | class contains "cookie/consent/gdpr", accept button | — (use static detect) |
-| `login` | Password input, class contains "login/signin" | — (use static detect) |
-| `chat` | `role="log"`, `aria-live`, input + scrollable container | input-cleared + children-added |
+## Extension API Reference (window.__UC_*)
 
-### window.__UC schema
-
+### State
 ```javascript
-{
-  version: "0.2.0",
-  ready: true,               // true once extension is loaded (NOT after detection)
-  mode: "detected",          // null → "scan" → "diffed" → "detected"
-  timestamp: 1711800000000,
-  url: "https://...",
-  scan: {                    // populated after firstScan()
-    elements: 1234,
-    timestamp: 1711800000000
-  },
-  diff: {                    // populated after nextScan()
-    changed: 5, added: 12, removed: 0, increased: 3, decreased: 1
-  },
-  patterns: {                // populated after detect/detectAll/autoDetect
-    search: [{
-      selector: "input#search",
-      confidence: 0.85,
-      input_selector: "input#search",  // direct input element
-      placeholder: "Search...",
-      form_action: "/search",
-      evidence: { structural: 0.8, phrasal: 0.7, semantic: 1, behavioral: 1 }
-    }],
-    feed: [{
-      selector: "div.feed",
-      confidence: 0.78,
-      item_count: 12,
-      item_selector: "div.feed > div",
-      scrollable: true,
-      evidence: { ... }
-    }],
-    // ... other pattern types
-  }
-}
+window.__UC                    // {version, ready, mode, timestamp, url, scan, diff, patterns}
 ```
 
-## Integration with Existing Harvest Pipeline
+### Scan-Diff
+```javascript
+__UC_firstScan()               // Baseline snapshot → {elements, timestamp}
+__UC_nextScan()                // Diff → {changed, added, removed, increased, decreased}
+__UC_autoDetect()              // Infer from diff → [{pattern, confidence, proof, selector}]
+```
 
-`web_fetch.py` loads the extension in all `launch_persistent_context` calls and triggers `detectAll()` after each page load:
+### Detection
+```javascript
+__UC_detect(name, guarantee)   // Three-signal detect → [{selector, confidence, evidence, ...}]
+__UC_detectAll(guarantee)      // All 8 patterns at once
+```
 
-- **`web_login()`** — extension active during manual login for debugging
-- **`fetch_event_pages()`** — calls `__UC_detectAll()`, auto-dismisses cookies, uses feed text extraction
-- **`fetch_feeds()`** — detects feed containers for targeted scrolling
+### Generic Discovery
+```javascript
+__UC_findInputs()              // All inputs scored → [{selector, score, tag, contentEditable, ...}]
+__UC_findButtons(inputSel)     // Buttons near input → [{selector, score, label, type}]
+__UC_setText(selector, text)   // Framework-aware → {success, method}
+__UC_clickButton(selector)     // Click → true/false
+```
 
-Fallback is automatic: if extension isn't present or detection times out, existing behavior is preserved.
+### Trigram Extraction
+```javascript
+__UC_captureBaseline()         // Snapshot page trigrams → {trigrams, textLength}
+__UC_extractResponse(minRatio) // Find new text → [{selector, text, newRatio, ...}]
+```
+
+### Real-Time Observation
+```javascript
+__UC_watchContainer(selector)  // Start MutationObserver → true/false
+__UC_getObserved()             // Read observed mutations → [{type, text, tag, timestamp}]
+__UC_stopWatching()            // Stop + return final observations
+```
+
+### Structural Fingerprinting (LSH)
+```javascript
+__UC_computeSignature(sel)     // MinHash → {fingerprint, features, minhash}
+__UC_compareSig(sig1, sig2)    // Jaccard similarity → 0.0–1.0
+__UC_indexSignature(key, sig)  // Add to LSH index
+__UC_querySimilar(sig)         // Find similar indexed elements
+```
+
+### Actions (require bind)
+```javascript
+__UC_chatSend(text)            // Send chat message (async, framework-aware)
+__UC_chatGetMessages()         // Get visible messages
+__UC_chatOnMessage(callback)   // Real-time message observer
+__UC_formFill(data)            // Fill form (priority: name > id > type > placeholder)
+__UC_formSubmit()              // Submit form
+__UC_dropdownToggle()          // Toggle dropdown
+__UC_dropdownSelect(value)     // Select option by text
+__UC_modalClose()              // Close modal (button + Escape fallback)
+```
+
+### Convenience
+```javascript
+__UC_dismiss()                 // Click cookie consent accept button
+__UC_fillSearch(query)         // Fill detected search bar
+__UC_getVisibleText()          // Text from detected feed or full page
+__UC_bind(patternName)         // Detect + bind → {pattern, path}
+__UC_unbind(patternName)       // Remove binding
+```
+
+### Advanced
+```javascript
+__UC_startPassive()            // Background event correlation
+__UC_stopPassive()
+__UC_getPassiveResults()       // Inferred patterns
+__UC_getLLMContext(name)        // DOM context formatted for LLM
+__UC_heapScan(name)            // React/Vue internals
+__UC_scanFramework()           // Detect framework
+__UC_findNewContent()          // Scan-diff: elements with children-added/text-grew
+```
+
+### Signatures
+```javascript
+__UC_saveSignature(name)       // Persist working pattern for domain
+__UC_loadSignatures()          // Load saved for current domain
+__UC_autoBindSignatures()      // Auto-bind from saved
+__UC_getAllSignatures()         // All signatures across all domains
+```
+
+## Building
+
+```bash
+# Build the Chrome extension bundle
+cd ext/uc_extension && npm run build
+# → dist/uc-extension.js (IIFE bundle, ~5,700 lines)
+
+# Watch mode for development
+cd ext/uc_extension && npm run watch
+
+# Build the Tampermonkey userscript (independent)
+cd ext/universal_controller && npm run build
+# → dist/universal-controller.user.js
+```
 
 ## Debugging
 
-### Check extension is loaded
-Navigate to `chrome://extensions` — look for "Universal Controller (Dev)".
+### Check extension loaded
+Open `chrome://extensions` in the Playwright browser. Look for "Universal Controller (Dev)".
 
-### Check detection in DevTools console
+### DevTools console
 ```javascript
-window.__UC                           // extension state (ready should be true)
-window.__UC_detectAll()               // run detection, see what's found
-window.__UC.patterns                  // read results
-
-// Scan-diff workflow
-window.__UC_firstScan()               // take baseline
-// ... perform an action ...
-window.__UC_nextScan()                // see diff
-window.__UC_autoDetect()              // infer patterns
-
-// Actions
-window.__UC_dismiss()                 // click cookie accept
-window.__UC_fillSearch("test")        // fill search bar
+window.__UC                         // Check ready state
+window.__UC_detectAll()             // Run full detection
+window.__UC_findInputs()            // See what inputs are found
+window.__UC_findButtons("#myinput") // See buttons near input
+window.__UC_captureBaseline()       // Take trigram snapshot
+window.__UC_scanFramework()         // Detect React/Vue/etc.
 ```
 
 ### Common issues
 
 | Problem | Cause | Fix |
 |---|---|---|
-| `window.__UC` is undefined | Extension not loaded | Check `ext/uc_extension/manifest.json` exists; must be headed mode |
-| `patterns` is empty | Detection not triggered | Call `__UC_detectAll()` or `uc.detect_all(page)` — detection is not automatic |
-| Search bar not found | Low confidence | Try `__UC_detect("search", "STRUCTURAL")` for a lower threshold |
-| Scan-diff shows nothing | No action between scans | Perform a visible action between `firstScan()` and `nextScan()` |
-| Extension not loaded in headless | Expected | Extensions require headed mode; headless uses plain Playwright fallback |
-
-## Extending Detection
-
-Edit `ext/uc_extension/content.js` to add selectors or adjust scoring:
-
-```javascript
-// In PATTERNS object — add CSS selectors:
-search: {
-  selectors: [
-    // ... existing ...
-    '[data-testid="search-input"]',  // site-specific
-  ],
-  rules: { "has-input": 3, "search-type": 3 },
-},
-
-// In PHRASAL object — add keyword signals:
-search: {
-  strong: ["search", "explore events"],  // +0.35 each
-  medium: ["find", "look up", "filter"], // +0.15 each
-  placeholders: ["search", "search..."], // +0.25 each
-  buttons: ["search", "find", "go"],     // +0.20 each
-  negative: ["message", "chat"],         // -0.25 each
-},
-```
-
-Changes take effect on next page load — no build step needed.
+| `window.__UC` undefined | Extension not loaded | Use `use_extension=True`; check manifest.json exists |
+| Extension loads but detection empty | Detection not triggered | Call `detect_all()` — detection is not automatic |
+| `launch_persistent_context` crashes | Corrupted profile | Delete `data/.uc_chromium_profile/` |
+| `channel='chrome'` + extension | Branded Chrome blocks extensions | Use `use_extension=True` (auto-uses Chromium) |
+| Chat sends but no response | Site needs auth, or response in Shadow DOM | Try `web_login()` first; check page text manually |
+| Trigram filter returns wrong text | Response trigrams overlap with baseline | Check `__UC_extractResponse(0.3)` results in console |
