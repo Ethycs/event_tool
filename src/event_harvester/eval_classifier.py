@@ -5,7 +5,7 @@ import logging
 import random
 from pathlib import Path
 
-from event_harvester.analysis import _prioritize
+from event_harvester.analysis import prioritize
 from event_harvester.classifier import (
     filter_actionable as classifier_filter,
 )
@@ -125,7 +125,7 @@ def run_eval(
     print(f"  {len(after_clf):>6d}  after classifier ({n_clf} noise dropped)")
 
     # Stage 3: keyword heuristic
-    after_kw = _prioritize(after_clf)
+    after_kw = prioritize(after_clf)
     n_kw = len(after_clf) - len(after_kw)
     print(f"  {len(after_kw):>6d}  after keyword heuristic ({n_kw} dropped)")
 

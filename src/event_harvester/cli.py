@@ -42,6 +42,112 @@ def _setup_logging(verbose: bool) -> None:
     )
 
 
+def _run_url_diagnostics(url: str) -> None:
+    """Open a URL and run all detection modes to show what works."""
+    import concurrent.futures
+    from event_harvester.sources.uc_browser import UCBrowser
+    from event_harvester.sources.web_fetch import (
+        _extract_event_links, _extract_text, _wait_cloudflare,
+    )
+
+    def _do_diagnostics():
+        with UCBrowser(headless=False) as uc:
+            print(f"  Testing: {url}\n")
+            page = uc.open(url, wait_ms=3000)
+            html = _wait_cloudflare(page, headless=False)
+
+            if "just a moment" in html.lower():
+                print(f"  {RED}BLOCKED{RESET} — Cloudflare challenge not resolved.")
+                print(f"  Recommendation: use native_chrome=True\n")
+                page.close()
+                return
+
+            # ── 1. Raw text ──────────────────────────────────────
+            text = _extract_text(html)
+            print(f"  Raw text: {len(text)} chars")
+
+            # ── 2. Event link extraction (calendar mode) ─────────
+            event_links = _extract_event_links(page)
+            date_links = [l for l in event_links if l.get("date_hint")]
+            inline_links = [l for l in event_links if l.get("inline")]
+            fetch_links = [l for l in event_links if not l.get("inline")]
+
+            print(f"  Event links: {len(event_links)} total "
+                  f"({len(date_links)} with dates, "
+                  f"{len(inline_links)} inline, "
+                  f"{len(fetch_links)} fetchable)")
+
+            # ── 3. UC pattern detection ──────────────────────────
+            patterns = uc.detect_all(page)
+            if patterns:
+                for ptype, hits in patterns.items():
+                    if hits:
+                        best = hits[0].get("confidence", 0)
+                        print(f"  UC {ptype}: {len(hits)} hit(s), best={best:.2f}")
+
+            # ── 4. Feed detection ────────────────────────────────
+            feed_items = uc.get_feed_items(page)
+            feed_items = [t for t in feed_items if len(t) > 30]
+            print(f"  Feed items: {len(feed_items)}")
+
+            # ── 5. Search bar ────────────────────────────────────
+            search_hits = uc.detect(page, "search")
+            has_search = len(search_hits) > 0
+
+            # ── Recommendation ───────────────────────────────────
+            print(f"\n  {BOLD}Recommendation:{RESET}")
+            if len(event_links) >= 3:
+                mode = "calendar"
+                print(f"  {GREEN}mode: calendar{RESET} — {len(event_links)} event links found")
+                if inline_links:
+                    print(f"    {len(inline_links)} inline (no fetch needed)")
+                if fetch_links:
+                    print(f"    {len(fetch_links)} detail pages to fetch")
+            elif has_search:
+                mode = "search"
+                ph = search_hits[0].get("placeholder", "")
+                print(f"  {GREEN}mode: search{RESET} — search bar detected" +
+                      (f' (placeholder: "{ph}")' if ph else ""))
+            elif len(feed_items) >= 3:
+                mode = "feed"
+                print(f"  {GREEN}mode: feed{RESET} — {len(feed_items)} feed items")
+            else:
+                mode = "raw"
+                print(f"  mode: raw — no structured content detected")
+
+            # ── Sample output ────────────────────────────────────
+            print(f"\n  {BOLD}Sample events:{RESET}")
+            if event_links:
+                for lnk in event_links[:5]:
+                    dh = lnk.get("date_hint", "")
+                    tag = " [inline]" if lnk.get("inline") else ""
+                    print(f"    {dh:12s} {lnk['text'][:70]}{tag}")
+            elif feed_items:
+                for item in feed_items[:5]:
+                    print(f"    {item[:80]}")
+            else:
+                print(f"    {text[:200]}")
+
+            # ── Suggested config ─────────────────────────────────
+            print(f"\n  {BOLD}Suggested config:{RESET}")
+            from urllib.parse import urlparse
+            name = urlparse(url).netloc.split(".")[0]
+            if name in ("www", "business"):
+                name = urlparse(url).netloc.split(".")[-2]
+            cfg = f'    {{"url": "{url}", "name": "{name}", "mode": "{mode}"'
+            if mode == "feed":
+                cfg += ', "api_pattern": r"api|graphql", "scroll_seconds": 15'
+            if mode == "search":
+                cfg += ', "query": "events", "scroll_seconds": 10'
+            cfg += "}"
+            print(f"  {cfg}")
+
+            page.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(_do_diagnostics).result()
+
+
 def _run_recruiter_grading(all_messages, cfg, args) -> list:
     """Grade Gmail recruiter emails and optionally auto-trash."""
     from event_harvester.recruiter_score import grade_emails_batch
@@ -216,19 +322,9 @@ async def main() -> None:
         web_login()
         return
 
-    # ── Test URL mode ─────────────────────────────────────────────────────
+    # ── Test URL mode (diagnostics) ─────────────────────────────────────
     if args.test_url:
-        from event_harvester.sources.web_fetch import fetch_event_pages
-        print(f"Testing: {args.test_url}\n")
-        msgs = fetch_event_pages(urls=[{"url": args.test_url, "headless": False}])
-        if msgs:
-            print(f"  {len(msgs)} message(s) extracted.\n")
-            for i, m in enumerate(msgs):
-                print(f"  --- [{i+1}/{len(msgs)}] {m['channel'][:80]} ---")
-                print(f"  {m['content'][:500]}")
-                print()
-        else:
-            print("  No content extracted.")
+        _run_url_diagnostics(args.test_url)
         return
 
     # ── Reparse mode ────────────────────────────────────────────────────────

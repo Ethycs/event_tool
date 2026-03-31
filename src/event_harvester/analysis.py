@@ -10,23 +10,10 @@ from event_harvester.llm import chat_completion
 logger = logging.getLogger("event_harvester.analysis")
 
 
-def _parse_llm_ini(raw: str) -> dict[str, dict[str, str]]:
-    """Parse INI-formatted LLM output. Handles LLM quirks like markdown fences."""
-    import configparser
+from event_harvester.utils import parse_llm_ini
 
-    cleaned = raw.strip()
-    # Strip markdown code fences if present
-    if cleaned.startswith("```"):
-        lines = cleaned.splitlines()
-        lines = [l for l in lines if not l.strip().startswith("```")]
-        cleaned = "\n".join(lines)
-
-    parser = configparser.ConfigParser()
-    try:
-        parser.read_string(cleaned)
-    except configparser.Error:
-        return {}
-    return {section: dict(parser[section]) for section in parser.sections()}
+# Backward-compat alias — existing internal callers use this name.
+_parse_llm_ini = parse_llm_ini
 
 
 PRIORITY_LABEL = {0: "none", 1: "low", 3: "medium", 5: "high"}
@@ -125,7 +112,7 @@ Include any registration links, RSVP links, or event page URLs.
 Only output the INI sections, nothing else."""
 
 
-def _prioritize(messages: list[dict], max_messages: int = 150) -> list[dict]:
+def prioritize(messages: list[dict], max_messages: int = 150) -> list[dict]:
     """Sort messages by event signal strength, cap to fit time budget.
 
     150 messages = 15 batches of 10 ≈ 2 minutes on local LLM.
@@ -190,14 +177,14 @@ def extract_events_llm(
             filtered = rerank_messages(filtered, top_k=150)
         except ImportError:
             logger.warning("sentence-transformers not installed, falling back to regex priority.")
-            filtered = _prioritize(filtered)
+            filtered = prioritize(filtered)
 
         logger.info(
             "Event extraction: %d -> %d (classifier) -> %d (reranker) -> LLM (%s)",
             total, n_after_clf, len(filtered), cfg.display_name,
         )
     else:
-        filtered = _prioritize(messages)
+        filtered = prioritize(messages)
         logger.info(
             "Event extraction: %d -> %d messages (priority) -> LLM (%s)",
             total, len(filtered), cfg.display_name,

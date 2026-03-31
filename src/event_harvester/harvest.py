@@ -8,9 +8,8 @@ from pathlib import Path
 from event_harvester.config import AppConfig
 from event_harvester.display import DIM, RESET
 from event_harvester.sources import (
-    fetch_event_pages,
-    fetch_feeds,
     fetch_gmail_messages,
+    fetch_web_sources,
     read_discord_messages,
     read_signal_messages,
     read_telegram_messages,
@@ -203,14 +202,9 @@ async def harvest_messages(
         print()
 
     if not no_web:
-        print("[ Web Pages ]")
-        web_pages = fetch_event_pages()
-        messages.extend(web_pages)
-        print()
-
-        print("[ Web Feeds ]")
-        feed_msgs = fetch_feeds()
-        messages.extend(feed_msgs)
+        print("[ Web Sources ]")
+        web_msgs = fetch_web_sources()
+        messages.extend(web_msgs)
         print()
 
     # ── Filter already-seen messages ──────────────────────────────────────

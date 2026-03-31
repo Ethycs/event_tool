@@ -8,7 +8,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from event_harvester.recruiter_score import RecruiterGrade
-from event_harvester.report import _ticktick_deep_link
+from event_harvester.report import ticktick_deep_link
 
 logger = logging.getLogger("event_harvester.obsidian")
 
@@ -173,7 +173,7 @@ def _append_obsidian_event(lines: list[str], index: int, ev: dict) -> None:
 
     # TickTick deep link
     link_content = f"From @{author} in {channel}"
-    deep_link = _ticktick_deep_link(title, resolved_date, all_day, link_content)
+    deep_link = ticktick_deep_link(title, resolved_date, all_day, link_content)
     lines.append(f"- [ ] [Add to TickTick]({deep_link})")
     lines.append("- [ ] Decide: attend or skip")
     lines.append("")

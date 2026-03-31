@@ -56,17 +56,20 @@ class UCBrowser:
         channel: str = "chrome",
         stealth: bool = True,
         timeout_ms: int = 30000,
-        use_extension: bool = False,
+        use_extension: bool = True,
+        native_chrome: bool = False,
     ):
         self.headless = headless
         self.channel = channel
         self.use_stealth = stealth
         self.timeout_ms = timeout_ms
         self.use_extension = use_extension
+        self.native_chrome = native_chrome
         self._pw = None
         self._context = None
         self._browser = None
         self._stealth_plugin = None
+        self._chrome_proc = None
 
     def __enter__(self):
         self.start()
@@ -78,14 +81,22 @@ class UCBrowser:
     def start(self) -> None:
         """Launch the browser.
 
-        Default: installed Chrome + logged-in profile (data/.chrome_profile).
-        With use_extension=True: Playwright Chromium + UC extension + separate profile.
+        Modes:
+        - native_chrome=True: Launch actual Chrome via subprocess + CDP.
+          No automation flags, real profile, real extensions. Best for
+          Cloudflare-protected sites.
+        - Default: Installed Chrome via Playwright's channel="chrome".
+        - use_extension=True: Playwright Chromium + UC extension.
         """
         from playwright.sync_api import sync_playwright
 
         self._pw = sync_playwright().start()
 
-        if self.headless:
+        if self.native_chrome:
+            self._start_native_chrome()
+            return
+
+        if self.headless and not self.use_extension:
             self._browser = self._pw.chromium.launch(
                 headless=True, channel=self.channel,
             )
@@ -135,6 +146,73 @@ class UCBrowser:
             except ImportError:
                 logger.warning("playwright-stealth not installed, skipping stealth")
 
+    def _start_native_chrome(self) -> None:
+        """Launch actual Chrome via subprocess, connect Playwright via CDP.
+
+        No automation flags, real user profile, real extensions — Chrome
+        runs exactly as the user would launch it, plus a debug port.
+        """
+        import shutil
+        import subprocess
+        import time as _time
+
+        chrome_path = shutil.which("chrome") or shutil.which("google-chrome")
+        if not chrome_path:
+            # Windows default paths
+            for candidate in [
+                Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+                Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
+                Path.home() / r"AppData\Local\Google\Chrome\Application\chrome.exe",
+            ]:
+                if candidate.exists():
+                    chrome_path = str(candidate)
+                    break
+
+        if not chrome_path:
+            logger.error("Chrome not found. Falling back to Playwright channel='chrome'.")
+            _CHROME_PROFILE.parent.mkdir(parents=True, exist_ok=True)
+            self._context = self._pw.chromium.launch_persistent_context(
+                str(_CHROME_PROFILE), headless=False, channel="chrome",
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            return
+
+        port = 9222
+        # Use a copy of the real Chrome profile to avoid lock conflicts
+        real_profile = Path.home() / r"AppData\Local\Google\Chrome\User Data"
+        profile_dir = str(_CHROME_PROFILE.parent / ".native_chrome_profile")
+        Path(profile_dir).mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            chrome_path,
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={profile_dir}",
+        ]
+        logger.info("Launching native Chrome: %s", " ".join(cmd[:2]))
+        self._chrome_proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+        # Wait for CDP to be ready
+        for _ in range(15):
+            _time.sleep(1)
+            try:
+                self._browser = self._pw.chromium.connect_over_cdp(
+                    f"http://localhost:{port}",
+                )
+                break
+            except Exception:
+                continue
+        else:
+            logger.error("Failed to connect to native Chrome on port %d", port)
+            self._chrome_proc.kill()
+            self._chrome_proc = None
+            return
+
+        contexts = self._browser.contexts
+        self._context = contexts[0] if contexts else self._browser.new_context()
+        logger.info("Connected to native Chrome via CDP (port %d).", port)
+
     def close(self) -> None:
         """Shut down browser and Playwright."""
         if self._context:
@@ -147,6 +225,13 @@ class UCBrowser:
                 self._browser.close()
             except Exception:
                 pass
+        if self._chrome_proc:
+            try:
+                self._chrome_proc.terminate()
+                self._chrome_proc.wait(timeout=5)
+            except Exception:
+                self._chrome_proc.kill()
+            self._chrome_proc = None
         if self._pw:
             try:
                 self._pw.stop()
@@ -164,6 +249,43 @@ class UCBrowser:
         page.goto(url, timeout=self.timeout_ms, wait_until="domcontentloaded")
         page.wait_for_timeout(wait_ms)
         return page
+
+    def open_with_intercept(
+        self, url: str, api_pattern: str, wait_ms: int = 2000,
+    ) -> tuple:
+        """Open URL with API response interception.
+
+        Registers a response handler *before* navigation so responses
+        are captured from the first load. Returns (page, captured) where
+        captured is a mutable list of (url, body) tuples that fills as
+        matching responses arrive.
+        """
+        import re as _re
+
+        page = self._context.new_page()
+        if self._stealth_plugin:
+            self._stealth_plugin.apply_stealth_sync(page)
+
+        captured: list[tuple[str, str]] = []
+        pattern = _re.compile(api_pattern)
+
+        def _on_response(response):
+            try:
+                if not pattern.search(response.url):
+                    return
+                content_type = response.headers.get("content-type", "")
+                if "json" not in content_type:
+                    return
+                body = response.text()
+                if len(body) > 100:
+                    captured.append((response.url, body))
+            except Exception:
+                pass
+
+        page.on("response", _on_response)
+        page.goto(url, timeout=self.timeout_ms, wait_until="domcontentloaded")
+        page.wait_for_timeout(wait_ms)
+        return page, captured
 
     def _wait_ready(self, page, timeout_ms: int = 5000) -> bool:
         """Wait for the UC extension to be loaded on this page."""

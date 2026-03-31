@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from urllib.parse import quote
 
 
-def _ticktick_deep_link(
+def ticktick_deep_link(
     title: str,
     start_date: str | None,
     all_day: bool,
@@ -149,7 +149,7 @@ def _append_event(lines: list[str], index: int, ev: dict) -> None:
 
     # TickTick deep link
     link_content = f"From @{author} in {channel}"
-    deep_link = _ticktick_deep_link(title, resolved_date, all_day, link_content)
+    deep_link = ticktick_deep_link(title, resolved_date, all_day, link_content)
     lines.append(f"[Add to TickTick]({deep_link})")
     lines.append("")
     lines.append("---")

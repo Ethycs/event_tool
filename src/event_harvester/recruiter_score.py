@@ -432,8 +432,8 @@ def _llm_refine_borderline(
             cfg=cfg,
             max_tokens=2048,
         )
-        from event_harvester.analysis import _parse_llm_ini
-        sections = _parse_llm_ini(raw)
+        from event_harvester.utils import parse_llm_ini
+        sections = parse_llm_ini(raw)
         llm_grades = {}
         for section_name, fields in sections.items():
             if not section_name.lower().startswith("grade"):

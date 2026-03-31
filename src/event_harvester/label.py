@@ -98,8 +98,8 @@ def label_messages(
             continue
 
         # Parse the response
-        from event_harvester.analysis import _parse_llm_ini
-        sections = _parse_llm_ini(raw)
+        from event_harvester.utils import parse_llm_ini
+        sections = parse_llm_ini(raw)
         label_map: dict[int, int] = {}
         for section_name, fields in sections.items():
             # Extract number from "Message.1", "Message.2", etc.

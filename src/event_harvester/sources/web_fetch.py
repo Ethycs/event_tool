@@ -20,15 +20,6 @@ _COOLDOWN_FILE = _DATA_DIR / ".web_cooldowns.json"
 _DEFAULT_COOLDOWN = timedelta(hours=1)
 _EXT_DIR = Path(__file__).resolve().parent.parent.parent.parent / "ext" / "uc_extension"
 
-# Default event pages to fetch — override with WEB_EVENT_URLS env var
-DEFAULT_EVENT_URLS = [
-    {"url": "https://lu.ma/discover", "headless": True},
-    {"url": "https://www.instagram.com/", "headless": True},
-    {"url": "https://www.erobay.com/", "headless": False, "cooldown_hours": 4},
-    {"url": "https://business.sfchamber.com/events/calendar", "headless": True},
-]
-
-
 def _load_cooldowns() -> dict[str, str]:
     """Load per-URL last-fetch timestamps."""
     if not _COOLDOWN_FILE.exists():
@@ -60,6 +51,439 @@ def _is_on_cooldown(url: str, cooldown: timedelta = _DEFAULT_COOLDOWN) -> bool:
         return datetime.now(timezone.utc) - last_dt < cooldown
     except Exception:
         return False
+
+
+# ── Unified web source config ─────────────────────────────────────────
+
+WEB_SOURCES = [
+    # Calendar extraction (load page → find date↔link pairs → fetch details)
+    {"url": "https://lu.ma/discover", "name": "luma", "mode": "calendar"},
+    {"url": "https://business.sfchamber.com/events/calendar", "name": "sfchamber", "mode": "calendar"},
+    {"url": "https://www.erobay.com/", "name": "erobay", "mode": "calendar", "native_chrome": True, "cooldown_hours": 4},
+    # Feed scroll + API interception
+    {"url": "https://www.instagram.com/", "name": "instagram", "mode": "feed", "api_pattern": r"graphql", "scroll_seconds": 25, "api_only": True},
+    {"url": "https://www.eventbrite.com/d/ca--san-francisco/events/", "name": "eventbrite", "mode": "feed", "api_pattern": r"api|search|events", "scroll_seconds": 15},
+    # Search + extract event links
+    {"url": "https://www.meetup.com/find/?source=EVENTS&eventType=inPerson&sortField=RELEVANCE", "name": "meetup", "mode": "search", "query": "AI meetup", "scroll_seconds": 10},
+]
+
+
+# ── Mode handlers ─────────────────────────────────────────────────────
+
+def _wait_cloudflare(page, headless: bool = True) -> str:
+    """Wait for Cloudflare challenge to resolve. Returns page HTML."""
+    html = page.content()
+    if "just a moment" not in html.lower() and "security verification" not in html.lower():
+        return html
+    if headless:
+        logger.warning("Cloudflare challenge (headless can't solve). Skipping.")
+        return html
+    print(f"  Cloudflare captcha — click it in the browser window (15s timeout)...")
+    for _ in range(15):
+        page.wait_for_timeout(1000)
+        try:
+            html = page.content()
+        except Exception:
+            continue
+        if "just a moment" not in html.lower():
+            page.wait_for_timeout(3000)
+            return page.content()
+    logger.warning("Cloudflare did not resolve in 15s. Skipping.")
+    return html
+
+
+def _do_calendar(uc, src: dict, timeout_ms: int, max_events: int) -> list[dict]:
+    """Calendar mode: load page, extract date↔link pairs, fetch detail pages."""
+    from urllib.parse import urlparse
+
+    url = src["url"]
+    logger.info("Calendar: %s", src.get("name", url))
+
+    page = uc.open(url)
+    html = _wait_cloudflare(page, headless=False)
+    if "just a moment" in html.lower():
+        page.close()
+        return []
+
+    # UC obstacle clearing
+    uc.detect_all(page)
+    uc.dismiss_cookies(page)
+    uc.close_modal(page)
+    domain = urlparse(url).netloc
+
+    # Scroll to load lazy content before extracting links
+    scroll_secs = src.get("scroll_seconds", 3)
+    for _ in range(scroll_secs):
+        page.evaluate("window.scrollBy(0, window.innerHeight)")
+        page.wait_for_timeout(800)
+
+    # Extract event links via DOM-graph date↔link association
+    event_links = _extract_event_links(page)
+    if len(event_links) >= 3:
+        logger.info("%s: %d event links found.", src.get("name"), len(event_links))
+        messages = []
+        for lnk in event_links[:max_events]:
+            if lnk.get("inline"):
+                date_hint = lnk.get("date_hint", "")
+                time_hint = lnk.get("time", "")
+                venue = lnk.get("venue", "")
+                parts = [lnk["text"]]
+                if date_hint:
+                    parts.append(f"date: {date_hint}")
+                if time_hint:
+                    parts.append(f"time: {time_hint}")
+                if venue:
+                    parts.append(f"location: {venue}")
+                messages.append({
+                    "platform": "web",
+                    "id": f"web:{hash(lnk['text'] + date_hint)}",
+                    "timestamp": f"{date_hint}T00:00:00+00:00" if date_hint else datetime.now(timezone.utc).isoformat(),
+                    "author": domain,
+                    "channel": url[:120],
+                    "content": "\n".join(parts),
+                })
+            else:
+                text = _fetch_event_detail(uc._context, uc._stealth_plugin, lnk["url"], timeout_ms)
+                if text:
+                    messages.append({
+                        "platform": "web",
+                        "id": f"web:{hash(lnk['url'])}",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "author": domain,
+                        "channel": lnk["url"][:120],
+                        "content": text[:5000],
+                    })
+        page.close()
+        return messages
+
+    # Fallback: raw text
+    text = _extract_text(html)
+    page.close()
+    if len(text) < 50:
+        return []
+    return [{
+        "platform": "web",
+        "id": f"web:{hash(url)}",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "author": domain,
+        "channel": url[:120],
+        "content": text[:8000],
+    }]
+
+
+def _do_feed(uc, src: dict) -> list[dict]:
+    """Feed mode: scroll page while intercepting API responses."""
+    import json as json_mod
+    import time as _time
+    from urllib.parse import urlparse
+
+    url = src["url"]
+    api_pattern = src.get("api_pattern", "graphql|api")
+    scroll_secs = src.get("scroll_seconds", 30)
+    name = src.get("name", "web")
+
+    logger.info("Feed: scrolling %s for %ds...", name, scroll_secs)
+
+    page, captured = uc.open_with_intercept(url, api_pattern)
+    page.wait_for_timeout(3000)
+
+    # UC obstacle clearing + feed detection
+    uc.detect_all(page)
+    uc.dismiss_cookies(page)
+    uc.close_modal(page)
+
+    # Use UC-detected feed container for targeted scrolling
+    feed_selector = None
+    patterns = uc.get_patterns(page)
+    if patterns.get("feed"):
+        feed_selector = patterns["feed"][0].get("selector")
+        logger.info("UC: scrolling detected feed container: %s", feed_selector)
+
+    # Scroll (targeted if feed detected, full-page otherwise)
+    end_time = _time.time() + scroll_secs
+    scroll_count = 0
+    while _time.time() < end_time:
+        if feed_selector:
+            page.evaluate(
+                """(sel) => {
+                    const el = document.querySelector(sel);
+                    if (el) el.scrollTop += el.clientHeight * 2;
+                    else window.scrollBy(0, window.innerHeight * 2);
+                }""",
+                feed_selector,
+            )
+        else:
+            page.evaluate("window.scrollBy(0, window.innerHeight * 2)")
+        page.wait_for_timeout(800)
+        scroll_count += 1
+
+    # Get page text — prefer feed container
+    if feed_selector:
+        page_text = page.evaluate(
+            "(sel) => { const el = document.querySelector(sel); return el ? el.innerText : document.body.innerText; }",
+            feed_selector,
+        )
+    else:
+        page_text = page.evaluate("document.body.innerText") or ""
+    logger.info("%s: scrolled %d times, captured %d API responses, %d chars page text.",
+                name, scroll_count, len(captured), len(page_text))
+
+    messages = []
+    domain = urlparse(url).netloc
+
+    # Try event link extraction from scrolled page (maximizes events)
+    # Skip for api_only sources (e.g. Instagram where links aren't event pages)
+    event_links = []
+    if not src.get("api_only"):
+        event_links = _extract_event_links(page)
+        if event_links:
+            logger.info("%s: %d event links found after scroll.", name, len(event_links))
+            for lnk in event_links[:30]:
+                if not lnk.get("inline"):
+                    text = _fetch_event_detail(uc._context, uc._stealth_plugin, lnk["url"], uc.timeout_ms)
+                    if text:
+                        messages.append({
+                            "platform": "web",
+                            "id": f"web:{hash(lnk['url'])}",
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "author": urlparse(lnk["url"]).netloc,
+                            "channel": lnk["url"][:120],
+                            "content": text[:5000],
+                        })
+
+    # Page text as a message (if no event links found)
+    if not event_links and page_text and len(page_text) > 200:
+        messages.append({
+            "platform": name,
+            "id": f"feed:page:{hash(url)}",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "author": name,
+            "channel": url[:120],
+            "content": page_text[:5000],
+        })
+
+    page.close()
+
+    # Parse captured API responses
+    for resp_url, resp_body in captured:
+        try:
+            data = json_mod.loads(resp_body)
+            posts = _extract_posts_from_api(data, resp_url, name)
+            messages.extend(posts)
+        except json_mod.JSONDecodeError:
+            pass
+
+    return messages
+
+
+def _do_search(uc, src: dict, timeout_ms: int, max_events: int) -> list[dict]:
+    """Search mode: detect search bar, query, scroll, extract event links."""
+    from urllib.parse import urlparse
+
+    url = src["url"]
+    query = src.get("query")
+    scroll_secs = src.get("scroll_seconds", 10)
+    name = src.get("name", "web")
+
+    logger.info("Search: %s", name)
+
+    page = uc.open(url)
+    uc.detect_all(page)
+    uc.dismiss_cookies(page)
+    uc.close_modal(page)
+
+    if uc.has_login_wall(page):
+        logger.warning("%s: login wall — skipping", name)
+        page.close()
+        return []
+
+    # Search if query provided
+    if query:
+        uc.first_scan(page)
+        searched = uc.search(page, query)
+
+        # Fallback: generic input discovery if static detect missed the search bar
+        if not searched:
+            # Try UC generic discovery first, then inline JS fallback
+            inputs = uc.find_inputs(page)
+            if not inputs:
+                inputs = page.evaluate("""() => {
+                    const els = document.querySelectorAll(
+                        'input[type="search"], input[type="text"], input:not([type]), textarea'
+                    );
+                    for (const el of els) {
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width === 0 || rect.height === 0) continue;
+                        const style = getComputedStyle(el);
+                        if (style.display === 'none' || style.visibility === 'hidden') continue;
+                        let sel = '';
+                        if (el.id) sel = '#' + el.id;
+                        else if (el.getAttribute('placeholder'))
+                            sel = el.tagName.toLowerCase()
+                                + '[placeholder="' + el.getAttribute('placeholder').replace(/"/g, '\\\\"') + '"]';
+                        else sel = el.tagName.toLowerCase() + '[type="' + (el.type || 'text') + '"]';
+                        return [{selector: sel, score: 1}];
+                    }
+                    return [];
+                }""") or []
+
+            if inputs:
+                best = inputs[0]
+                logger.info("%s: using generic input: %s (score=%.1f)",
+                            name, best.get("selector"), best.get("score", 0))
+                try:
+                    page.fill(best["selector"], query)
+                    page.press(best["selector"], "Enter")
+                    searched = True
+                except Exception as e:
+                    logger.debug("Generic search fill failed: %s", e)
+
+        if searched:
+            page.wait_for_timeout(3000)
+            diff = uc.next_scan(page)
+            detected = uc.auto_detect(page)
+            if diff:
+                logger.info("%s: search → %d changed, %d added",
+                            name, diff.get("changed", 0), diff.get("added", 0))
+
+    # Scroll
+    for _ in range(scroll_secs):
+        page.evaluate("window.scrollBy(0, window.innerHeight)")
+        page.wait_for_timeout(1000)
+
+    # Extract event links
+    event_links = _extract_event_links(page)[:max_events]
+    messages = []
+    domain = urlparse(url).netloc
+
+    if event_links:
+        logger.info("%s: %d event links, fetching details...", name, len(event_links))
+        for lnk in event_links:
+            text = _fetch_event_detail(uc._context, uc._stealth_plugin, lnk["url"], timeout_ms)
+            if text:
+                messages.append({
+                    "platform": "web",
+                    "id": f"web:{hash(lnk['url'])}",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "author": urlparse(lnk["url"]).netloc,
+                    "channel": lnk["url"][:120],
+                    "content": text[:5000],
+                })
+    else:
+        # Fallback: feed items
+        items = uc.get_feed_items(page)
+        for i, item_text in enumerate(items):
+            if len(item_text) > 30:
+                messages.append({
+                    "platform": "web",
+                    "id": f"web:{hash(url + str(i))}",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "author": domain,
+                    "channel": f"{name}-feed",
+                    "content": item_text[:5000],
+                })
+
+    page.close()
+    return messages
+
+
+def _do_raw(uc, src: dict) -> list[dict]:
+    """Raw mode: just load page and grab text."""
+    from urllib.parse import urlparse
+
+    url = src["url"]
+    page = uc.open(url)
+    html = _wait_cloudflare(page, headless=False)
+    uc.dismiss_cookies(page)
+    text = _extract_text(html)
+    page.close()
+
+    if len(text) < 50:
+        return []
+
+    domain = urlparse(url).netloc
+    return [{
+        "platform": "web",
+        "id": f"web:{hash(url)}",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "author": domain,
+        "channel": url[:120],
+        "content": text[:8000],
+    }]
+
+
+# ── Unified entry point ──────────────────────────────────────────────
+
+def fetch_web_sources(
+    sources: list[dict] | None = None,
+    max_events: int = 30,
+    timeout_ms: int = 30000,
+) -> list[dict]:
+    """Fetch events from all configured web sources.
+
+    Groups sources by headless/visible, launches one UCBrowser per group,
+    dispatches each source to its mode handler.
+    """
+    if sources is None:
+        sources = list(WEB_SOURCES)
+    if not sources:
+        return []
+
+    # Filter cooldowns
+    active = []
+    for src in sources:
+        cd_hours = src.get("cooldown_hours", -1)
+        if cd_hours >= 0 and _is_on_cooldown(src["url"], timedelta(hours=cd_hours)):
+            logger.info("Skipping %s (on cooldown).", src.get("name", src["url"]))
+        else:
+            active.append(src)
+    if not active:
+        return []
+
+    # Group: standard sources (Chromium + UC extension) vs native Chrome (Cloudflare)
+    standard_srcs = [s for s in active if not s.get("native_chrome")]
+    native_srcs = [s for s in active if s.get("native_chrome")]
+
+    import concurrent.futures
+
+    def _process_group(group: list[dict], **uc_kwargs) -> list[dict]:
+        from event_harvester.sources.uc_browser import UCBrowser
+
+        messages = []
+        with UCBrowser(**uc_kwargs) as uc:
+            for src in group:
+                mode = src.get("mode", "calendar")
+                name = src.get("name", src["url"])
+                try:
+                    if mode == "calendar":
+                        msgs = _do_calendar(uc, src, timeout_ms, max_events)
+                    elif mode == "feed":
+                        msgs = _do_feed(uc, src)
+                    elif mode == "search":
+                        msgs = _do_search(uc, src, timeout_ms, max_events)
+                    else:
+                        msgs = _do_raw(uc, src)
+                    messages.extend(msgs)
+                    if msgs:
+                        _save_cooldown(src["url"])
+                    logger.info("%s: %d messages.", name, len(msgs))
+                except Exception as e:
+                    logger.error("Failed %s (%s): %s", name, mode, e)
+        return messages
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        futures = []
+        if standard_srcs:
+            futures.append(pool.submit(_process_group, standard_srcs))
+        if native_srcs:
+            futures.append(pool.submit(_process_group, native_srcs, native_chrome=True))
+
+        all_messages = []
+        for f in concurrent.futures.as_completed(futures):
+            all_messages.extend(f.result())
+
+    logger.info("Web sources: %d messages from %d sources.", len(all_messages), len(active))
+    return all_messages
 
 
 def _get_chrome_cookies(domains: list[str] | None = None) -> list[dict]:
@@ -261,7 +685,7 @@ def web_login(urls: list[str] | None = None) -> None:
     to data/.playwright_state.json for future headless runs.
     """
     if urls is None:
-        urls = [u["url"] if isinstance(u, dict) else u for u in DEFAULT_EVENT_URLS]
+        urls = [s["url"] for s in WEB_SOURCES]
 
     import concurrent.futures
 
@@ -317,337 +741,15 @@ def web_login(urls: list[str] | None = None) -> None:
         pool.submit(_do_login).result()
 
 
-# ── UC-driven perceptual harvest ──────────────────────────────────────
+# ── Legacy wrappers ───────────────────────────────────────────────────
 
-DEFAULT_UC_SOURCES = [
-    {
-        "url": "https://www.meetup.com/find/?source=EVENTS&eventType=inPerson&sortField=RELEVANCE",
-        "query": "AI meetup",
-        "scroll_seconds": 10,
-        "name": "meetup",
-    },
-]
-
-
-def uc_harvest(
-    sources: list[dict] | None = None,
-    max_events: int = 30,
-) -> list[dict]:
-    """Perceptually discover and harvest events from any website.
-
-    Uses UC extension to detect page components (search bars, feeds,
-    cookie banners, modals, login walls), interact with them, and
-    extract event data — turning any event site into an API.
-
-    Flow per source:
-      1. Open → detectAll → clear obstacles (cookies, modals, login walls)
-      2. If query: detect search → fill + submit → scan-diff the results
-      3. Scroll to load more content
-      4. Extract event links from page → fetch each detail page
-      5. Fallback: use detected feed items as messages
-
-    Source config keys:
-        url:             page to open
-        query:           search text (optional — skip search if absent)
-        scroll_seconds:  how long to scroll (default 10)
-        name:            source label for logging
-    """
-    if sources is None:
-        sources = DEFAULT_UC_SOURCES
-    if not sources:
-        return []
-
-    import concurrent.futures
-
-    def _do_harvest():
-        from event_harvester.sources.uc_browser import UCBrowser
-        from urllib.parse import urlparse
-
-        all_messages = []
-
-        with UCBrowser(headless=False) as uc:
-            for cfg in sources:
-                url = cfg["url"]
-                query = cfg.get("query")
-                scroll_secs = cfg.get("scroll_seconds", 10)
-                name = cfg.get("name", urlparse(url).netloc)
-                messages = []
-
-                logger.info("UC harvest: %s", name)
-
-                # ── 1. Open + detect + clear obstacles ───────────
-                page = uc.open(url)
-                patterns = uc.detect_all(page)
-                uc.dismiss_cookies(page)
-                uc.close_modal(page)
-
-                if uc.has_login_wall(page):
-                    logger.warning("%s: login wall — skipping", name)
-                    page.close()
-                    continue
-
-                # ── 2. Search if query provided ──────────────────
-                if query:
-                    uc.first_scan(page)
-                    searched = uc.search(page, query)
-                    if searched:
-                        page.wait_for_timeout(3000)
-                        diff = uc.next_scan(page)
-                        detected = uc.auto_detect(page)
-                        if diff:
-                            logger.info(
-                                "%s: search → %d changed, %d added, %d patterns",
-                                name, diff.get("changed", 0),
-                                diff.get("added", 0), len(detected),
-                            )
-                    else:
-                        logger.info("%s: no search bar — using page as-is", name)
-
-                # ── 3. Scroll to load more ───────────────────────
-                for _ in range(scroll_secs):
-                    page.evaluate("window.scrollBy(0, window.innerHeight)")
-                    page.wait_for_timeout(1000)
-
-                # ── 4. Score and extract event links ─────────────
-                event_links = _extract_event_links(page)
-
-                event_links = event_links[:max_events]
-
-                if event_links:
-                    logger.info("%s: %d event links, fetching details...", name, len(event_links))
-                    for lnk in event_links:
-                        text = _fetch_event_detail(
-                            uc._context, uc._stealth_plugin,
-                            lnk["url"], uc.timeout_ms,
-                        )
-                        if text:
-                            domain = urlparse(lnk["url"]).netloc
-                            messages.append({
-                                "platform": "web",
-                                "id": f"web:{hash(lnk['url'])}",
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
-                                "author": domain,
-                                "channel": lnk["url"][:120],
-                                "content": text[:5000],
-                            })
-                else:
-                    # ── 5. Fallback: feed items as messages ──────
-                    items = uc.get_feed_items(page)
-                    domain = urlparse(url).netloc
-                    for i, item_text in enumerate(items):
-                        if len(item_text) > 30:
-                            messages.append({
-                                "platform": "web",
-                                "id": f"web:{hash(url + str(i))}",
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
-                                "author": domain,
-                                "channel": f"{name}-feed",
-                                "content": item_text[:5000],
-                            })
-
-                logger.info("%s: %d messages harvested.", name, len(messages))
-                all_messages.extend(messages)
-                page.close()
-
-        return all_messages
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        messages = pool.submit(_do_harvest).result()
-
-    logger.info("UC harvest: %d message(s) from %d source(s).", len(messages), len(sources))
-    return messages
-
-
-# ── Feed scrolling with API interception ───────────────────────────────
-
-# Feed configs: URL to visit, API pattern to intercept, scroll duration
-DEFAULT_FEEDS = [
-    {
-        "url": "https://www.instagram.com/",
-        "api_pattern": r"graphql",
-        "scroll_seconds": 25,
-        "name": "instagram",
-    },
-    {
-        "url": "https://www.eventbrite.com/d/ca--san-francisco/events/",
-        "api_pattern": r"api|search|events",
-        "scroll_seconds": 15,
-        "name": "eventbrite",
-    },
-]
-
-
-def fetch_feeds(
-    feeds: list[dict] | None = None,
-    headless: bool = True,
-) -> list[dict]:
-    """Scroll through social feeds and intercept API responses.
-
-    Opens each feed URL, scrolls for a set duration, and captures
-    API responses containing post/event data.
-
-    Args:
-        feeds: list of feed configs (url, api_pattern, scroll_seconds, name)
-        headless: run browser without visible window
-
-    Returns:
-        List of message dicts from intercepted API responses.
-    """
+def fetch_feeds(feeds: list[dict] | None = None, headless: bool = True) -> list[dict]:
+    """Legacy wrapper — delegates to fetch_web_sources with feed mode."""
     if feeds is None:
-        env_feeds = os.getenv("WEB_FEED_URLS", "")
-        if env_feeds:
-            feeds = [{"url": u.strip(), "api_pattern": "graphql|api", "scroll_seconds": 30, "name": "web"}
-                     for u in env_feeds.split(",") if u.strip()]
-        else:
-            feeds = DEFAULT_FEEDS
-
-    if not feeds:
-        return []
-
-    import concurrent.futures
-
-    def _do_scroll():
-        import json as json_mod
-        import time
-        from playwright.sync_api import sync_playwright
-        from playwright_stealth import Stealth
-
-        stealth = Stealth()
-        messages = []
-        user_data_dir = str(Path("data/.chrome_profile").resolve())
-
-        with sync_playwright() as p:
-            # Use storage_state for headless, persistent profile for visible
-            if headless:
-                browser = p.chromium.launch(headless=True, channel="chrome")
-                if _STATE_FILE.exists():
-                    context = browser.new_context(storage_state=str(_STATE_FILE))
-                else:
-                    context = browser.new_context()
-            else:
-                context = p.chromium.launch_persistent_context(
-                    user_data_dir,
-                    headless=False,
-                    channel="chrome",
-                    args=[
-                        "--disable-blink-features=AutomationControlled",
-                        *_extension_args(),
-                    ],
-                )
-                browser = None
-
-            for feed in feeds:
-                url = feed["url"]
-                api_pattern = re.compile(feed.get("api_pattern", "graphql|api"))
-                scroll_secs = feed.get("scroll_seconds", 30)
-                name = feed.get("name", "web")
-                feed_responses: list[str] = []
-
-                logger.info("Scrolling %s for %ds...", url, scroll_secs)
-
-                page = context.new_page()
-                stealth.apply_stealth_sync(page)
-
-                # Intercept API responses as they load — capture full body
-                def _on_response(response):
-                    try:
-                        if not api_pattern.search(response.url):
-                            return
-                        content_type = response.headers.get("content-type") or ""
-                        if "json" not in content_type:
-                            return
-                        body = response.text()
-                        if len(body) > 100:
-                            feed_responses.append((response.url, body))
-                    except Exception:
-                        pass
-
-                page.on("response", _on_response)
-
-                try:
-                    page.goto(url, timeout=20000, wait_until="domcontentloaded")
-                    page.wait_for_timeout(3000)
-
-                    # Check UC extension for detected patterns
-                    uc = _wait_for_uc(page, timeout_ms=3000)
-                    _apply_uc_patterns(page, uc)
-
-                    # If UC found a feed container, scroll it specifically
-                    feed_selector = None
-                    if uc and uc.get("patterns", {}).get("feed"):
-                        best_feed = uc["patterns"]["feed"][0]
-                        feed_selector = best_feed.get("selector")
-                        logger.info("UC: scrolling detected feed container: %s", feed_selector)
-
-                    # Scroll rapidly
-                    end_time = time.time() + scroll_secs
-                    scroll_count = 0
-                    while time.time() < end_time:
-                        if feed_selector:
-                            page.evaluate(
-                                """(sel) => {
-                                    const el = document.querySelector(sel);
-                                    if (el) el.scrollTop += el.clientHeight * 2;
-                                    else window.scrollBy(0, window.innerHeight * 2);
-                                }""",
-                                feed_selector,
-                            )
-                        else:
-                            page.evaluate("window.scrollBy(0, window.innerHeight * 2)")
-                        page.wait_for_timeout(800)  # fast scroll
-                        scroll_count += 1
-
-                    # Grab text — prefer UC feed text extraction
-                    if feed_selector:
-                        page_text = page.evaluate(
-                            "(sel) => { const el = document.querySelector(sel); return el ? el.innerText : document.body.innerText; }",
-                            feed_selector,
-                        )
-                    else:
-                        page_text = page.evaluate("document.body.innerText")
-
-                    logger.info(
-                        "%s: scrolled %d times, captured %d API responses, page text %d chars.",
-                        name, scroll_count, len(feed_responses), len(page_text or ""),
-                    )
-
-                    # Add page text as a message if substantial
-                    if page_text and len(page_text) > 200:
-                        messages.append({
-                            "platform": name,
-                            "id": f"feed:page:{hash(url)}",
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                            "author": name,
-                            "channel": url[:120],
-                            "content": page_text[:5000],
-                        })
-
-                except Exception as e:
-                    logger.error("Feed scroll failed for %s: %s", url, e)
-
-                page.close()
-
-                # Parse captured API responses — extract posts/events
-                for resp_url, resp_body in feed_responses:
-                    try:
-                        data = json_mod.loads(resp_body)
-                        # Extract individual posts from known feed structures
-                        posts = _extract_posts_from_api(data, resp_url, name)
-                        messages.extend(posts)
-                    except json_mod.JSONDecodeError:
-                        pass
-
-            context.close()
-            if browser:
-                browser.close()
-
-        return messages
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        messages = pool.submit(_do_scroll).result()
-
-    logger.info("Feed fetch: %d response(s) captured.", len(messages))
-    return messages
+        feeds = [s for s in WEB_SOURCES if s.get("mode") == "feed"]
+    else:
+        feeds = [{"mode": "feed", "headless": headless, **f} for f in feeds]
+    return fetch_web_sources(sources=feeds)
 
 
 def _extract_posts_from_api(data: dict, url: str, platform: str) -> list[dict]:
@@ -899,6 +1001,60 @@ def _extract_event_links(page) -> list[dict]:
             }
         }
 
+        // ── Step 4b: JavaScript links with embedded data ────────────────
+        // Some calendars use javascript: hrefs that encode the event name,
+        // date, and ID directly. Extract time and venue from DOM context.
+        if (results.length < 3) {
+            const jsLinks = document.querySelectorAll('a[href^="JavaScript:" i], a[href^="javascript:" i]');
+            const jsDateRe = /(\\d{4})\\/+(\\d{1,2})\\/+(\\d{1,2})/;
+            for (const a of jsLinks) {
+                const text = a.innerText.trim();
+                if (text.length < 5) continue;
+                const href = a.getAttribute('href') || '';
+                const dm = href.match(jsDateRe);
+                if (!dm) continue;
+                const dateStr = dm[1] + '-' + dm[2].padStart(2, '0') + '-' + dm[3].padStart(2, '0');
+                if (seenUrls.has(text + dateStr)) continue;
+                seenUrls.add(text + dateStr);
+
+                // Extract time from sibling TimeLabel
+                const container = a.closest('.CalEvent') || a.closest('div') || a.parentElement;
+                const timeEl = container ? container.querySelector('.TimeLabel') : null;
+                const time = timeEl ? timeEl.innerText.trim() : '';
+
+                // Extract venue from parent table class (e.g. c_FilthyStudios)
+                const venueTable = a.closest('table[class]');
+                let venue = '';
+                if (venueTable) {
+                    venue = venueTable.className
+                        .replace(/^c_/, '')
+                        .replace(/([A-Z])/g, ' $1')
+                        .trim();
+                }
+
+                // Build event detail URL from PopupWindow params
+                const idMatch = href.match(/['\"]\\s*,\\s*['\"]\\d{4}\\/\\d+\\/\\d+['\"]\\s*,\\s*['\"](\\d+)/);
+                const calMatch = href.match(/PopupWindow\\s*\\(\\s*['\"]([^'\"]+)/);
+                let eventUrl = location.origin + location.pathname;
+                if (idMatch && calMatch) {
+                    const calName = calMatch[1];
+                    const eventId = idMatch[1];
+                    eventUrl = location.origin + '/calendar/Calcium40.pl?CalendarName='
+                        + encodeURIComponent(calName)
+                        + '&Op=PopupWindow&Date=' + encodeURIComponent(dm[0])
+                        + '&ID=' + eventId;
+                }
+
+                results.push({
+                    url: eventUrl,
+                    text: text.substring(0, 200),
+                    date_hint: dateStr,
+                    time: time,
+                    venue: venue,
+                });
+            }
+        }
+
         // ── Step 5: Last resort — links near dates (walk up 5 ancestors) ──
         if (results.length < 3) {
             const allLinks = document.querySelectorAll('a[href]');
@@ -946,10 +1102,25 @@ def _fetch_event_detail(context, stealth, url: str, timeout_ms: int) -> str | No
     """Fetch a single event detail page and return its text."""
     try:
         page = context.new_page()
-        stealth.apply_stealth_sync(page)
+        if stealth:
+            stealth.apply_stealth_sync(page)
         page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
         page.wait_for_timeout(1500)
+
+        # Wait for Cloudflare challenge if present
         html = page.content()
+        if "just a moment" in html.lower():
+            for _ in range(15):
+                page.wait_for_timeout(1000)
+                try:
+                    html = page.content()
+                except Exception:
+                    continue
+                if "just a moment" not in html.lower():
+                    page.wait_for_timeout(1000)
+                    html = page.content()
+                    break
+
         page.close()
         text = _extract_text(html)
         return text if len(text) > 50 else None
@@ -975,20 +1146,48 @@ def _try_calendar_extraction(
     )
 
     messages = []
+    fetchable = []
     for lnk in event_links:
-        text = _fetch_event_detail(context, stealth, lnk["url"], timeout_ms)
-        if not text:
-            continue
-        messages.append({
-            "platform": "web",
-            "id": f"web:{hash(lnk['url'])}",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "author": domain,
-            "channel": lnk["url"][:120],
-            "content": text[:5000],
-        })
+        if lnk.get("inline"):
+            # Inline event (e.g. javascript: link with embedded data)
+            date_hint = lnk.get("date_hint", "")
+            time_hint = lnk.get("time", "")
+            venue = lnk.get("venue", "")
+            parts = [lnk["text"]]
+            if date_hint:
+                parts.append(f"date: {date_hint}")
+            if time_hint:
+                parts.append(f"time: {time_hint}")
+            if venue:
+                parts.append(f"location: {venue}")
+            messages.append({
+                "platform": "web",
+                "id": f"web:{hash(lnk['text'] + date_hint)}",
+                "timestamp": f"{date_hint}T00:00:00+00:00" if date_hint else datetime.now(timezone.utc).isoformat(),
+                "author": domain,
+                "channel": url[:120],
+                "content": "\n".join(parts),
+            })
+        else:
+            fetchable.append(lnk)
 
-    logger.info("Calendar: fetched %d/%d event detail pages.", len(messages), len(event_links))
+    if fetchable:
+        logger.info("Fetching %d event detail pages...", len(fetchable))
+        for lnk in fetchable:
+            text = _fetch_event_detail(context, stealth, lnk["url"], timeout_ms)
+            if not text:
+                continue
+            messages.append({
+                "platform": "web",
+                "id": f"web:{hash(lnk['url'])}",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "author": domain,
+                "channel": lnk["url"][:120],
+                "content": text[:5000],
+            })
+
+    logger.info("Calendar: %d events (%d inline, %d fetched).",
+                len(messages), len(messages) - len(fetchable), len(fetchable))
     return messages if messages else None
 
 
@@ -996,165 +1195,17 @@ def fetch_event_pages(
     urls: list[dict | str] | None = None,
     timeout_ms: int = 30000,
 ) -> list[dict]:
-    """Fetch event pages using Playwright.
-
-    URLs can be dicts ``{"url": ..., "headless": bool, "cooldown_hours": N}``
-    or plain strings (default headless=True, cooldown=1h).
-    Headless and non-headless URLs run in parallel browser instances.
-    URLs on cooldown are skipped.
-    """
+    """Legacy wrapper — delegates to fetch_web_sources with calendar mode."""
     if urls is None:
-        env_urls = os.getenv("WEB_EVENT_URLS", "")
-        if env_urls:
-            urls = [{"url": u.strip(), "headless": True}
-                    for u in env_urls.split(",") if u.strip()]
-        else:
-            urls = list(DEFAULT_EVENT_URLS)
-
-    if not urls:
-        return []
-
-    # Normalise plain strings to dicts
-    normalised = []
-    for u in urls:
-        if isinstance(u, str):
-            normalised.append({"url": u, "headless": True})
-        else:
-            normalised.append(u)
-
-    # Filter out URLs on cooldown (cooldown_hours=-1 means no cooldown)
-    active = []
-    for u in normalised:
-        cd_hours = u.get("cooldown_hours", -1)
-        if cd_hours >= 0 and _is_on_cooldown(u["url"], timedelta(hours=cd_hours)):
-            logger.info("Skipping %s (on cooldown).", u["url"])
-        else:
-            active.append(u)
-
-    if not active:
-        return []
-
-    # Split into headless and non-headless groups
-    headless_urls = [u["url"] for u in active if u.get("headless", True)]
-    visible_urls = [u["url"] for u in active if not u.get("headless", True)]
-
-    import concurrent.futures
-
-    def _fetch_group(group_urls: list[str], headless: bool) -> list[dict]:
-        from urllib.parse import urlparse
-        from playwright.sync_api import sync_playwright
-        from playwright_stealth import Stealth
-
-        stealth = Stealth()
-        messages = []
-        user_data_dir = str(Path("data/.chrome_profile").resolve())
-
-        with sync_playwright() as p:
-            if headless:
-                browser = p.chromium.launch(headless=True, channel="chrome")
-                if _STATE_FILE.exists():
-                    context = browser.new_context(storage_state=str(_STATE_FILE))
-                else:
-                    context = browser.new_context()
+        urls = [s for s in WEB_SOURCES if s.get("mode") == "calendar"]
+    else:
+        normalised = []
+        for u in urls:
+            if isinstance(u, str):
+                normalised.append({"url": u, "mode": "calendar", "headless": True})
+            elif "mode" not in u:
+                normalised.append({"mode": "calendar", **u})
             else:
-                context = p.chromium.launch_persistent_context(
-                    user_data_dir,
-                    headless=False,
-                    channel="chrome",
-                    args=[
-                        "--disable-blink-features=AutomationControlled",
-                        *_extension_args(),
-                    ],
-                )
-                browser = None
-
-            for url in group_urls:
-                logger.info("Fetching: %s", url)
-                try:
-                    page = context.new_page()
-                    stealth.apply_stealth_sync(page)
-                    page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
-                    page.wait_for_timeout(2000)
-
-                    # Wait for Cloudflare challenge to resolve
-                    html = page.content()
-                    if "just a moment" in html.lower() or "security verification" in html.lower():
-                        if headless:
-                            logger.warning("Cloudflare on %s (headless). Skipping.", url)
-                            page.close()
-                            continue
-                        print(f"  Cloudflare captcha on {url} — click it in the browser...")
-                        for _ in range(90):
-                            page.wait_for_timeout(1000)
-                            try:
-                                html = page.content()
-                            except Exception:
-                                continue
-                            if "just a moment" not in html.lower():
-                                page.wait_for_timeout(3000)
-                                html = page.content()
-                                break
-
-                    domain = urlparse(url).netloc
-
-                    # Check UC extension for detected patterns
-                    uc = _wait_for_uc(page, timeout_ms=3000)
-                    _apply_uc_patterns(page, uc)
-
-                    # Try calendar link extraction first
-                    cal_msgs = _try_calendar_extraction(
-                        page, context, stealth, url, domain, timeout_ms,
-                    )
-                    if cal_msgs:
-                        messages.extend(cal_msgs)
-                        page.close()
-                        _save_cooldown(url)
-                        continue
-
-                    # Prefer UC feed extraction if available
-                    if uc and uc.get("patterns", {}).get("feed"):
-                        try:
-                            text = page.evaluate("window.__UC_getVisibleText()")
-                        except Exception:
-                            text = _extract_text(html)
-                    else:
-                        text = _extract_text(html)
-
-                    if len(text) < 50:
-                        page.close()
-                        continue
-
-                    messages.append({
-                        "platform": "web",
-                        "id": f"web:{hash(url)}",
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "author": domain,
-                        "channel": url[:120],
-                        "content": text[:8000],
-                    })
-                    _save_cooldown(url)
-                    page.close()
-
-                except Exception as e:
-                    logger.error("Failed to fetch %s: %s", url, e)
-
-            context.close()
-            if browser:
-                browser.close()
-
-        return messages
-
-    # Run headless and visible groups in parallel threads
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        futures = []
-        if headless_urls:
-            futures.append(pool.submit(_fetch_group, headless_urls, True))
-        if visible_urls:
-            futures.append(pool.submit(_fetch_group, visible_urls, False))
-
-        messages = []
-        for f in concurrent.futures.as_completed(futures):
-            messages.extend(f.result())
-
-    logger.info("Web fetch: %d page(s) fetched.", len(messages))
-    return messages
+                normalised.append(u)
+        urls = normalised
+    return fetch_web_sources(sources=urls, timeout_ms=timeout_ms)

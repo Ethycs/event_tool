@@ -3,28 +3,28 @@
 import os
 import tempfile
 
-from event_harvester.report import _ticktick_deep_link, generate_report
+from event_harvester.report import ticktick_deep_link, generate_report
 
 
 class TestTickTickDeepLink:
     def test_basic_link(self):
-        link = _ticktick_deep_link("Test Event", "2026-03-21T14:00", False, "context")
+        link = ticktick_deep_link("Test Event", "2026-03-21T14:00", False, "context")
         assert link.startswith("ticktick://x-callback-url/v1/add_task?")
         assert "title=Test%20Event" in link
         assert "allDay=false" in link
 
     def test_all_day_event(self):
-        link = _ticktick_deep_link("All Day", "2026-03-21", True, "ctx")
+        link = ticktick_deep_link("All Day", "2026-03-21", True, "ctx")
         assert "allDay=true" in link
         assert "startDate=2026-03-21T00%3A00%3A00.000%2B0000" in link
 
     def test_special_chars_encoded(self):
-        link = _ticktick_deep_link("Event @ Venue!", None, False, "From @user")
+        link = ticktick_deep_link("Event @ Venue!", None, False, "From @user")
         assert "Event%20%40%20Venue%21" in link
         assert "%40user" in link
 
     def test_no_date(self):
-        link = _ticktick_deep_link("No Date", None, False, "ctx")
+        link = ticktick_deep_link("No Date", None, False, "ctx")
         assert "startDate" not in link
         assert "allDay" not in link
 
