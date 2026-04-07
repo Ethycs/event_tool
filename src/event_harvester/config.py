@@ -111,6 +111,13 @@ class DiscordConfig:
 
 
 @dataclass
+class WebConfig:
+    sources_file: str = "data/web_sources.json"
+    max_events: int = 30
+    timeout_ms: int = 30000
+
+
+@dataclass
 class AppConfig:
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     discord: DiscordConfig = field(default_factory=DiscordConfig)
@@ -118,6 +125,7 @@ class AppConfig:
     signal: SignalConfig = field(default_factory=SignalConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     ticktick: TickTickConfig = field(default_factory=TickTickConfig)
+    web: WebConfig = field(default_factory=WebConfig)
     days_back: int = 7
 
     # Obsidian output
@@ -182,6 +190,11 @@ def load_config() -> AppConfig:
             username=os.getenv("TICKTICK_USERNAME", ""),
             password=os.getenv("TICKTICK_PASSWORD", ""),
             project=os.getenv("TICKTICK_PROJECT", ""),
+        ),
+        web=WebConfig(
+            sources_file=os.getenv("WEB_SOURCES_FILE", "data/web_sources.json"),
+            max_events=int(os.getenv("WEB_MAX_EVENTS", "30")),
+            timeout_ms=int(os.getenv("WEB_TIMEOUT_MS", "30000")),
         ),
         obsidian_events_dir=os.getenv("OBSIDIAN_EVENTS_DIR", ""),
         obsidian_recruiters_dir=os.getenv("OBSIDIAN_RECRUITERS_DIR", ""),

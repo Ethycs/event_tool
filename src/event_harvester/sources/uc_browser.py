@@ -768,6 +768,90 @@ class UCBrowser:
         except Exception:
             return []
 
+    # ── ML-enhanced detection ────────────────────────────────────────────
+
+    def ml_find_chat(self, page) -> dict | None:
+        """Use ML classifier to find a chat input UC's heuristics missed.
+
+        Returns the best chat_input candidate as:
+          {"selector": str, "confidence": float, "label": "chat_input"}
+        or None if no chat input found.
+
+        If found, also binds it via __UC_bindBySelector so UC's chat API
+        (__UC_chatSend, __UC_chatGetMessages) can use it.
+        """
+        try:
+            from event_harvester.dom_classifier import classify_code, extract_code_features
+        except ImportError:
+            return None
+
+        # Discover candidate containers
+        candidates = page.evaluate("""() => {
+            const seen = new Set();
+            const sels = [];
+            const inputs = document.querySelectorAll(
+                'textarea, [contenteditable="true"], [role="textbox"], '
+                + 'input[type="text"], input:not([type]), '
+                + '[class*="chat" i], [class*="message" i], [class*="prompt" i], '
+                + '[class*="composer" i], [class*="widget" i]'
+            );
+            for (const el of inputs) {
+                let target = el;
+                for (let i = 0; i < 3; i++) {
+                    if (target.parentElement
+                        && target.parentElement !== document.body
+                        && target.parentElement.children.length < 20)
+                        target = target.parentElement;
+                }
+                if (seen.has(target)) continue;
+                seen.add(target);
+                const id = 'mlchat-' + sels.length;
+                target.setAttribute('data-ml-id', id);
+                sels.push('[data-ml-id="' + id + '"]');
+                if (sels.length >= 20) break;
+            }
+            return sels;
+        }""")
+
+        if not candidates:
+            return None
+
+        best = None
+        for sel in candidates:
+            result = classify_code(page, sel)
+            if not result:
+                continue
+            if result.get("label") == "chat_input":
+                if not best or result["confidence"] > best["confidence"]:
+                    best = {
+                        "selector": sel,
+                        "confidence": result["confidence"],
+                        "label": "chat_input",
+                    }
+
+        # Clean up tags
+        page.evaluate("""() => {
+            document.querySelectorAll('[data-ml-id]').forEach(
+                el => el.removeAttribute('data-ml-id')
+            );
+        }""")
+
+        if best:
+            # Bind via UC so chat API works
+            try:
+                page.evaluate(
+                    "(args) => window.__UC_bindBySelector(args[0], args[1])",
+                    ["chat", best["selector"]],
+                )
+                logger.info(
+                    "ML found chat_input (conf=%.2f) at %s — bound to UC chat API.",
+                    best["confidence"], best["selector"],
+                )
+            except Exception:
+                pass
+
+        return best
+
     # ── Dynamic chat interaction (full UC toolbox) ──────────────────────
 
     def chat(
@@ -791,12 +875,39 @@ class UCBrowser:
 
         # ── Find the input ───────────────────────────────────────
         inputs = self.find_inputs(page)
-        if not inputs:
-            logger.warning("No interactive input found on page.")
-            return None
 
-        best_input = inputs[0]
-        selector = best_input["selector"]
+        # If UC's heuristic found a high-confidence input, use it.
+        # Otherwise, try ML classifier to find chat inputs UC missed.
+        if inputs and inputs[0].get("score", 0) >= 4:
+            best_input = inputs[0]
+            selector = best_input["selector"]
+        else:
+            ml_result = self.ml_find_chat(page)
+            if ml_result and ml_result["confidence"] > 0.5:
+                logger.info("ML override: using ML-detected chat input over UC heuristic.")
+                # Find the actual input element inside the ML container
+                inner_input = page.evaluate("""(sel) => {
+                    const el = document.querySelector(sel);
+                    if (!el) return null;
+                    const input = el.querySelector(
+                        'textarea, [contenteditable="true"], [role="textbox"], input'
+                    );
+                    if (!input) return null;
+                    if (input.id) return '#' + input.id;
+                    if (input.getAttribute('aria-label'))
+                        return input.tagName.toLowerCase()
+                            + '[aria-label="' + input.getAttribute('aria-label') + '"]';
+                    return sel + ' textarea, ' + sel + ' [contenteditable="true"]';
+                }""", ml_result["selector"])
+                selector = inner_input or ml_result["selector"]
+                best_input = {"selector": selector, "score": ml_result["confidence"] * 10,
+                              "contentEditable": True, "placeholder": ""}
+            elif inputs:
+                best_input = inputs[0]
+                selector = best_input["selector"]
+            else:
+                logger.warning("No interactive input found on page.")
+                return None
         logger.info(
             "Input: %s (score=%.1f, ce=%s, ph='%s')",
             selector, best_input["score"],

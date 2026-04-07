@@ -6,10 +6,9 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Optional
 
 from event_harvester.analysis import extract_events_llm
-from event_harvester.config import LLMConfig, load_config, validate_config
+from event_harvester.config import load_config, validate_config
 from event_harvester.display import (
     BOLD,
     DIM,
@@ -42,23 +41,28 @@ def _setup_logging(verbose: bool) -> None:
     )
 
 
-def _run_url_diagnostics(url: str) -> None:
-    """Open a URL and run all detection modes to show what works."""
+def _run_url_diagnostics(url: str) -> str | None:
+    """Open a URL and run all detection modes. Returns the recommended mode string."""
     import concurrent.futures
+
     from event_harvester.sources.uc_browser import UCBrowser
     from event_harvester.sources.web_fetch import (
-        _extract_event_links, _extract_text, _wait_cloudflare,
+        _extract_event_links,
+        _extract_text,
+        _wait_cloudflare,
     )
 
+    detected_mode = [None]  # mutable container for thread result
+
     def _do_diagnostics():
-        with UCBrowser(headless=False) as uc:
+        with UCBrowser() as uc:
             print(f"  Testing: {url}\n")
             page = uc.open(url, wait_ms=3000)
             html = _wait_cloudflare(page, headless=False)
 
             if "just a moment" in html.lower():
                 print(f"  {RED}BLOCKED{RESET} — Cloudflare challenge not resolved.")
-                print(f"  Recommendation: use native_chrome=True\n")
+                print("  Recommendation: use native_chrome=True\n")
                 page.close()
                 return
 
@@ -113,7 +117,9 @@ def _run_url_diagnostics(url: str) -> None:
                 print(f"  {GREEN}mode: feed{RESET} — {len(feed_items)} feed items")
             else:
                 mode = "raw"
-                print(f"  mode: raw — no structured content detected")
+                print("  mode: raw — no structured content detected")
+
+            detected_mode[0] = mode
 
             # ── Sample output ────────────────────────────────────
             print(f"\n  {BOLD}Sample events:{RESET}")
@@ -147,11 +153,46 @@ def _run_url_diagnostics(url: str) -> None:
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         pool.submit(_do_diagnostics).result()
 
+    return detected_mode[0]
+
+
+def _add_source_to_config(url: str, detected_mode: str | None = None) -> None:
+    """Add a web source to data/web_sources.json using the detected mode."""
+    from urllib.parse import urlparse
+
+    from event_harvester.sources.web_fetch import _WEB_SOURCES_FILE, _load_web_sources
+    from event_harvester.utils import save_json
+
+    sources = _load_web_sources()
+
+    # Check for duplicate
+    if any(s["url"] == url for s in sources):
+        print(f"\n  {BOLD}Already configured{RESET} — {url} is already in web_sources.json")
+        return
+
+    name = urlparse(url).netloc.split(".")[0]
+    if name in ("www", "business"):
+        name = urlparse(url).netloc.split(".")[-2]
+
+    mode = detected_mode or "calendar"
+    source = {"url": url, "name": name, "mode": mode}
+    if mode == "feed":
+        source["api_pattern"] = r"api|graphql"
+        source["scroll_seconds"] = 15
+    elif mode == "search":
+        source["query"] = "events"
+        source["scroll_seconds"] = 10
+
+    sources.append(source)
+    save_json(_WEB_SOURCES_FILE, sources)
+    print(f"\n  {GREEN}{BOLD}Added{RESET} {name} (mode={mode}) -> {_WEB_SOURCES_FILE}")
+
 
 def _run_recruiter_grading(all_messages, cfg, args) -> list:
     """Grade Gmail recruiter emails and optionally auto-trash."""
     from event_harvester.recruiter_score import grade_emails_batch
-    from event_harvester.sources import fetch_full_bodies, gmail_trash as trash
+    from event_harvester.sources import fetch_full_bodies
+    from event_harvester.sources import gmail_trash as trash
 
     gmail_msgs = [m for m in all_messages if m["platform"] == "gmail"]
     if not gmail_msgs:
@@ -230,6 +271,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Fetch a single URL with Playwright and display extracted text (test mode)",
     )
     parser.add_argument(
+        "--add-source", metavar="URL",
+        help="Run diagnostics on a URL, then add it to data/web_sources.json",
+    )
+    parser.add_argument(
         "--no-analysis", action="store_true",
         help="Skip OpenRouter analysis + task extraction",
     )
@@ -251,6 +296,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--report", nargs="?", const="events_report.md", default=None,
         metavar="FILE", help="Generate markdown report with TickTick links",
+    )
+    parser.add_argument(
+        "--serve", action="store_true",
+        help="Start local web server to review and approve/decline events",
     )
     parser.add_argument(
         "--grade-recruiters", action="store_true",
@@ -318,13 +367,19 @@ async def main() -> None:
 
     # ── Web login mode ─────────────────────────────────────────────────────
     if args.web_login:
-        from event_harvester.sources.web_fetch import web_login
+        from event_harvester.sources.web_session import web_login
         web_login()
         return
 
     # ── Test URL mode (diagnostics) ─────────────────────────────────────
     if args.test_url:
         _run_url_diagnostics(args.test_url)
+        return
+
+    # ── Add source mode ─────────────────────────────────────────────────
+    if args.add_source:
+        detected_mode = _run_url_diagnostics(args.add_source)
+        _add_source_to_config(args.add_source, detected_mode)
         return
 
     # ── Reparse mode ────────────────────────────────────────────────────────
@@ -540,6 +595,12 @@ async def main() -> None:
             output_dir=cfg.obsidian_events_dir,
         )
         print(f"Obsidian events -> {path}\n")
+
+    # ── Serve mode — local server with markdown report ──────────────────────
+    if args.serve:
+        from event_harvester.server import serve_events
+        serve_events(events)
+        return
 
     # ── TickTick event sync ─────────────────────────────────────────────────
     if args.no_ticktick:

@@ -203,7 +203,10 @@ async def harvest_messages(
 
     if not no_web:
         print("[ Web Sources ]")
-        web_msgs = fetch_web_sources()
+        web_msgs = fetch_web_sources(
+            max_events=cfg.web.max_events,
+            timeout_ms=cfg.web.timeout_ms,
+        )
         messages.extend(web_msgs)
         print()
 
@@ -220,15 +223,23 @@ async def harvest_messages(
     _update_watermarks(messages, watermarks)
     _save_watermarks(watermarks)
 
-    # ── Auto-save to cache (with new messages only) ────────────────────
+    # ── Auto-save to cache (decimate web content to reduce cache size) ──
     if new_messages:
         try:
+            from event_harvester.sources.web_fetch import _decimate_text
+
+            cache_msgs = []
+            for m in new_messages:
+                if m.get("platform") == "web" and len(m.get("content", "")) > 2000:
+                    m = {**m, "content": _decimate_text(m["content"])}
+                cache_msgs.append(m)
+
             CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
             CACHE_FILE.write_text(
                 json.dumps({
                     "cached_at": datetime.now(timezone.utc).isoformat(),
                     "sources": active_sources,
-                    "messages": new_messages,
+                    "messages": cache_msgs,
                 }, ensure_ascii=False),
                 encoding="utf-8",
             )

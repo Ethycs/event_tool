@@ -131,6 +131,52 @@ window.__UC_unbind = function (patternName) {
   return controller.unbind(patternName);
 };
 
+/**
+ * Bind a pattern using an ML-discovered selector instead of UC detection.
+ *
+ * Bypasses the three-signal detector — used when ML finds a chat input
+ * that UC's heuristics missed. Creates the same binding that enables
+ * __UC_chatSend(), __UC_chatGetMessages(), etc.
+ *
+ * @param {string} patternName - "chat", "form", "search", etc.
+ * @param {string} selector - CSS selector for the container element
+ * @returns {{pattern, selector}} or null
+ */
+window.__UC_bindBySelector = function (patternName, selector) {
+  const el = document.querySelector(selector);
+  if (!el) return null;
+
+  // Build a minimal detection result for the controller to bind
+  const path = [];
+  let cur = el;
+  while (cur && cur !== document.body) {
+    const parent = cur.parentElement;
+    if (!parent) break;
+    const idx = Array.from(parent.children).indexOf(cur);
+    path.unshift(idx);
+    cur = parent;
+  }
+  const pathStr = 'body>' + path.join('>');
+
+  // Attempt to bind — controller.bind creates the action API
+  const api = controller.bind(patternName, pathStr);
+  if (api) return { pattern: patternName, selector };
+
+  // Fallback: if controller.bind needs a detection result first,
+  // manually register the element as a detected pattern
+  try {
+    controller._bindings = controller._bindings || {};
+    controller._bindings[patternName] = {
+      el,
+      path: pathStr,
+      components: { container: el, input: el.querySelector('textarea, [contenteditable="true"], input') },
+    };
+    return { pattern: patternName, selector };
+  } catch (e) {
+    return null;
+  }
+};
+
 window.__UC_listBound = function () {
   return controller.listBoundAPIs();
 };
@@ -943,6 +989,286 @@ function _autoBind(patternName) {
     controller.bind(patternName, results[0].path);
   }
 }
+
+// ── DOM Rasterizer ────────────────────────────────────────────────────
+// Renders DOM bounding-box geometry into a small spatial feature grid
+// for ML-based UI pattern classification.
+
+window.__UC_rasterize = function (selector, gridSize = 32) {
+  const channels = 4;
+  const grid = new Array(gridSize * gridSize * channels).fill(0);
+
+  let root, bounds;
+  if (!selector) {
+    root = document.body;
+    bounds = { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
+  } else {
+    root = document.querySelector(selector);
+    if (!root) return null;
+    const r = root.getBoundingClientRect();
+    bounds = { left: r.left, top: r.top, width: r.width, height: r.height };
+  }
+  if (bounds.width === 0 || bounds.height === 0) return null;
+
+  const scaleX = gridSize / bounds.width;
+  const scaleY = gridSize / bounds.height;
+  const INTERACTIVE = new Set(['INPUT', 'TEXTAREA', 'BUTTON', 'SELECT', 'A']);
+
+  function fill(gx1, gy1, gx2, gy2, ch, val) {
+    const x1 = Math.max(0, Math.min(gridSize - 1, gx1));
+    const y1 = Math.max(0, Math.min(gridSize - 1, gy1));
+    const x2 = Math.max(0, Math.min(gridSize - 1, gx2));
+    const y2 = Math.max(0, Math.min(gridSize - 1, gy2));
+    for (let y = y1; y <= y2; y++)
+      for (let x = x1; x <= x2; x++)
+        grid[(y * gridSize + x) * channels + ch] = Math.max(grid[(y * gridSize + x) * channels + ch], val);
+  }
+
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+  let node = walker.currentNode;
+  while (node) {
+    const rect = node.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) {
+      const gx1 = Math.floor((rect.left - bounds.left) * scaleX);
+      const gy1 = Math.floor((rect.top - bounds.top) * scaleY);
+      const gx2 = Math.floor((rect.right - bounds.left) * scaleX);
+      const gy2 = Math.floor((rect.bottom - bounds.top) * scaleY);
+
+      // Ch0: interactive elements
+      if (INTERACTIVE.has(node.tagName) || node.contentEditable === 'true'
+          || node.getAttribute('role') === 'textbox' || node.getAttribute('role') === 'button')
+        fill(gx1, gy1, gx2, gy2, 0, 1.0);
+
+      // Ch1: text density
+      const textLen = (node.innerText || '').length;
+      if (textLen > 0) fill(gx1, gy1, gx2, gy2, 1, Math.min(textLen / 500, 1.0));
+
+      // Ch2: iframes
+      if (node.tagName === 'IFRAME' || node.tagName === 'EMBED')
+        fill(gx1, gy1, gx2, gy2, 2, 1.0);
+
+      // Ch3: overlay / fixed
+      const style = getComputedStyle(node);
+      if (style.position === 'fixed' || style.position === 'sticky')
+        fill(gx1, gy1, gx2, gy2, 3, 1.0);
+      else {
+        const z = parseInt(style.zIndex);
+        if (z > 100) fill(gx1, gy1, gx2, gy2, 3, Math.min(z / 10000, 1.0));
+      }
+    }
+    node = walker.nextNode();
+  }
+
+  // Accessibility metadata
+  const a11y = { roles: [], ariaLabels: [], hasLiveRegion: false };
+  root.querySelectorAll('[role]').forEach(el => {
+    const r = el.getAttribute('role');
+    if (r && !a11y.roles.includes(r)) a11y.roles.push(r);
+  });
+  root.querySelectorAll('[aria-label]').forEach(el => {
+    const l = el.getAttribute('aria-label').toLowerCase();
+    if (!a11y.ariaLabels.includes(l)) a11y.ariaLabels.push(l);
+  });
+  a11y.hasLiveRegion = !!root.querySelector('[aria-live]');
+
+  return { grid, gridSize, channels, a11y };
+};
+
+// ── Stage 2: DOM code feature extractor ───────────────────────────────
+// Extracts ~30 structural/semantic features from a DOM subtree for
+// classification by a sklearn RandomForest (runs in Python).
+
+window.__UC_extractCodeFeatures = function (selector) {
+  const root = selector ? document.querySelector(selector) : document.body;
+  if (!root) return null;
+
+  const all = root.querySelectorAll('*');
+  const totalEls = all.length || 1;
+
+  // ── Tag counts ──
+  const tagCounts = {};
+  const interactiveTags = ['INPUT', 'TEXTAREA', 'BUTTON', 'SELECT', 'A'];
+  let interactiveCount = 0;
+  for (const el of all) {
+    tagCounts[el.tagName] = (tagCounts[el.tagName] || 0) + 1;
+    if (interactiveTags.includes(el.tagName) || el.contentEditable === 'true')
+      interactiveCount++;
+  }
+
+  // ── Attribute signals ──
+  let hasRole = 0, hasAriaLabel = 0, hasPlaceholder = 0;
+  let hasContentEditable = 0, roleTextbox = 0, roleDialog = 0;
+  let roleSearch = 0, roleNavigation = 0, roleForm = 0;
+  for (const el of all) {
+    if (el.getAttribute('role')) hasRole++;
+    if (el.getAttribute('aria-label')) hasAriaLabel++;
+    if (el.getAttribute('placeholder')) hasPlaceholder++;
+    if (el.contentEditable === 'true') hasContentEditable++;
+    const role = (el.getAttribute('role') || '').toLowerCase();
+    if (role === 'textbox') roleTextbox++;
+    if (role === 'dialog') roleDialog++;
+    if (role === 'search' || role === 'searchbox') roleSearch++;
+    if (role === 'navigation') roleNavigation++;
+    if (role === 'form') roleForm++;
+  }
+
+  // ── Class/ID keyword signals ──
+  const classText = Array.from(all).map(el =>
+    ((el.className || '') + ' ' + (el.id || '')).toLowerCase()
+  ).join(' ');
+
+  const kwChat = /chat|message|compose|messenger|conversation/i.test(classText) ? 1 : 0;
+  const kwSearch = /search|find|query|filter|autocomplete|combobox/i.test(classText) ? 1 : 0;
+  const kwLogin = /login|signin|sign-in|auth|password|credential/i.test(classText) ? 1 : 0;
+  const kwModal = /modal|dialog|overlay|popup|drawer|offcanvas/i.test(classText) ? 1 : 0;
+  const kwNav = /nav|menu|sidebar|breadcrumb|tabs?|pagination/i.test(classText) ? 1 : 0;
+  const kwForm = /form|field|input|label|control/i.test(classText) ? 1 : 0;
+  const kwFeed = /feed|list|card|grid|item|article|post/i.test(classText) ? 1 : 0;
+
+  // ── Structural ratios ──
+  const depth = (function maxDepth(el, d) {
+    let max = d;
+    for (const c of el.children) max = Math.max(max, maxDepth(c, d + 1));
+    return max;
+  })(root, 0);
+
+  const childCount = root.children.length;
+
+  // ── Text content signals ──
+  const text = (root.innerText || '').toLowerCase();
+  const wordCount = text.split(/\s+/).filter(w => w.length > 0).length;
+  const hasSend = /\bsend\b|\bsubmit\b|\bpost\b/i.test(text) ? 1 : 0;
+  const hasSearch = /\bsearch\b|\bfind\b/i.test(text) ? 1 : 0;
+  const hasLogin = /\blogin\b|\bsign in\b|\bpassword\b/i.test(text) ? 1 : 0;
+  const hasLiveRegion = root.querySelector('[aria-live]') ? 1 : 0;
+
+  // ── Iframe presence ──
+  const iframeCount = root.querySelectorAll('iframe').length;
+
+  // ── Position / visibility ──
+  const rect = root.getBoundingClientRect();
+  const isFixed = getComputedStyle(root).position === 'fixed' ? 1 : 0;
+  const isBottomRight = (rect.bottom > window.innerHeight * 0.7 && rect.right > window.innerWidth * 0.7) ? 1 : 0;
+  const relWidth = rect.width / window.innerWidth;
+  const relHeight = rect.height / window.innerHeight;
+
+  return {
+    // Tag composition (6)
+    n_input: tagCounts['INPUT'] || 0,
+    n_textarea: tagCounts['TEXTAREA'] || 0,
+    n_button: tagCounts['BUTTON'] || 0,
+    n_select: tagCounts['SELECT'] || 0,
+    n_a: tagCounts['A'] || 0,
+    n_iframe: iframeCount,
+    // Ratios (3)
+    interactive_ratio: interactiveCount / totalEls,
+    depth: depth,
+    child_count: childCount,
+    // ARIA / attributes (9)
+    has_role: hasRole,
+    has_aria_label: hasAriaLabel,
+    has_placeholder: hasPlaceholder,
+    has_contenteditable: hasContentEditable,
+    role_textbox: roleTextbox,
+    role_dialog: roleDialog,
+    role_search: roleSearch,
+    role_navigation: roleNavigation,
+    role_form: roleForm,
+    // Class/ID keywords (7)
+    kw_chat: kwChat,
+    kw_search: kwSearch,
+    kw_login: kwLogin,
+    kw_modal: kwModal,
+    kw_nav: kwNav,
+    kw_form: kwForm,
+    kw_feed: kwFeed,
+    // Text signals (5)
+    word_count: wordCount,
+    has_send: hasSend,
+    has_search_text: hasSearch,
+    has_login_text: hasLogin,
+    has_live_region: hasLiveRegion,
+    // Position (4)
+    is_fixed: isFixed,
+    is_bottom_right: isBottomRight,
+    rel_width: Math.round(relWidth * 100) / 100,
+    rel_height: Math.round(relHeight * 100) / 100,
+  };
+};
+
+// ── Vanilla JS MLP classifier (no TFJS) ──────────────────────────────
+// Forward pass for sklearn MLPClassifier trained by train_dom_classifier.py.
+// Weights injected by Python via __UC_loadWeights() before __UC_classify().
+// Architecture: StandardScaler → Dense(128,relu) → Dense(64,relu) → Dense(8,softmax)
+
+let _classifierWeights = null;
+let _classifierLabels = null;
+
+window.__UC_loadWeights = function (weightsJson, labels) {
+  _classifierWeights = weightsJson;
+  _classifierLabels = labels;
+  return true;
+};
+
+window.__UC_classify = function (selector, gridSize = 32) {
+  if (!_classifierWeights || !_classifierLabels) return null;
+
+  const raster = window.__UC_rasterize(selector, gridSize);
+  if (!raster || !raster.grid) return null;
+
+  const layers = _classifierWeights.layers;
+  let x = raster.grid; // flat array, e.g. 4096 elements
+
+  for (const layer of layers) {
+    if (layer.type === 'Scaler') {
+      const out = new Float32Array(x.length);
+      for (let i = 0; i < x.length; i++)
+        out[i] = (x[i] - layer.mean[i]) / (layer.scale[i] || 1);
+      x = out;
+    } else if (layer.type === 'PCA') {
+      const comps = layer.components; // [n_components][n_features]
+      const n = comps.length;
+      const out = new Float32Array(n);
+      for (let i = 0; i < n; i++) {
+        let s = 0;
+        const row = comps[i];
+        for (let j = 0; j < x.length; j++) s += (x[j] - layer.mean[j]) * row[j];
+        out[i] = s;
+      }
+      x = out;
+    } else if (layer.type === 'Dense') {
+      const K = layer.kernel, B = layer.bias;
+      const out = new Float32Array(B.length);
+      for (let j = 0; j < B.length; j++) {
+        let s = B[j];
+        for (let i = 0; i < x.length; i++) s += x[i] * K[i][j];
+        out[j] = (layer.activation === 'relu' && s < 0) ? 0 : s;
+      }
+      if (layer.activation === 'softmax') {
+        const mx = Math.max(...out);
+        let expSum = 0;
+        for (let i = 0; i < out.length; i++) { out[i] = Math.exp(out[i] - mx); expSum += out[i]; }
+        for (let i = 0; i < out.length; i++) out[i] /= expSum;
+      }
+      x = out;
+    }
+  }
+
+  // x is now softmax probabilities
+  let bestIdx = 0;
+  for (let i = 1; i < x.length; i++) if (x[i] > x[bestIdx]) bestIdx = i;
+
+  const scores = {};
+  for (let i = 0; i < _classifierLabels.length; i++)
+    scores[_classifierLabels[i]] = Math.round(x[i] * 1000) / 1000;
+
+  return {
+    label: _classifierLabels[bestIdx] || 'unknown',
+    confidence: Math.round(x[bestIdx] * 1000) / 1000,
+    scores,
+    a11y: raster.a11y,
+  };
+};
 
 // ── Initialize ─────────────────────────────────────────────────────────
 

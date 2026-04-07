@@ -7,18 +7,15 @@ Subsequent runs reuse the saved session automatically.
 
 import json
 import logging
-import os
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger("event_harvester.web_fetch")
 
 _DATA_DIR = Path(__file__).resolve().parent.parent.parent.parent / "data"
 _COOLDOWN_FILE = _DATA_DIR / ".web_cooldowns.json"
 _DEFAULT_COOLDOWN = timedelta(hours=1)
-_EXT_DIR = Path(__file__).resolve().parent.parent.parent.parent / "ext" / "uc_extension"
 
 def _load_cooldowns() -> dict[str, str]:
     """Load per-URL last-fetch timestamps."""
@@ -53,19 +50,125 @@ def _is_on_cooldown(url: str, cooldown: timedelta = _DEFAULT_COOLDOWN) -> bool:
         return False
 
 
-# ── Unified web source config ─────────────────────────────────────────
+# ── Web source config ────────────────────────────────────────────────
 
-WEB_SOURCES = [
-    # Calendar extraction (load page → find date↔link pairs → fetch details)
+_WEB_SOURCES_FILE = _DATA_DIR / "web_sources.json"
+
+# Fallback defaults (used only if data/web_sources.json is missing).
+_DEFAULT_SOURCES = [
     {"url": "https://lu.ma/discover", "name": "luma", "mode": "calendar"},
     {"url": "https://business.sfchamber.com/events/calendar", "name": "sfchamber", "mode": "calendar"},
     {"url": "https://www.erobay.com/", "name": "erobay", "mode": "calendar", "native_chrome": True, "cooldown_hours": 4},
-    # Feed scroll + API interception
     {"url": "https://www.instagram.com/", "name": "instagram", "mode": "feed", "api_pattern": r"graphql", "scroll_seconds": 25, "api_only": True},
     {"url": "https://www.eventbrite.com/d/ca--san-francisco/events/", "name": "eventbrite", "mode": "feed", "api_pattern": r"api|search|events", "scroll_seconds": 15},
-    # Search + extract event links
     {"url": "https://www.meetup.com/find/?source=EVENTS&eventType=inPerson&sortField=RELEVANCE", "name": "meetup", "mode": "search", "query": "AI meetup", "scroll_seconds": 10},
+    # Chat — query AI chatbots for event discovery (requires --web-login first)
+    {"url": "https://chatgpt.com", "name": "chatgpt", "mode": "chat", "query": "What AI and tech events are happening in San Francisco this week? List each with date, time, location, and link.", "timeout_s": 45},
 ]
+
+
+def _load_web_sources() -> list[dict]:
+    """Load web sources from data/web_sources.json, falling back to defaults."""
+    from event_harvester.utils import load_json
+
+    sources = load_json(_WEB_SOURCES_FILE, default=None)
+    return sources if sources is not None else list(_DEFAULT_SOURCES)
+
+
+# ── Pre-fetch fingerprint filter + save ───────────────────────────────
+
+def _save_link_fingerprint(lnk: dict) -> None:
+    """Save a lightweight fingerprint for a processed event link.
+
+    Called after successfully fetching a detail page, so the same link
+    is skipped on the next run. Uses the event_match fingerprint store.
+    """
+    from event_harvester.event_match import save_fingerprint
+
+    save_fingerprint({
+        "title": lnk.get("text", ""),
+        "date": lnk.get("date_hint"),
+        "link": lnk.get("url"),
+    })
+
+
+# ── Pre-fetch fingerprint filter ──────────────────────────────────────
+
+def _filter_known_links(event_links: list[dict]) -> list[dict]:
+    """Filter out event links that match existing fingerprints.
+
+    Checks each link's (text, date_hint, url) against the fingerprint store
+    before expensive detail page fetches. Returns only new/unknown links.
+    """
+    from event_harvester.event_match import _normalize_title, _titles_overlap, load_fingerprints
+
+    fps = load_fingerprints()
+    if not fps:
+        return event_links
+
+    # Build fingerprint lookup: link index + title/date sets
+    fp_links = set()
+    fp_sigs = []
+    for fp in fps:
+        link = (fp.get("link") or "").strip().lower()
+        if link:
+            fp_links.add(link)
+        fp_sigs.append({
+            "title_words": _normalize_title(fp.get("title", "")),
+            "date": (fp.get("date") or "")[:10],
+        })
+
+    new_links = []
+    skipped = 0
+    for lnk in event_links:
+        # Fast path: exact URL match
+        link_url = lnk.get("url", "").strip().lower()
+        if link_url and link_url in fp_links:
+            skipped += 1
+            continue
+
+        # Fuzzy path: title + date match
+        lnk_title = _normalize_title(lnk.get("text", ""))
+        lnk_date = (lnk.get("date_hint") or "")[:10]
+        matched = False
+        for fp_sig in fp_sigs:
+            score = 0
+            if _titles_overlap(lnk_title, fp_sig["title_words"]):
+                score += 1
+            if lnk_date and fp_sig["date"] and lnk_date == fp_sig["date"]:
+                score += 1
+            if score >= 2:
+                matched = True
+                break
+        if matched:
+            skipped += 1
+            continue
+
+        new_links.append(lnk)
+
+    if skipped:
+        logger.info("Fingerprint filter: %d known, %d new.", skipped, len(new_links))
+    return new_links
+
+
+# ── Auto-mode detection ───────────────────────────────────────────────
+
+def _detect_mode(uc, page, src: dict) -> str:
+    """Auto-detect the best mode for a page using the same signals as --test-url."""
+    event_links = _extract_event_links(page)
+    if len(event_links) >= 3:
+        return "calendar"
+
+    search_hits = uc.detect(page, "search")
+    if search_hits and src.get("query"):
+        return "search"
+
+    feed_items = uc.get_feed_items(page)
+    feed_items = [t for t in feed_items if len(t) > 30]
+    if len(feed_items) >= 3:
+        return "feed"
+
+    return "raw"
 
 
 # ── Mode handlers ─────────────────────────────────────────────────────
@@ -78,7 +181,7 @@ def _wait_cloudflare(page, headless: bool = True) -> str:
     if headless:
         logger.warning("Cloudflare challenge (headless can't solve). Skipping.")
         return html
-    print(f"  Cloudflare captcha — click it in the browser window (15s timeout)...")
+    print("  Cloudflare captcha — click it in the browser window (15s timeout)...")
     for _ in range(15):
         page.wait_for_timeout(1000)
         try:
@@ -92,18 +195,19 @@ def _wait_cloudflare(page, headless: bool = True) -> str:
     return html
 
 
-def _do_calendar(uc, src: dict, timeout_ms: int, max_events: int) -> list[dict]:
+def _do_calendar(uc, src: dict, timeout_ms: int, max_events: int, page=None) -> list[dict]:
     """Calendar mode: load page, extract date↔link pairs, fetch detail pages."""
     from urllib.parse import urlparse
 
     url = src["url"]
     logger.info("Calendar: %s", src.get("name", url))
 
-    page = uc.open(url)
-    html = _wait_cloudflare(page, headless=False)
-    if "just a moment" in html.lower():
-        page.close()
-        return []
+    if page is None:
+        page = uc.open(url)
+        html = _wait_cloudflare(page, headless=False)
+        if "just a moment" in html.lower():
+            page.close()
+            return []
 
     # UC obstacle clearing
     uc.detect_all(page)
@@ -119,32 +223,79 @@ def _do_calendar(uc, src: dict, timeout_ms: int, max_events: int) -> list[dict]:
 
     # Extract event links via DOM-graph date↔link association
     event_links = _extract_event_links(page)
+
+    # Multi-page: follow pagination to get more events
+    max_pages = src.get("max_pages", 0)
+    for _ in range(max_pages):
+        next_sel = page.evaluate("""() => {
+            const candidates = [...document.querySelectorAll('a, button')].filter(el => {
+                const text = ((el.textContent || '') + ' '
+                    + (el.getAttribute('aria-label') || '') + ' '
+                    + (el.getAttribute('title') || '')).toLowerCase();
+                return /next|forward|›|»|load more|show more|more events/.test(text)
+                    && el.offsetWidth > 0 && el.offsetHeight > 0;
+            });
+            if (candidates.length === 0) return null;
+            const el = candidates[0];
+            if (el.id) return '#' + el.id;
+            if (el.getAttribute('aria-label'))
+                return el.tagName.toLowerCase() + '[aria-label="' + el.getAttribute('aria-label').replace(/"/g, '\\\\"') + '"]';
+            return null;
+        }""")
+        if not next_sel:
+            break
+        logger.info("%s: following pagination (%s)...", src.get("name"), next_sel[:40])
+        try:
+            page.click(next_sel)
+            page.wait_for_timeout(2000)
+            more_links = _extract_event_links(page)
+            # Deduplicate by URL
+            seen = {lnk["url"] for lnk in event_links}
+            for lnk in more_links:
+                if lnk["url"] not in seen:
+                    event_links.append(lnk)
+                    seen.add(lnk["url"])
+        except Exception:
+            break
+
     if len(event_links) >= 3:
-        logger.info("%s: %d event links found.", src.get("name"), len(event_links))
+        # Filter out already-known events before expensive detail fetches
+        event_links = _filter_known_links(event_links)
+        logger.info("%s: %d event links to process.", src.get("name"), len(event_links))
         messages = []
-        for lnk in event_links[:max_events]:
-            if lnk.get("inline"):
-                date_hint = lnk.get("date_hint", "")
-                time_hint = lnk.get("time", "")
-                venue = lnk.get("venue", "")
-                parts = [lnk["text"]]
-                if date_hint:
-                    parts.append(f"date: {date_hint}")
-                if time_hint:
-                    parts.append(f"time: {time_hint}")
-                if venue:
-                    parts.append(f"location: {venue}")
-                messages.append({
-                    "platform": "web",
-                    "id": f"web:{hash(lnk['text'] + date_hint)}",
-                    "timestamp": f"{date_hint}T00:00:00+00:00" if date_hint else datetime.now(timezone.utc).isoformat(),
-                    "author": domain,
-                    "channel": url[:120],
-                    "content": "\n".join(parts),
-                })
-            else:
-                text = _fetch_event_detail(uc._context, uc._stealth_plugin, lnk["url"], timeout_ms)
+        # Split inline vs fetchable
+        inline_links = [l for l in event_links if l.get("inline")]
+        fetch_links = [l for l in event_links if not l.get("inline")]
+
+        # Inline events (already have all data)
+        for lnk in inline_links:
+            date_hint = lnk.get("date_hint", "")
+            time_hint = lnk.get("time", "")
+            venue = lnk.get("venue", "")
+            parts = [lnk["text"]]
+            if date_hint:
+                parts.append(f"date: {date_hint}")
+            if time_hint:
+                parts.append(f"time: {time_hint}")
+            if venue:
+                parts.append(f"location: {venue}")
+            messages.append({
+                "platform": "web",
+                "id": f"web:{hash(lnk.get('url', '') + date_hint)}",
+                "timestamp": f"{date_hint}T00:00:00+00:00" if date_hint else datetime.now(timezone.utc).isoformat(),
+                "author": domain,
+                "channel": url[:120],
+                "content": "\n".join(parts),
+            })
+
+        # Fetch detail pages in parallel (5 tabs at a time)
+        if fetch_links:
+            results = _fetch_event_details_parallel(
+                uc._context, uc._stealth_plugin, fetch_links, timeout_ms,
+            )
+            for lnk, text in results:
                 if text:
+                    _save_link_fingerprint(lnk)
                     messages.append({
                         "platform": "web",
                         "id": f"web:{hash(lnk['url'])}",
@@ -171,8 +322,15 @@ def _do_calendar(uc, src: dict, timeout_ms: int, max_events: int) -> list[dict]:
     }]
 
 
-def _do_feed(uc, src: dict) -> list[dict]:
-    """Feed mode: scroll page while intercepting API responses."""
+def _do_feed(uc, src: dict, page=None) -> list[dict]:
+    """Feed mode: scroll page while intercepting API responses.
+
+    Note: page param is accepted for interface consistency but feed mode
+    always opens its own page (needs response interception from first load).
+    If a pre-opened page is passed, it's closed and re-opened with interception.
+    """
+    if page is not None:
+        page.close()  # need to re-open with interception
     import json as json_mod
     import time as _time
     from urllib.parse import urlparse
@@ -236,20 +394,24 @@ def _do_feed(uc, src: dict) -> list[dict]:
     event_links = []
     if not src.get("api_only"):
         event_links = _extract_event_links(page)
+        event_links = _filter_known_links(event_links)
         if event_links:
-            logger.info("%s: %d event links found after scroll.", name, len(event_links))
-            for lnk in event_links[:30]:
-                if not lnk.get("inline"):
-                    text = _fetch_event_detail(uc._context, uc._stealth_plugin, lnk["url"], uc.timeout_ms)
-                    if text:
-                        messages.append({
-                            "platform": "web",
-                            "id": f"web:{hash(lnk['url'])}",
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                            "author": urlparse(lnk["url"]).netloc,
-                            "channel": lnk["url"][:120],
-                            "content": text[:5000],
-                        })
+            fetch_links = [l for l in event_links[:30] if not l.get("inline")]
+            logger.info("%s: %d new event links, fetching in parallel...", name, len(fetch_links))
+            results = _fetch_event_details_parallel(
+                uc._context, uc._stealth_plugin, fetch_links, uc.timeout_ms,
+            )
+            for lnk, text in results:
+                if text:
+                    _save_link_fingerprint(lnk)
+                    messages.append({
+                        "platform": "web",
+                        "id": f"web:{hash(lnk['url'])}",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "author": urlparse(lnk["url"]).netloc,
+                        "channel": lnk["url"][:120],
+                        "content": text[:5000],
+                    })
 
     # Page text as a message (if no event links found)
     if not event_links and page_text and len(page_text) > 200:
@@ -276,7 +438,7 @@ def _do_feed(uc, src: dict) -> list[dict]:
     return messages
 
 
-def _do_search(uc, src: dict, timeout_ms: int, max_events: int) -> list[dict]:
+def _do_search(uc, src: dict, timeout_ms: int, max_events: int, page=None) -> list[dict]:
     """Search mode: detect search bar, query, scroll, extract event links."""
     from urllib.parse import urlparse
 
@@ -287,7 +449,8 @@ def _do_search(uc, src: dict, timeout_ms: int, max_events: int) -> list[dict]:
 
     logger.info("Search: %s", name)
 
-    page = uc.open(url)
+    if page is None:
+        page = uc.open(url)
     uc.detect_all(page)
     uc.dismiss_cookies(page)
     uc.close_modal(page)
@@ -351,16 +514,19 @@ def _do_search(uc, src: dict, timeout_ms: int, max_events: int) -> list[dict]:
         page.evaluate("window.scrollBy(0, window.innerHeight)")
         page.wait_for_timeout(1000)
 
-    # Extract event links
-    event_links = _extract_event_links(page)[:max_events]
+    # Extract event links, filter already-known ones
+    event_links = _filter_known_links(_extract_event_links(page))[:max_events]
     messages = []
     domain = urlparse(url).netloc
 
     if event_links:
-        logger.info("%s: %d event links, fetching details...", name, len(event_links))
-        for lnk in event_links:
-            text = _fetch_event_detail(uc._context, uc._stealth_plugin, lnk["url"], timeout_ms)
+        logger.info("%s: %d event links, fetching in parallel...", name, len(event_links))
+        results = _fetch_event_details_parallel(
+            uc._context, uc._stealth_plugin, event_links, timeout_ms,
+        )
+        for lnk, text in results:
             if text:
+                _save_link_fingerprint(lnk)
                 messages.append({
                     "platform": "web",
                     "id": f"web:{hash(lnk['url'])}",
@@ -376,7 +542,7 @@ def _do_search(uc, src: dict, timeout_ms: int, max_events: int) -> list[dict]:
             if len(item_text) > 30:
                 messages.append({
                     "platform": "web",
-                    "id": f"web:{hash(url + str(i))}",
+                    "id": f"web:{hash(item_text[:100])}",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "author": domain,
                     "channel": f"{name}-feed",
@@ -387,13 +553,16 @@ def _do_search(uc, src: dict, timeout_ms: int, max_events: int) -> list[dict]:
     return messages
 
 
-def _do_raw(uc, src: dict) -> list[dict]:
+def _do_raw(uc, src: dict, page=None) -> list[dict]:
     """Raw mode: just load page and grab text."""
     from urllib.parse import urlparse
 
     url = src["url"]
-    page = uc.open(url)
-    html = _wait_cloudflare(page, headless=False)
+    if page is None:
+        page = uc.open(url)
+        html = _wait_cloudflare(page, headless=False)
+    else:
+        html = page.content()
     uc.dismiss_cookies(page)
     text = _extract_text(html)
     page.close()
@@ -412,6 +581,46 @@ def _do_raw(uc, src: dict) -> list[dict]:
     }]
 
 
+def _do_chat(uc, src: dict) -> list[dict]:
+    """Chat mode: query an AI chatbot and extract events from its response."""
+    from urllib.parse import urlparse
+
+    url = src["url"]
+    query = src.get("query", "What events are happening this week? List each with date, time, location, and link.")
+    timeout_s = src.get("timeout_s", 45)
+    name = src.get("name", "chat")
+
+    logger.info("Chat: %s (query: %s...)", name, query[:60])
+
+    page = uc.open(url, wait_ms=5000)
+    uc.dismiss_cookies(page)
+    uc.close_modal(page)
+
+    if uc.has_login_wall(page):
+        logger.warning("%s: login wall — run --web-login first", name)
+        page.close()
+        return []
+
+    response = uc.chat(page, query, timeout_s=timeout_s)
+    page.close()
+
+    if not response or len(response) < 50:
+        logger.warning("%s: no usable response (%d chars)", name, len(response or ""))
+        return []
+
+    logger.info("%s: got %d chars response", name, len(response))
+    domain = urlparse(url).netloc
+
+    return [{
+        "platform": "web",
+        "id": f"chat:{name}:{hash(query)}",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "author": f"chat:{name}",
+        "channel": f"chat-{name}",
+        "content": response[:8000],
+    }]
+
+
 # ── Unified entry point ──────────────────────────────────────────────
 
 def fetch_web_sources(
@@ -425,7 +634,7 @@ def fetch_web_sources(
     dispatches each source to its mode handler.
     """
     if sources is None:
-        sources = list(WEB_SOURCES)
+        sources = _load_web_sources()
     if not sources:
         return []
 
@@ -450,26 +659,79 @@ def fetch_web_sources(
         from event_harvester.sources.uc_browser import UCBrowser
 
         messages = []
+        cf_retries = []
         with UCBrowser(**uc_kwargs) as uc:
             for src in group:
-                mode = src.get("mode", "calendar")
+                mode = src.get("mode")
                 name = src.get("name", src["url"])
                 try:
+                    # Chat mode doesn't need page pre-open
+                    if mode == "chat":
+                        msgs = _do_chat(uc, src)
+                        messages.extend(msgs)
+                        if msgs:
+                            _save_cooldown(src["url"])
+                        logger.info("%s: %d messages.", name, len(msgs))
+                        continue
+
+                    # All other modes: open page, detect mode if needed
+                    page = uc.open(src["url"])
+                    html = _wait_cloudflare(page, headless=False)
+
+                    # Cloudflare blocked — queue for native Chrome retry
+                    if "just a moment" in html.lower():
+                        if not uc_kwargs.get("native_chrome"):
+                            logger.info("%s: Cloudflare — queuing for native Chrome retry.", name)
+                            cf_retries.append(src)
+                            page.close()
+                            continue
+
+                    # Auto-mode: check saved signatures, then detect
+                    if not mode or mode == "auto":
+                        uc.detect_all(page)
+                        uc.dismiss_cookies(page)
+                        uc.close_modal(page)
+
+                        # Check saved signature first
+                        try:
+                            sigs = uc.load_signatures(page)
+                            mode_sig = next(
+                                (s for s in sigs if s.get("pattern", "").startswith("mode:")),
+                                None,
+                            )
+                            if mode_sig:
+                                mode = mode_sig["pattern"].split(":")[1]
+                                logger.info("%s: saved signature → mode=%s", name, mode)
+                        except Exception:
+                            pass
+
+                        if not mode or mode == "auto":
+                            mode = _detect_mode(uc, page, src)
+                            logger.info("%s: auto-detected mode=%s", name, mode)
+
+                    # Dispatch with pre-opened page
                     if mode == "calendar":
-                        msgs = _do_calendar(uc, src, timeout_ms, max_events)
+                        msgs = _do_calendar(uc, src, timeout_ms, max_events, page=page)
                     elif mode == "feed":
-                        msgs = _do_feed(uc, src)
+                        msgs = _do_feed(uc, src, page=page)
                     elif mode == "search":
-                        msgs = _do_search(uc, src, timeout_ms, max_events)
+                        msgs = _do_search(uc, src, timeout_ms, max_events, page=page)
                     else:
-                        msgs = _do_raw(uc, src)
+                        msgs = _do_raw(uc, src, page=page)
+
+                    # Save mode as signature on success
+                    if msgs:
+                        try:
+                            uc.save_signature(page, f"mode:{mode}")
+                        except Exception:
+                            pass
                     messages.extend(msgs)
                     if msgs:
                         _save_cooldown(src["url"])
                     logger.info("%s: %d messages.", name, len(msgs))
                 except Exception as e:
                     logger.error("Failed %s (%s): %s", name, mode, e)
-        return messages
+        return messages, cf_retries
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         futures = []
@@ -479,277 +741,23 @@ def fetch_web_sources(
             futures.append(pool.submit(_process_group, native_srcs, native_chrome=True))
 
         all_messages = []
+        all_cf_retries = []
         for f in concurrent.futures.as_completed(futures):
-            all_messages.extend(f.result())
+            msgs, retries = f.result()
+            all_messages.extend(msgs)
+            all_cf_retries.extend(retries)
+
+    # Phase 4: Cloudflare auto-retry with native Chrome
+    if all_cf_retries:
+        logger.info("Retrying %d source(s) with native Chrome (Cloudflare)...", len(all_cf_retries))
+        retry_msgs, _ = _process_group(all_cf_retries, native_chrome=True)
+        all_messages.extend(retry_msgs)
 
     logger.info("Web sources: %d messages from %d sources.", len(all_messages), len(active))
     return all_messages
 
 
-def _get_chrome_cookies(domains: list[str] | None = None) -> list[dict]:
-    """Extract cookies from Chrome using rookiepy.
 
-    Chrome v130+ uses app-bound encryption requiring admin on Windows.
-    Falls back to spawning an elevated subprocess if needed.
-    """
-    # Try direct extraction first
-    try:
-        import rookiepy
-        if domains:
-            cookies = rookiepy.chrome(domains)
-        else:
-            cookies = rookiepy.chrome()
-        logger.info("Extracted %d cookies from Chrome.", len(cookies))
-        return cookies
-    except Exception as e:
-        if "admin" not in str(e).lower() and "appbound" not in str(e).lower():
-            logger.error("Failed to extract Chrome cookies: %s", e)
-            return []
-
-    # Chrome v130+ app-bound encryption — need elevated subprocess
-    logger.info("Chrome requires admin for cookie decryption. Requesting elevation...")
-    return _get_cookies_elevated(domains)
-
-
-def _get_cookies_elevated(domains: list[str] | None = None) -> list[dict]:
-    """Spawn an elevated Python subprocess to extract Chrome cookies.
-
-    Shows a UAC prompt. The elevated process writes cookies to a temp file.
-    """
-    import json
-    import subprocess
-    import sys
-    import tempfile
-    from pathlib import Path
-
-    # Write a small script that extracts cookies and dumps to JSON
-    cookie_file = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".json", prefix="chrome_cookies_", delete=False,
-    )
-    cookie_file.close()
-
-    domain_arg = json.dumps(domains) if domains else "null"
-    script = f'''
-import json, sys, os
-# Signal that we started
-with open(r"{cookie_file.name}", "w") as f:
-    json.dump({{"status": "running"}}, f)
-try:
-    # Add pixi env to path so rookiepy is importable
-    sys.path.insert(0, os.path.dirname(r"{sys.executable}") + r"\\..\\Lib\\site-packages")
-    import rookiepy
-    domains = {domain_arg}
-    cookies = rookiepy.chrome(domains) if domains else rookiepy.chrome()
-    with open(r"{cookie_file.name}", "w") as f:
-        json.dump({{"status": "done", "cookies": cookies}}, f)
-except Exception as e:
-    with open(r"{cookie_file.name}", "w") as f:
-        json.dump({{"status": "error", "error": str(e)}}, f)
-'''
-
-    script_file = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".py", prefix="extract_cookies_", delete=False,
-    )
-    script_file.write(script)
-    script_file.close()
-
-    try:
-        if sys.platform == "win32":
-            import ctypes
-            import time
-
-            python_exe = sys.executable
-            # Use cmd /c with title so UAC shows "Event Harvester - Cookie Access"
-            params = f'/c title Event Harvester - Cookie Access && "{python_exe}" "{script_file.name}"'
-            print("  [UAC] Requesting admin access for Chrome cookie decryption...")
-            ret = ctypes.windll.shell32.ShellExecuteW(
-                None, "runas", "cmd.exe", params, None, 1  # 1 = SW_SHOWNORMAL
-            )
-            if ret <= 32:
-                logger.warning("UAC elevation was denied or failed (code %d).", ret)
-                return []
-
-            # Wait for the elevated process to write results
-            for i in range(30):
-                time.sleep(1)
-                try:
-                    data = json.loads(Path(cookie_file.name).read_text())
-                    if data.get("status") == "done":
-                        cookies = data.get("cookies", [])
-                        logger.info("Elevated extraction: %d cookies.", len(cookies))
-                        return cookies
-                    elif data.get("status") == "error":
-                        logger.error("Elevated extraction error: %s", data.get("error"))
-                        return []
-                except (json.JSONDecodeError, FileNotFoundError):
-                    continue
-            logger.warning("Elevated cookie extraction timed out.")
-            return []
-        else:
-            # Non-Windows: try sudo
-            result = subprocess.run(
-                [sys.executable, script_file.name],
-                capture_output=True, text=True, timeout=30,
-            )
-            cookies = json.loads(Path(cookie_file.name).read_text())
-            logger.info("Extracted %d cookies.", len(cookies))
-            return cookies
-
-    except Exception as e:
-        logger.error("Elevated cookie extraction failed: %s", e)
-        return []
-    finally:
-        Path(script_file.name).unlink(missing_ok=True)
-        Path(cookie_file.name).unlink(missing_ok=True)
-
-
-def _cookies_to_playwright(cookies: list[dict]) -> list[dict]:
-    """Convert rookiepy cookies to Playwright format."""
-    pw_cookies = []
-    for c in cookies:
-        cookie = {
-            "name": c.get("name", ""),
-            "value": c.get("value", ""),
-            "domain": c.get("domain", ""),
-            "path": c.get("path", "/"),
-        }
-        if c.get("expires"):
-            cookie["expires"] = c["expires"]
-        if c.get("secure"):
-            cookie["secure"] = True
-        if c.get("httponly"):
-            cookie["httpOnly"] = True
-        # Playwright requires sameSite
-        cookie["sameSite"] = "Lax"
-        pw_cookies.append(cookie)
-    return pw_cookies
-
-
-_STATE_FILE = Path("data/.playwright_state.json")
-
-
-def _extension_args() -> list[str]:
-    """Return Chromium launch args to load the UC extension, or [] if not available."""
-    if not _EXT_DIR.is_dir() or not (_EXT_DIR / "manifest.json").exists():
-        return []
-    ext_path = str(_EXT_DIR.resolve())
-    return [
-        f"--load-extension={ext_path}",
-        f"--disable-extensions-except={ext_path}",
-    ]
-
-
-def _wait_for_uc(page, timeout_ms: int = 5000) -> Optional[dict]:
-    """Wait for UC extension, run detection, return window.__UC or None.
-
-    UC doesn't auto-detect — it needs an explicit detectAll() call.
-    """
-    try:
-        page.wait_for_function(
-            "window.__UC && window.__UC.ready === true",
-            timeout=timeout_ms,
-        )
-        # Trigger static three-signal detection for all pattern types
-        page.evaluate("window.__UC_detectAll()")
-        return page.evaluate("window.__UC")
-    except Exception:
-        return None
-
-
-def _apply_uc_patterns(page, uc: dict) -> None:
-    """Use detected patterns to dismiss cookie banners, etc."""
-    if not uc or not uc.get("patterns"):
-        return
-    # Auto-dismiss cookie consent
-    cookies = uc["patterns"].get("cookie_consent", [])
-    if cookies:
-        try:
-            dismissed = page.evaluate("window.__UC_dismiss()")
-            if dismissed:
-                logger.info("UC: dismissed cookie consent banner.")
-                page.wait_for_timeout(500)
-        except Exception:
-            pass
-    # Log what was detected
-    for ptype, hits in uc["patterns"].items():
-        if hits:
-            logger.info("UC detected %s: %d candidate(s), best=%.2f",
-                        ptype, len(hits), hits[0].get("confidence", 0))
-
-
-def web_login(urls: list[str] | None = None) -> None:
-    """Open a visible browser for manual login. Saves session state.
-
-    Opens each URL in a browser window. Log into your accounts,
-    then close the browser. The session cookies/storage are saved
-    to data/.playwright_state.json for future headless runs.
-    """
-    if urls is None:
-        urls = [s["url"] for s in WEB_SOURCES]
-
-    import concurrent.futures
-
-    def _do_login():
-        from playwright.sync_api import sync_playwright
-
-        print("Opening browser. Log into your event sites, then close the browser.")
-        print("Session will be saved for future runs.\n")
-        print("  Suggested sites to log into:")
-        for url in urls:
-            print(f"    - {url}")
-        print()
-
-        user_data_dir = str(Path("data/.chrome_profile").resolve())
-
-        with sync_playwright() as p:
-            context = p.chromium.launch_persistent_context(
-                user_data_dir,
-                headless=False,
-                channel="chrome",
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    *_extension_args(),
-                ],
-            )
-
-            # Open each URL in its own tab
-            for i, url in enumerate(urls):
-                if i == 0 and context.pages:
-                    page = context.pages[0]
-                else:
-                    page = context.new_page()
-                try:
-                    page.goto(url, timeout=30000, wait_until="domcontentloaded")
-                except Exception:
-                    pass  # timeout is fine, user can interact
-
-            print("  Browser opened. Navigate to sites, log in, then close the window.")
-            try:
-                # Wait for any page to close (user closes browser)
-                context.pages[0].wait_for_event("close", timeout=600000)  # 10 min
-            except Exception:
-                pass
-
-            _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            context.storage_state(path=str(_STATE_FILE))
-            print(f"\n  Session saved -> {_STATE_FILE}")
-
-            context.close()
-
-    # Run in a thread to avoid conflict with asyncio event loop
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        pool.submit(_do_login).result()
-
-
-# ── Legacy wrappers ───────────────────────────────────────────────────
-
-def fetch_feeds(feeds: list[dict] | None = None, headless: bool = True) -> list[dict]:
-    """Legacy wrapper — delegates to fetch_web_sources with feed mode."""
-    if feeds is None:
-        feeds = [s for s in WEB_SOURCES if s.get("mode") == "feed"]
-    else:
-        feeds = [{"mode": "feed", "headless": headless, **f} for f in feeds]
-    return fetch_web_sources(sources=feeds)
 
 
 def _extract_posts_from_api(data: dict, url: str, platform: str) -> list[dict]:
@@ -851,255 +859,170 @@ def _extract_text(html: str) -> str:
     return re.sub(r"\s+", " ", html).strip()
 
 
+# Date/time patterns for content region detection (reuse from weights.py)
+_DECIMATE_DATE_RE = re.compile(
+    r"(?i)(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2}"
+    r"|\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*"
+    r"|\d{4}-\d{2}-\d{2}"
+    r"|(?:mon|tue|wed|thu|fri|sat|sun)(?:day)?(?:\s*,)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)"
+)
+_DECIMATE_TIME_RE = re.compile(
+    r"(?i)\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b"
+    r"|\b(?:[01]\d|2[0-3]):[0-5]\d\b"
+)
+
+
+def _decimate_text(text: str, max_chars: int = 2000) -> str:
+    """Extract the event-relevant region from page text.
+
+    Adaptive: if the text is already small, return it whole.
+    Otherwise, find date/time anchors and extract surrounding context.
+
+    This reduces LLM input from ~5000 chars of nav junk to ~1000 chars
+    of pure event content.
+    """
+    if len(text) <= max_chars:
+        return text
+
+    # Find all date/time positions
+    anchors = []
+    for m in _DECIMATE_DATE_RE.finditer(text):
+        anchors.append(m.start())
+    for m in _DECIMATE_TIME_RE.finditer(text):
+        anchors.append(m.start())
+
+    if not anchors:
+        # No dates found — take the middle of the text (skip header/footer)
+        start = len(text) // 5
+        return text[start:start + max_chars]
+
+    # Find the region that contains the most date/time anchors
+    # Use a window of max_chars centered on the anchor cluster
+    anchors.sort()
+    # Cluster: find the densest group within max_chars window
+    best_start = 0
+    best_count = 0
+    for i, pos in enumerate(anchors):
+        window_end = pos + max_chars
+        count = sum(1 for a in anchors if pos <= a < window_end)
+        if count > best_count:
+            best_count = count
+            best_start = pos
+
+    # Expand backwards to capture title (usually before the first date)
+    context_before = 300
+    region_start = max(0, best_start - context_before)
+    region_end = min(len(text), best_start + max_chars)
+
+    # Try to start at a word boundary
+    while region_start > 0 and text[region_start] != " ":
+        region_start -= 1
+
+    return text[region_start:region_end].strip()
+
+
+_JS_DIR = Path(__file__).resolve().parent.parent.parent.parent / "ext"
+_EVENT_LINKS_JS = (_JS_DIR / "extract_event_links.js").read_text(encoding="utf-8")
+
+
 def _extract_event_links(page) -> list[dict]:
     """Extract event links by associating dates with links via DOM locality.
 
-    Treats the DOM as a graph. For each date/time text node on the page,
-    walks up to find the containing "card" (nearest ancestor with siblings),
-    then finds the primary link in that same card. The date and link are
-    associated because they share a common ancestor subtree.
+    The JavaScript logic lives in ext/extract_event_links.js for proper
+    syntax highlighting and independent testability.
 
     Returns list of {url, text, date_hint} — links co-located with dates.
-    Falls back to primary links from repeated-child containers if no
-    date associations are found.
     """
-    raw = page.evaluate("""() => {
-        const DATE_RE = /(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\\.?\\s+\\d{1,2}(?:st|nd|rd|th)?|\\d{1,2}(?:st|nd|rd|th)?\\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*|\\d{4}-\\d{2}-\\d{2}|(?:mon|tue|wed|thu|fri|sat|sun)(?:day)?(?:\\s*,)?\\s*(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\\.?\\s+\\d{1,2}/i;
-        const TIME_RE = /\\b\\d{1,2}(?::\\d{2})?\\s*(?:am|pm)\\b|\\b(?:[01]\\d|2[0-3]):[0-5]\\d\\b/i;
-        const domain = location.hostname;
-
-        // ── Step 1: Walk the DOM tree to find all text nodes with dates ──
-        const dateNodes = [];
-        const walker = document.createTreeWalker(
-            document.body, NodeFilter.SHOW_TEXT, null
-        );
-        while (walker.nextNode()) {
-            const text = walker.currentNode.textContent.trim();
-            if (text.length > 3 && text.length < 200 && DATE_RE.test(text)) {
-                dateNodes.push({
-                    node: walker.currentNode,
-                    text: text,
-                    dateMatch: text.match(DATE_RE)?.[0] || '',
-                    hasTime: TIME_RE.test(text),
-                });
-            }
-        }
-
-        // ── Step 2: For each date node, walk up to find its "card" ──────
-        // A card is the nearest ancestor that has siblings of the same type
-        // (indicating it's an item in a repeated list/grid)
-        function findCard(node) {
-            let cur = node.parentElement;
-            let bestCard = null;
-            while (cur && cur !== document.body) {
-                const parent = cur.parentElement;
-                if (parent) {
-                    const cn = typeof cur.className === 'string' ? cur.className : '';
-                    const tag = cur.tagName + '.' + cn.split(' ')[0];
-                    let sibCount = 0;
-                    for (const sib of parent.children) {
-                        const scn = typeof sib.className === 'string' ? sib.className : '';
-                        if (sib.tagName + '.' + scn.split(' ')[0] === tag) sibCount++;
-                    }
-                    if (sibCount >= 2) {
-                        bestCard = cur;
-                        // Keep walking if this card has no links (too narrow)
-                        if (cur.querySelectorAll('a[href]').length > 0) return cur;
-                    }
-                }
-                cur = cur.parentElement;
-            }
-            return bestCard;
-        }
-
-        // ── Step 3: From each card, find the primary link ───────────────
-        const results = [];
-        const seenUrls = new Set();
-        const seenCards = new Set();
-
-        for (const dn of dateNodes) {
-            const card = findCard(dn.node);
-            if (!card || seenCards.has(card)) continue;
-            seenCards.add(card);
-
-            // Find the best link in this card (longest text = likely title)
-            const links = card.querySelectorAll('a[href]');
-            let bestLink = null;
-            let bestLen = 0;
-            for (const a of links) {
-                const href = a.href;
-                if (!href || seenUrls.has(href)) continue;
-                try { if (new URL(href).hostname !== domain) continue; } catch { continue; }
-                const linkText = a.innerText.trim();
-                if (linkText.length > bestLen) {
-                    bestLink = a;
-                    bestLen = linkText.length;
-                }
-            }
-
-            // Accept link with text, or image-wrapped link (empty text but long slug)
-            if (bestLink && bestLen >= 5) {
-                seenUrls.add(bestLink.href);
-                results.push({
-                    url: bestLink.href,
-                    text: bestLink.innerText.trim().substring(0, 200) || card.innerText.trim().substring(0, 200),
-                    date_hint: dn.dateMatch,
-                });
-            } else if (bestLink && bestLen < 5) {
-                // Image-wrapped link — use card text as the title
-                const cardTitle = card.innerText.trim().split('\\n').filter(l => l.length > 5)[0] || '';
-                if (cardTitle.length >= 5) {
-                    seenUrls.add(bestLink.href);
-                    results.push({
-                        url: bestLink.href,
-                        text: cardTitle.substring(0, 200),
-                        date_hint: dn.dateMatch,
-                    });
-                }
-            }
-        }
-
-        // ── Step 4: Fallback — if few date associations, try repeated ───
-        // containers and extract primary links from each child item
-        if (results.length < 3) {
-            const containers = [];
-            document.querySelectorAll('main, [role="main"], section, div, ul, ol, table, tbody').forEach(el => {
-                if (el.children.length < 3) return;
-                const tags = {};
-                for (const c of el.children) {
-                    const cn = typeof c.className === 'string' ? c.className : '';
-                    tags[c.tagName + '.' + cn.split(' ')[0]] = (tags[c.tagName + '.' + cn.split(' ')[0]] || 0) + 1;
-                }
-                const max = Math.max(...Object.values(tags));
-                if (max >= 3) containers.push({ el, count: max });
-            });
-            containers.sort((a, b) => b.count - a.count);
-
-            // Use top container, skip if it's a parent of an already-used one
-            for (const { el: cont } of containers.slice(0, 2)) {
-                for (const item of cont.children) {
-                    const links = item.querySelectorAll('a[href]');
-                    let best = null, bestLen = 0;
-                    for (const a of links) {
-                        if (!a.href || seenUrls.has(a.href)) continue;
-                        try { if (new URL(a.href).hostname !== domain) continue; } catch { continue; }
-                        const t = a.innerText.trim();
-                        if (t.length > bestLen) { best = a; bestLen = t.length; }
-                    }
-                    if (best && bestLen >= 5) {
-                        seenUrls.add(best.href);
-                        // Check if this item has a date too
-                        const itemText = item.innerText || '';
-                        const dateMatch = itemText.match(DATE_RE);
-                        results.push({
-                            url: best.href,
-                            text: best.innerText.trim().substring(0, 200),
-                            date_hint: dateMatch ? dateMatch[0] : '',
-                        });
-                    }
-                }
-            }
-        }
-
-        // ── Step 4b: JavaScript links with embedded data ────────────────
-        // Some calendars use javascript: hrefs that encode the event name,
-        // date, and ID directly. Extract time and venue from DOM context.
-        if (results.length < 3) {
-            const jsLinks = document.querySelectorAll('a[href^="JavaScript:" i], a[href^="javascript:" i]');
-            const jsDateRe = /(\\d{4})\\/+(\\d{1,2})\\/+(\\d{1,2})/;
-            for (const a of jsLinks) {
-                const text = a.innerText.trim();
-                if (text.length < 5) continue;
-                const href = a.getAttribute('href') || '';
-                const dm = href.match(jsDateRe);
-                if (!dm) continue;
-                const dateStr = dm[1] + '-' + dm[2].padStart(2, '0') + '-' + dm[3].padStart(2, '0');
-                if (seenUrls.has(text + dateStr)) continue;
-                seenUrls.add(text + dateStr);
-
-                // Extract time from sibling TimeLabel
-                const container = a.closest('.CalEvent') || a.closest('div') || a.parentElement;
-                const timeEl = container ? container.querySelector('.TimeLabel') : null;
-                const time = timeEl ? timeEl.innerText.trim() : '';
-
-                // Extract venue from parent table class (e.g. c_FilthyStudios)
-                const venueTable = a.closest('table[class]');
-                let venue = '';
-                if (venueTable) {
-                    venue = venueTable.className
-                        .replace(/^c_/, '')
-                        .replace(/([A-Z])/g, ' $1')
-                        .trim();
-                }
-
-                // Build event detail URL from PopupWindow params
-                const idMatch = href.match(/['\"]\\s*,\\s*['\"]\\d{4}\\/\\d+\\/\\d+['\"]\\s*,\\s*['\"](\\d+)/);
-                const calMatch = href.match(/PopupWindow\\s*\\(\\s*['\"]([^'\"]+)/);
-                let eventUrl = location.origin + location.pathname;
-                if (idMatch && calMatch) {
-                    const calName = calMatch[1];
-                    const eventId = idMatch[1];
-                    eventUrl = location.origin + '/calendar/Calcium40.pl?CalendarName='
-                        + encodeURIComponent(calName)
-                        + '&Op=PopupWindow&Date=' + encodeURIComponent(dm[0])
-                        + '&ID=' + eventId;
-                }
-
-                results.push({
-                    url: eventUrl,
-                    text: text.substring(0, 200),
-                    date_hint: dateStr,
-                    time: time,
-                    venue: venue,
-                });
-            }
-        }
-
-        // ── Step 5: Last resort — links near dates (walk up 5 ancestors) ──
-        if (results.length < 3) {
-            const allLinks = document.querySelectorAll('a[href]');
-            for (const a of allLinks) {
-                if (seenUrls.has(a.href)) continue;
-                const text = a.innerText.trim();
-                if (text.length < 5) continue;
-                try { if (new URL(a.href).hostname !== domain) continue; } catch { continue; }
-                if (/^(home|about|contact|login|sign|help|privacy|terms|\\d{1,2})$/i.test(text)) continue;
-
-                // Walk up 5 ancestors looking for date context
-                let dateMatch = text.match(DATE_RE)?.[0] || '';
-                if (!dateMatch) {
-                    let cur = a.parentElement;
-                    for (let depth = 0; cur && depth < 5; depth++, cur = cur.parentElement) {
-                        const ct = (cur.childNodes.length <= 5)
-                            ? (cur.innerText || '').substring(0, 300)
-                            : '';
-                        const m = ct.match(DATE_RE);
-                        if (m) { dateMatch = m[0]; break; }
-                    }
-                }
-
-                // Accept if date found nearby, or if the URL pattern suggests event detail
-                const urlPath = new URL(a.href).pathname;
-                const looksLikeDetail = /\\/\\w{5,}.*\\d/.test(urlPath) && urlPath.split('/').length >= 3;
-                if (!dateMatch && !looksLikeDetail) continue;
-
-                seenUrls.add(a.href);
-                results.push({
-                    url: a.href,
-                    text: text.substring(0, 200),
-                    date_hint: dateMatch,
-                });
-            }
-        }
-
-        return results;
-    }""")
-
+    raw = page.evaluate(_EVENT_LINKS_JS)
     return raw or []
 
 
+def _extract_structured_data(html: str) -> dict | None:
+    """Extract schema.org Event JSON-LD from HTML.
+
+    Many event sites embed structured data like:
+      <script type="application/ld+json">{"@type": "Event", ...}</script>
+
+    Returns a dict with title, date, time, location, link, details — or None.
+    """
+    import json as _json
+
+    # Find all JSON-LD blocks
+    for m in re.finditer(
+        r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html, re.DOTALL | re.IGNORECASE,
+    ):
+        try:
+            data = _json.loads(m.group(1))
+        except Exception:
+            continue
+
+        # Handle @graph arrays
+        items = [data] if isinstance(data, dict) else data if isinstance(data, list) else []
+        if isinstance(data, dict) and "@graph" in data:
+            items = data["@graph"]
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("@type", "")
+            if isinstance(item_type, list):
+                item_type = " ".join(item_type)
+            if "Event" not in item_type:
+                continue
+
+            # Extract fields
+            title = item.get("name", "")
+            start = item.get("startDate", "")
+            end = item.get("endDate", "")
+            desc = item.get("description", "")
+            url = item.get("url", "")
+
+            # Location
+            loc = item.get("location", {})
+            if isinstance(loc, dict):
+                loc_name = loc.get("name", "")
+                address = loc.get("address", {})
+                if isinstance(address, dict):
+                    loc_parts = [address.get("streetAddress", ""),
+                                 address.get("addressLocality", "")]
+                    loc_str = ", ".join(p for p in [loc_name] + loc_parts if p)
+                elif isinstance(address, str):
+                    loc_str = f"{loc_name}, {address}" if loc_name else address
+                else:
+                    loc_str = loc_name
+            elif isinstance(loc, str):
+                loc_str = loc
+            else:
+                loc_str = ""
+
+            # Parse date/time
+            date_str = start[:10] if start else ""
+            time_str = ""
+            if "T" in start:
+                time_str = start.split("T")[1][:5]
+                if end and "T" in end:
+                    time_str += " - " + end.split("T")[1][:5]
+
+            if title:
+                return {
+                    "title": title,
+                    "date": date_str,
+                    "time": time_str,
+                    "location": loc_str,
+                    "link": url,
+                    "details": desc[:500] if desc else "",
+                }
+
+    return None
+
+
 def _fetch_event_detail(context, stealth, url: str, timeout_ms: int) -> str | None:
-    """Fetch a single event detail page and return its text."""
+    """Fetch a single event detail page.
+
+    Tries schema.org JSON-LD first (structured, no LLM needed).
+    Falls back to text extraction.
+    """
     try:
         page = context.new_page()
         if stealth:
@@ -1122,90 +1045,107 @@ def _fetch_event_detail(context, stealth, url: str, timeout_ms: int) -> str | No
                     break
 
         page.close()
+
+        # Try structured data first
+        structured = _extract_structured_data(html)
+        if structured:
+            parts = [structured["title"]]
+            if structured["date"]:
+                parts.append(f"date: {structured['date']}")
+            if structured["time"]:
+                parts.append(f"time: {structured['time']}")
+            if structured["location"]:
+                parts.append(f"location: {structured['location']}")
+            if structured["link"]:
+                parts.append(f"link: {structured['link']}")
+            if structured["details"]:
+                parts.append(structured["details"])
+            return "\n".join(parts)
+
+        # Fallback to text extraction
         text = _extract_text(html)
         return text if len(text) > 50 else None
     except Exception:
         return None
 
 
-def _try_calendar_extraction(
-    page, context, stealth, url: str, domain: str, timeout_ms: int,
-) -> list[dict] | None:
-    """Detect calendar pages and extract events via their detail links.
+def _fetch_event_details_parallel(
+    context, stealth, links: list[dict], timeout_ms: int, max_workers: int = 5,
+) -> list[tuple[dict, str | None]]:
+    """Fetch multiple event detail pages in parallel.
 
-    Returns list of message dicts (one per event), or None if not a calendar.
+    Opens up to max_workers tabs simultaneously. Returns list of
+    (link_dict, text_or_none) tuples.
     """
-    event_links = _extract_event_links(page)
+    import concurrent.futures
 
-    if len(event_links) < 3:
-        return None
+    results: list[tuple[dict, str | None]] = []
 
-    logger.info(
-        "Calendar detected on %s: %d event links found. Fetching details...",
-        domain, len(event_links),
-    )
+    # Process in batches to avoid too many open tabs
+    for batch_start in range(0, len(links), max_workers):
+        batch = links[batch_start:batch_start + max_workers]
+        pages = []
 
-    messages = []
-    fetchable = []
-    for lnk in event_links:
-        if lnk.get("inline"):
-            # Inline event (e.g. javascript: link with embedded data)
-            date_hint = lnk.get("date_hint", "")
-            time_hint = lnk.get("time", "")
-            venue = lnk.get("venue", "")
-            parts = [lnk["text"]]
-            if date_hint:
-                parts.append(f"date: {date_hint}")
-            if time_hint:
-                parts.append(f"time: {time_hint}")
-            if venue:
-                parts.append(f"location: {venue}")
-            messages.append({
-                "platform": "web",
-                "id": f"web:{hash(lnk['text'] + date_hint)}",
-                "timestamp": f"{date_hint}T00:00:00+00:00" if date_hint else datetime.now(timezone.utc).isoformat(),
-                "author": domain,
-                "channel": url[:120],
-                "content": "\n".join(parts),
-            })
-        else:
-            fetchable.append(lnk)
+        # Open all tabs in this batch
+        for lnk in batch:
+            try:
+                page = context.new_page()
+                if stealth:
+                    stealth.apply_stealth_sync(page)
+                page.goto(lnk["url"], timeout=timeout_ms, wait_until="domcontentloaded")
+                pages.append((lnk, page))
+            except Exception:
+                pages.append((lnk, None))
 
-    if fetchable:
-        logger.info("Fetching %d event detail pages...", len(fetchable))
-        for lnk in fetchable:
-            text = _fetch_event_detail(context, stealth, lnk["url"], timeout_ms)
-            if not text:
+        # Wait for all to settle, then collect
+        for lnk, page in pages:
+            if page is None:
+                results.append((lnk, None))
                 continue
-            messages.append({
-                "platform": "web",
-                "id": f"web:{hash(lnk['url'])}",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "author": domain,
-                "channel": lnk["url"][:120],
-                "content": text[:5000],
-            })
+            try:
+                page.wait_for_timeout(1500)
 
-    logger.info("Calendar: %d events (%d inline, %d fetched).",
-                len(messages), len(messages) - len(fetchable), len(fetchable))
-    return messages if messages else None
+                html = page.content()
+                # Cloudflare wait
+                if "just a moment" in html.lower():
+                    for _ in range(10):
+                        page.wait_for_timeout(1000)
+                        try:
+                            html = page.content()
+                        except Exception:
+                            continue
+                        if "just a moment" not in html.lower():
+                            page.wait_for_timeout(1000)
+                            html = page.content()
+                            break
+
+                page.close()
+
+                # Try structured data first
+                structured = _extract_structured_data(html)
+                if structured:
+                    parts = [structured["title"]]
+                    if structured["date"]:
+                        parts.append(f"date: {structured['date']}")
+                    if structured["time"]:
+                        parts.append(f"time: {structured['time']}")
+                    if structured["location"]:
+                        parts.append(f"location: {structured['location']}")
+                    if structured["link"]:
+                        parts.append(f"link: {structured['link']}")
+                    if structured["details"]:
+                        parts.append(structured["details"])
+                    results.append((lnk, "\n".join(parts)))
+                else:
+                    text = _extract_text(html)
+                    results.append((lnk, text if len(text) > 50 else None))
+            except Exception:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+                results.append((lnk, None))
+
+    return results
 
 
-def fetch_event_pages(
-    urls: list[dict | str] | None = None,
-    timeout_ms: int = 30000,
-) -> list[dict]:
-    """Legacy wrapper — delegates to fetch_web_sources with calendar mode."""
-    if urls is None:
-        urls = [s for s in WEB_SOURCES if s.get("mode") == "calendar"]
-    else:
-        normalised = []
-        for u in urls:
-            if isinstance(u, str):
-                normalised.append({"url": u, "mode": "calendar", "headless": True})
-            elif "mode" not in u:
-                normalised.append({"mode": "calendar", **u})
-            else:
-                normalised.append(u)
-        urls = normalised
-    return fetch_web_sources(sources=urls, timeout_ms=timeout_ms)

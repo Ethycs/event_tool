@@ -9,9 +9,15 @@ from event_harvester.sources.chromium_cache import (
 from event_harvester.sources.discord import find_discord_cache, read_discord_messages
 from event_harvester.sources.gmail import (
     fetch_full_bodies,
-    fetch_messages as fetch_gmail_messages,
     filter_read_sent,
+)
+from event_harvester.sources.gmail import (
+    fetch_messages as fetch_gmail_messages,
+)
+from event_harvester.sources.gmail import (
     reply as gmail_reply,
+)
+from event_harvester.sources.gmail import (
     trash as gmail_trash,
 )
 from event_harvester.sources.signal import read_signal_messages
@@ -20,7 +26,8 @@ from event_harvester.sources.telegram import (
     read_telegram_messages,
 )
 from event_harvester.sources.uc_browser import UCBrowser
-from event_harvester.sources.web_fetch import fetch_event_pages, fetch_feeds, fetch_web_sources
+from event_harvester.sources.web_fetch import fetch_web_sources
+from event_harvester.sources.web_session import web_login
 
 __all__ = [
     # Generic Chromium cache reader
@@ -41,8 +48,7 @@ __all__ = [
     "read_signal_messages",
     "create_persistent_client",
     "read_telegram_messages",
-    "fetch_event_pages",
-    "fetch_feeds",
     "fetch_web_sources",
+    "web_login",
     "UCBrowser",
 ]
