@@ -42,35 +42,95 @@ cp .env.example .env
 
 ## Usage
 
+The CLI uses subcommands. Bare `event-harvester` runs the default `harvest` pipeline.
+
 ```bash
-# Full pipeline — last 7 days, both platforms, analyse + create tasks
+# Full pipeline — last 7 days, all sources, extract events, sync to TickTick
 event-harvester
+event-harvester harvest                # equivalent
 
 # Custom time window
 event-harvester --days 14
 
-# Discord only, skip analysis
-event-harvester --no-telegram --no-analysis
+# Only specific sources (positive framing)
+event-harvester --only discord,telegram
 
-# Telegram only
-event-harvester --no-discord
+# Skip specific sources
+event-harvester --skip web,signal
 
-# Preview tasks without creating them
+# Preview events without creating TickTick tasks
 event-harvester --dry-run
 
-# Save raw messages for later
-event-harvester --save messages.json
+# Skip the LLM analysis step entirely
+event-harvester --no-analyze
 
-# Load saved messages (skip harvesting)
+# Save raw messages, or load from a previous run
+event-harvester --save messages.json
 event-harvester --load messages.json
 
-# Watch mode — poll every 30s for new messages
-event-harvester --watch
-event-harvester --watch --interval 10
+# Per-source caps (max events fed to the LLM per platform)
+event-harvester --cap discord=20,telegram=30 --cap total=100
 
-# Debug output
+# Group output by source
+event-harvester --group-by-source
+
+# Verbose / quiet
 event-harvester -v
+event-harvester -q
 ```
+
+### Subcommands
+
+```bash
+# Watch mode — poll every 30s for new Discord/Telegram messages
+event-harvester watch
+event-harvester watch --interval 10
+
+# Web source management
+event-harvester web list                            # show configured web sources
+event-harvester web test https://lu.ma/discover     # diagnostics only
+event-harvester web add  https://lu.ma/discover     # diagnostics + save to config
+event-harvester web login                           # browser login for session state
+
+# Recruiter email workflows
+event-harvester recruiters grade                    # grade Gmail recruiters
+event-harvester recruiters grade --auto-trash       # also trash low-scoring ones
+event-harvester recruiters reparse report.md        # interactively act on saved report
+
+# Classifier training and evaluation
+event-harvester classifier train --out-labels labels.json
+event-harvester classifier eval  --labels labels.json --out-samples samples/
+
+# Local web review server (alternative to TickTick sync)
+event-harvester serve
+```
+
+### Filtering sources
+
+`--only` and `--skip` are mutually exclusive. Valid platforms:
+`discord`, `telegram`, `gmail`, `signal`, `web`.
+
+```bash
+event-harvester --only discord                  # just Discord
+event-harvester --only discord,gmail            # Discord + Gmail
+event-harvester --skip web                      # everything except web
+```
+
+### Per-source caps
+
+The `--cap` flag accepts `key=value` pairs and is repeatable. Per-source caps
+prevent any single noisy source from crowding out higher-signal events from
+other sources. `total` is the global ceiling applied after per-source caps.
+
+Valid keys: `discord`, `telegram`, `gmail`, `signal`, `web`, `total`.
+
+```bash
+event-harvester --cap discord=20,telegram=30 --cap total=100
+event-harvester --cap web=50               # raise web ceiling, others default
+```
+
+Defaults: discord=50, telegram=50, gmail=30, signal=30, web=30, total=150.
+Override the defaults via env vars: `CAP_DISCORD=100`, `CAP_TOTAL=200`, etc.
 
 ## Optional filtering
 
@@ -106,7 +166,17 @@ ruff format src/ tests/
 
 ```
 src/event_harvester/
-├── cli.py              # CLI entry point + orchestration
+├── cli/
+│   ├── dispatch.py     # main(), routing, normalization
+│   ├── parser.py       # argparse subcommand setup
+│   ├── parse_helpers.py # --cap, --only, --skip parsers
+│   └── commands/       # one file per subcommand
+│       ├── harvest.py
+│       ├── watch.py
+│       ├── web.py
+│       ├── recruiters.py
+│       ├── classifier.py
+│       └── serve.py
 ├── config.py           # Config loading + validation
 ├── display.py          # Terminal formatting
 ├── analysis.py         # OpenRouter client + prompt builder
@@ -114,5 +184,8 @@ src/event_harvester/
 ├── watch.py            # Watch-mode polling loop
 └── sources/
     ├── discord.py      # LevelDB cache reader
-    └── telegram.py     # Telethon MTProto reader
+    ├── telegram.py     # Telethon MTProto reader
+    ├── gmail.py        # Gmail API reader
+    ├── signal.py       # Signal Desktop SQLCipher reader
+    └── web_fetch.py    # Playwright-based web event scraper
 ```
