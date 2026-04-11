@@ -18,6 +18,38 @@ FINGERPRINT_FILE = Path("data/.event_fingerprints.json")
 _STOP_WORDS = frozenset({"the", "a", "an", "at", "in", "on", "for", "and", "of", "to"})
 
 
+def _normalize_date(date_val) -> str | None:
+    """Normalize a date value to ISO YYYY-MM-DD or None.
+
+    Accepts ISO strings, free-text dates (parsed via dateutil), or None.
+    Returns None if the date cannot be parsed — never returns junk.
+    """
+    if not date_val:
+        return None
+    if not isinstance(date_val, str):
+        return None
+    s = date_val.strip()
+    if not s:
+        return None
+
+    # Fast path: already ISO
+    try:
+        return date.fromisoformat(s[:10]).isoformat()
+    except ValueError:
+        pass
+
+    # Slow path: parse free text via dateutil
+    try:
+        from dateutil import parser as dateutil_parser
+
+        parsed = dateutil_parser.parse(s, fuzzy=True, default=None)
+        if parsed is None:
+            return None
+        return parsed.date().isoformat()
+    except (ValueError, OverflowError, TypeError):
+        return None
+
+
 def _normalize_title(title: str) -> set[str]:
     """Lowercase, strip punctuation, remove stop words, return word set."""
     title = title.lower()
@@ -40,28 +72,35 @@ def _normalize_location(loc) -> set[str] | None:
 
 
 def _titles_overlap(a: set[str], b: set[str]) -> bool:
-    """Check if word set overlap is >= 50% of the smaller set."""
+    """Check if word set overlap is >= 50% of the smaller set.
+
+    Special case: identical non-empty sets always match (so "AI Meetup"
+    matches itself even though it has only 2 words after stop-word removal).
+
+    For non-identical sets, requires at least 2 overlapping words —
+    otherwise titles like "Event A" and "Event B" (which differ only in
+    a stop-word-stripped letter) would match each other.
+    """
     if not a or not b:
         return False
-    overlap = len(a & b)
+    if a == b:
+        return True
+    overlap = a & b
+    if len(overlap) < 2:
+        return False
     smaller = min(len(a), len(b))
-    return overlap / smaller >= 0.5
+    return len(overlap) / smaller >= 0.5
 
 
 def event_signature(event: dict) -> dict:
     """Extract normalized comparison fields from an event."""
     title = event.get("title", "") or ""
-    date_val = event.get("date") or None
     location = event.get("location") or None
     link = event.get("link") or None
 
-    # Normalize date to YYYY-MM-DD string
-    if date_val and isinstance(date_val, str):
-        date_val = date_val[:10]  # take just the date portion
-
     return {
         "title_words": _normalize_title(title),
-        "date": date_val,
+        "date": _normalize_date(event.get("date")),
         "location_words": _normalize_location(location),
         "link": link.strip().lower() if link else None,
     }
@@ -102,7 +141,14 @@ def events_match(a: dict, b: dict) -> tuple[bool, int]:
 
 
 def load_fingerprints() -> list[dict]:
-    """Load fingerprints from JSON, auto-prune expired entries."""
+    """Load fingerprints from JSON, auto-prune expired entries.
+
+    Pruning rules (in order):
+      1. If `date` is a parseable ISO date in the past → drop.
+      2. If `date` is unparseable AND created_at > 30 days ago → drop.
+      3. If `created_at` > 30 days ago (no date) → drop.
+      4. Otherwise → keep.
+    """
     data = load_json(FINGERPRINT_FILE, default=[])
     if not data:
         return []
@@ -113,17 +159,26 @@ def load_fingerprints() -> list[dict]:
         fp_date = fp.get("date")
         created_at = fp.get("created_at")
 
-        if fp_date:
+        # Try to parse the event date
+        date_is_past = False
+        date_parseable = False
+        if fp_date and isinstance(fp_date, str):
             try:
-                if date.fromisoformat(fp_date) < today:
-                    continue  # expired
+                if date.fromisoformat(fp_date[:10]) < today:
+                    date_is_past = True
+                date_parseable = True
             except ValueError:
-                pass
-        elif created_at:
+                pass  # falls through to created_at check
+
+        if date_is_past:
+            continue  # expired by event date
+
+        # Fall back to created_at staleness for entries without parseable dates
+        if not date_parseable and created_at:
             try:
                 created = date.fromisoformat(created_at)
                 if (today - created).days > 30:
-                    continue  # older than 30 days with no date
+                    continue  # too old to keep without a usable date
             except ValueError:
                 pass
 
@@ -133,12 +188,16 @@ def load_fingerprints() -> list[dict]:
 
 
 def save_fingerprint(event: dict, ticktick_id: str | None = None) -> None:
-    """Add a fingerprint for an event to the store."""
+    """Add a fingerprint for an event to the store.
+
+    Dates are normalized to ISO YYYY-MM-DD on write so the pruning logic
+    in load_fingerprints() can correctly drop expired entries.
+    """
     fps = load_fingerprints()
 
     entry = {
         "title": event.get("title", ""),
-        "date": event.get("date"),
+        "date": _normalize_date(event.get("date")),
         "time": event.get("time"),
         "location": event.get("location"),
         "link": event.get("link"),

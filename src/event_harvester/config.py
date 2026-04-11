@@ -118,6 +118,27 @@ class WebConfig:
 
 
 @dataclass
+class CapConfig:
+    """Per-source caps applied at the analysis stage.
+
+    Messages are scored first, then capped per source, then merged up to
+    the global `total` ceiling. Caps prevent any single noisy source from
+    crowding out higher-signal events from other sources.
+    """
+    discord: int = 50
+    telegram: int = 50
+    gmail: int = 30
+    signal: int = 30
+    web: int = 30
+    total: int = 150           # global ceiling after per-source caps
+    group_by_source: bool = False  # if True, output is bucketed by source
+
+    def get(self, platform: str) -> int:
+        """Look up cap for a platform name (case-insensitive)."""
+        return getattr(self, platform.lower(), self.total)
+
+
+@dataclass
 class AppConfig:
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     discord: DiscordConfig = field(default_factory=DiscordConfig)
@@ -126,6 +147,7 @@ class AppConfig:
     llm: LLMConfig = field(default_factory=LLMConfig)
     ticktick: TickTickConfig = field(default_factory=TickTickConfig)
     web: WebConfig = field(default_factory=WebConfig)
+    caps: CapConfig = field(default_factory=CapConfig)
     days_back: int = 7
 
     # Obsidian output
@@ -195,6 +217,15 @@ def load_config() -> AppConfig:
             sources_file=os.getenv("WEB_SOURCES_FILE", "data/web_sources.json"),
             max_events=int(os.getenv("WEB_MAX_EVENTS", "30")),
             timeout_ms=int(os.getenv("WEB_TIMEOUT_MS", "30000")),
+        ),
+        caps=CapConfig(
+            discord=int(os.getenv("CAP_DISCORD", "50")),
+            telegram=int(os.getenv("CAP_TELEGRAM", "50")),
+            gmail=int(os.getenv("CAP_GMAIL", "30")),
+            signal=int(os.getenv("CAP_SIGNAL", "30")),
+            web=int(os.getenv("CAP_WEB", "30")),
+            total=int(os.getenv("CAP_TOTAL", "150")),
+            group_by_source=os.getenv("CAP_GROUP_BY_SOURCE", "").lower() in ("1", "true", "yes"),
         ),
         obsidian_events_dir=os.getenv("OBSIDIAN_EVENTS_DIR", ""),
         obsidian_recruiters_dir=os.getenv("OBSIDIAN_RECRUITERS_DIR", ""),

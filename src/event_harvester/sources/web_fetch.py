@@ -77,17 +77,44 @@ def _load_web_sources() -> list[dict]:
 
 # ── Pre-fetch fingerprint filter + save ───────────────────────────────
 
+_JUNK_LINK_TITLES = frozenset({
+    "view all", "view more", "see all", "see more", "show all", "show more",
+    "next", "previous", "prev", "more", "load more", "back", "home",
+    "relative", "navigation", "menu", "filter", "sort", "search",
+})
+
+
+def _is_junk_link_title(title: str) -> bool:
+    """Reject navigation/UI links that aren't actual events."""
+    if not title:
+        return True
+    t = title.strip().lower()
+    if not t:
+        return True
+    if t in _JUNK_LINK_TITLES:
+        return True
+    # Reject very short titles (likely nav widgets)
+    if len(t) < 5:
+        return True
+    return False
+
+
 def _save_link_fingerprint(lnk: dict) -> None:
     """Save a lightweight fingerprint for a processed event link.
 
     Called after successfully fetching a detail page, so the same link
-    is skipped on the next run. Uses the event_match fingerprint store.
+    is skipped on the next run. Skips navigation/UI links to avoid
+    polluting the fingerprint store.
     """
+    title = lnk.get("text", "") or ""
+    if _is_junk_link_title(title):
+        return  # Don't fingerprint navigation widgets
+
     from event_harvester.event_match import save_fingerprint
 
     save_fingerprint({
-        "title": lnk.get("text", ""),
-        "date": lnk.get("date_hint"),
+        "title": title,
+        "date": lnk.get("date_hint"),  # save_fingerprint normalizes free-text dates
         "link": lnk.get("url"),
     })
 
@@ -322,7 +349,7 @@ def _do_calendar(uc, src: dict, timeout_ms: int, max_events: int, page=None) -> 
     }]
 
 
-def _do_feed(uc, src: dict, page=None) -> list[dict]:
+def _do_feed(uc, src: dict, max_events: int = 30, page=None) -> list[dict]:
     """Feed mode: scroll page while intercepting API responses.
 
     Note: page param is accepted for interface consistency but feed mode
@@ -396,7 +423,7 @@ def _do_feed(uc, src: dict, page=None) -> list[dict]:
         event_links = _extract_event_links(page)
         event_links = _filter_known_links(event_links)
         if event_links:
-            fetch_links = [l for l in event_links[:30] if not l.get("inline")]
+            fetch_links = [l for l in event_links[:max_events] if not l.get("inline")]
             logger.info("%s: %d new event links, fetching in parallel...", name, len(fetch_links))
             results = _fetch_event_details_parallel(
                 uc._context, uc._stealth_plugin, fetch_links, uc.timeout_ms,
@@ -713,7 +740,7 @@ def fetch_web_sources(
                     if mode == "calendar":
                         msgs = _do_calendar(uc, src, timeout_ms, max_events, page=page)
                     elif mode == "feed":
-                        msgs = _do_feed(uc, src, page=page)
+                        msgs = _do_feed(uc, src, max_events, page=page)
                     elif mode == "search":
                         msgs = _do_search(uc, src, timeout_ms, max_events, page=page)
                     else:

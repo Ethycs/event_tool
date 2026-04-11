@@ -240,6 +240,29 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Days to look back (default: from DAYS_BACK env or 7)",
     )
     parser.add_argument(
+        "--group-by-source", action="store_true",
+        help="Sort and display events grouped by source platform",
+    )
+    parser.add_argument(
+        "--cap-discord", type=int, default=None, help="Per-source cap for Discord (default: 50)",
+    )
+    parser.add_argument(
+        "--cap-telegram", type=int, default=None, help="Per-source cap for Telegram (default: 50)",
+    )
+    parser.add_argument(
+        "--cap-gmail", type=int, default=None, help="Per-source cap for Gmail (default: 30)",
+    )
+    parser.add_argument(
+        "--cap-signal", type=int, default=None, help="Per-source cap for Signal (default: 30)",
+    )
+    parser.add_argument(
+        "--cap-web", type=int, default=None, help="Per-source cap for web sources (default: 30)",
+    )
+    parser.add_argument(
+        "--cap-total", type=int, default=None,
+        help="Global cap after per-source caps (default: 150)",
+    )
+    parser.add_argument(
         "--watch", action="store_true",
         help="Watch mode: poll continuously and print new messages",
     )
@@ -353,6 +376,22 @@ async def main() -> None:
     cfg = load_config()
     if args.days is not None:
         cfg.days_back = args.days
+
+    # Apply CLI cap overrides
+    if args.cap_discord is not None:
+        cfg.caps.discord = args.cap_discord
+    if args.cap_telegram is not None:
+        cfg.caps.telegram = args.cap_telegram
+    if args.cap_gmail is not None:
+        cfg.caps.gmail = args.cap_gmail
+    if args.cap_signal is not None:
+        cfg.caps.signal = args.cap_signal
+    if args.cap_web is not None:
+        cfg.caps.web = args.cap_web
+    if args.cap_total is not None:
+        cfg.caps.total = args.cap_total
+    if args.group_by_source:
+        cfg.caps.group_by_source = True
 
     warnings = validate_config(
         cfg,
@@ -517,7 +556,7 @@ async def main() -> None:
     print("[ LLM - extracting events ]")
     print(f"{'=' * W}\n")
 
-    summary, events = extract_events_llm(actionable, cfg.days_back, cfg.llm)
+    summary, events = extract_events_llm(actionable, cfg.days_back, cfg.llm, caps=cfg.caps)
 
     if not events:
         print("No events extracted.")
@@ -526,8 +565,7 @@ async def main() -> None:
     # Check which events are already fingerprinted (in TickTick)
     from event_harvester.event_match import find_fingerprint
 
-    print(f"\n{BOLD}Events ({len(events)}){RESET}")
-    for i, t in enumerate(events, 1):
+    def _print_event(idx: int, t: dict) -> None:
         title = t.get("title") or "Untitled"
         date_str = t.get("date") or ""
         time_str = t.get("time") or ""
@@ -538,7 +576,7 @@ async def main() -> None:
         fp = find_fingerprint(t)
         status = "in TickTick" if fp else "new"
 
-        print(f"  [{i}] {BOLD}{title}{RESET} {DIM}({status}){RESET}")
+        print(f"  [{idx}] {BOLD}{title}{RESET} {DIM}({status}){RESET}")
         if date_str:
             print(f"     date: {date_str}")
         if time_str:
@@ -550,6 +588,34 @@ async def main() -> None:
         if source:
             print(f"     {DIM}source: {source}{RESET}")
         print()
+
+    if cfg.caps.group_by_source:
+        # Group events by their source platform/channel
+        from collections import defaultdict
+
+        groups: dict[str, list[dict]] = defaultdict(list)
+        for t in events:
+            src = t.get("source", "") or "unknown"
+            # Extract platform from "@author in #channel" format
+            if " in " in src:
+                channel = src.split(" in ", 1)[1].strip().lstrip("#")
+                key = channel or "unknown"
+            else:
+                key = src.lstrip("@") or "unknown"
+            groups[key].append(t)
+
+        print(f"\n{BOLD}Events ({len(events)}) grouped by source{RESET}")
+        idx = 1
+        for source_key in sorted(groups.keys()):
+            bucket = groups[source_key]
+            print(f"\n{BOLD}── {source_key} ({len(bucket)}) ──{RESET}")
+            for t in bucket:
+                _print_event(idx, t)
+                idx += 1
+    else:
+        print(f"\n{BOLD}Events ({len(events)}){RESET}")
+        for i, t in enumerate(events, 1):
+            _print_event(i, t)
 
     # ── Reports (use LLM-extracted events) ────────────────────────────────
     validated_events = []

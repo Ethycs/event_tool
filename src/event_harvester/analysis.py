@@ -112,31 +112,111 @@ Include any registration links, RSVP links, or event page URLs.
 Only output the INI sections, nothing else."""
 
 
+def score_message(m: dict) -> int:
+    """Score a message by event signal strength.
+
+    Higher = more likely to contain an event mention. Used by prioritize()
+    and prioritize_with_caps() to sort before capping.
+    """
+    from event_harvester.weights import URL_RE, has_date_or_event_signal
+
+    content = m.get("content", "")
+    s = 0
+    if has_date_or_event_signal(content):
+        s += 3
+    if URL_RE.search(content):
+        s += 2
+    if m.get("pinned"):
+        s += 2
+    if any(kw in content.lower() for kw in _get_actionable_signals()):
+        s += 1
+    return s
+
+
 def prioritize(messages: list[dict], max_messages: int = 150) -> list[dict]:
     """Sort messages by event signal strength, cap to fit time budget.
 
     150 messages = 15 batches of 10 ≈ 2 minutes on local LLM.
     """
-    from event_harvester.weights import has_date_or_event_signal, URL_RE
-
-    def _score(m: dict) -> int:
-        content = m.get("content", "")
-        s = 0
-        if has_date_or_event_signal(content):
-            s += 3
-        if URL_RE.search(content):
-            s += 2
-        if m.get("pinned"):
-            s += 2
-        if any(kw in content.lower() for kw in _get_actionable_signals()):
-            s += 1
-        return s
-
-    scored = sorted(messages, key=_score, reverse=True)
+    scored = sorted(messages, key=score_message, reverse=True)
     if len(scored) > max_messages:
-        logger.info("Priority cap: %d -> %d messages (top by date/link/pinned score).",
+        logger.info("Priority cap: %d -> %d messages (top by score).",
                      len(scored), max_messages)
     return scored[:max_messages]
+
+
+def prioritize_with_caps(messages: list[dict], caps) -> list[dict]:
+    """Score messages, then apply per-source caps before merging.
+
+    Each source's messages are scored independently, sorted, and capped
+    to its quota. The resulting per-source winners are merged and
+    optionally trimmed to caps.total.
+
+    This prevents noisy sources (e.g., 500 Telegram messages) from
+    crowding out high-signal events from quieter sources (e.g., 6 web
+    events).
+    """
+    from collections import defaultdict
+
+    # Bucket by platform
+    buckets: dict[str, list[dict]] = defaultdict(list)
+    for m in messages:
+        platform = (m.get("platform") or "unknown").lower()
+        buckets[platform].append(m)
+
+    # Score-then-cap per bucket
+    capped_buckets: dict[str, list[dict]] = {}
+    for platform, msgs in buckets.items():
+        scored = sorted(msgs, key=score_message, reverse=True)
+        cap = caps.get(platform)
+        kept = scored[:cap]
+        capped_buckets[platform] = kept
+        if len(scored) > cap:
+            logger.info(
+                "  %s: %d -> %d (per-source cap)", platform, len(scored), cap,
+            )
+
+    # Merge and re-sort by score, then apply global ceiling
+    merged: list[dict] = []
+    for msgs in capped_buckets.values():
+        merged.extend(msgs)
+    merged.sort(key=score_message, reverse=True)
+
+    if len(merged) > caps.total:
+        logger.info(
+            "Global cap: %d -> %d messages (after per-source caps).",
+            len(merged), caps.total,
+        )
+        merged = merged[: caps.total]
+
+    return merged
+
+
+def prioritize_grouped(messages: list[dict], caps) -> dict[str, list[dict]]:
+    """Like prioritize_with_caps but returns per-source buckets.
+
+    Each bucket is independently scored and capped. No global merge or
+    total ceiling — useful when downstream wants to process each source
+    separately (e.g., one LLM call per source, or grouped display).
+    """
+    from collections import defaultdict
+
+    buckets: dict[str, list[dict]] = defaultdict(list)
+    for m in messages:
+        platform = (m.get("platform") or "unknown").lower()
+        buckets[platform].append(m)
+
+    grouped: dict[str, list[dict]] = {}
+    for platform, msgs in buckets.items():
+        scored = sorted(msgs, key=score_message, reverse=True)
+        cap = caps.get(platform)
+        grouped[platform] = scored[:cap]
+        if len(scored) > cap:
+            logger.info(
+                "  %s: %d -> %d (per-source cap)", platform, len(scored), cap,
+            )
+
+    return grouped
 
 
 _ACTIONABLE_SIGNALS = [
@@ -157,34 +237,52 @@ def extract_events_llm(
     messages: list[dict],
     days_back: int,
     cfg: LLMConfig,
+    caps=None,
 ) -> tuple[str, list[dict]]:
-    """Send messages to LLM and return (summary, tasks)."""
+    """Send messages to LLM and return (summary, tasks).
+
+    If `caps` (CapConfig) is provided, applies per-source quotas before
+    LLM extraction. Messages are scored first, then capped per source,
+    so noisy sources can't crowd out high-signal ones.
+    """
     if not cfg.is_configured:
         logger.warning("LLM not configured - skipping analysis.")
         return "", []
 
-    # Always run classifier + reranker to cut messages before hitting any LLM
     from event_harvester.classifier import filter_actionable as classifier_filter, has_trained_models
 
     total = len(messages)
+    cap_total = caps.total if caps else 150
 
+    # Stage 1: classifier filter (if trained models exist)
     if has_trained_models():
-        filtered = classifier_filter(messages)
-        n_after_clf = len(filtered)
+        after_clf = classifier_filter(messages)
+        n_after_clf = len(after_clf)
 
+        # Stage 2: reranker if available, else score-based prioritize
         try:
             from event_harvester.reranker import rerank_messages
-            filtered = rerank_messages(filtered, top_k=150)
+            reranked = rerank_messages(after_clf, top_k=cap_total)
         except ImportError:
             logger.warning("sentence-transformers not installed, falling back to regex priority.")
-            filtered = prioritize(filtered)
+            reranked = sorted(after_clf, key=score_message, reverse=True)
+
+        # Stage 3: per-source caps (if configured) — runs AFTER scoring
+        if caps:
+            filtered = prioritize_with_caps(reranked, caps)
+        else:
+            filtered = reranked[:cap_total]
 
         logger.info(
-            "Event extraction: %d -> %d (classifier) -> %d (reranker) -> LLM (%s)",
-            total, n_after_clf, len(filtered), cfg.display_name,
+            "Event extraction: %d -> %d (classifier) -> %d (rerank/score) -> %d (caps) -> LLM (%s)",
+            total, n_after_clf, len(reranked), len(filtered), cfg.display_name,
         )
     else:
-        filtered = prioritize(messages)
+        # No classifier — score, then per-source cap (or global cap)
+        if caps:
+            filtered = prioritize_with_caps(messages, caps)
+        else:
+            filtered = prioritize(messages, max_messages=cap_total)
         logger.info(
             "Event extraction: %d -> %d messages (priority) -> LLM (%s)",
             total, len(filtered), cfg.display_name,
