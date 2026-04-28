@@ -41,7 +41,8 @@ from typing import Optional
 
 logger = logging.getLogger("event_harvester.uc_browser")
 
-_EXT_DIR = Path(__file__).resolve().parent.parent.parent.parent / "ext" / "uc_extension"
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+_EXT_DIR = _REPO_ROOT / "ext" / "universal_controller" / "extension"
 _CHROME_PROFILE = Path("data/.chrome_profile").resolve()
 _NATIVE_PROFILE = Path("data/.native_chrome_profile").resolve()
 _STATE_FILE = Path("data/.playwright_state.json")
@@ -908,33 +909,8 @@ class UCBrowser:
         except ImportError:
             return None
 
-        # Discover candidate containers
-        candidates = page.evaluate("""() => {
-            const seen = new Set();
-            const sels = [];
-            const inputs = document.querySelectorAll(
-                'textarea, [contenteditable="true"], [role="textbox"], '
-                + 'input[type="text"], input:not([type]), '
-                + '[class*="chat" i], [class*="message" i], [class*="prompt" i], '
-                + '[class*="composer" i], [class*="widget" i]'
-            );
-            for (const el of inputs) {
-                let target = el;
-                for (let i = 0; i < 3; i++) {
-                    if (target.parentElement
-                        && target.parentElement !== document.body
-                        && target.parentElement.children.length < 20)
-                        target = target.parentElement;
-                }
-                if (seen.has(target)) continue;
-                seen.add(target);
-                const id = 'mlchat-' + sels.length;
-                target.setAttribute('data-ml-id', id);
-                sels.push('[data-ml-id="' + id + '"]');
-                if (sels.length >= 20) break;
-            }
-            return sels;
-        }""")
+        # Discover candidate containers (extension tags them with data-ml-id)
+        candidates = page.evaluate("window.__UC_findChatCandidates()")
 
         if not candidates:
             return None
@@ -952,12 +928,8 @@ class UCBrowser:
                         "label": "chat_input",
                     }
 
-        # Clean up tags
-        page.evaluate("""() => {
-            document.querySelectorAll('[data-ml-id]').forEach(
-                el => el.removeAttribute('data-ml-id')
-            );
-        }""")
+        # Clean up data-ml-id tags
+        page.evaluate("window.__UC_clearChatCandidates()")
 
         if best:
             # Bind via UC so chat API works
@@ -1008,20 +980,10 @@ class UCBrowser:
             ml_result = self.ml_find_chat(page)
             if ml_result and ml_result["confidence"] > 0.5:
                 logger.info("ML override: using ML-detected chat input over UC heuristic.")
-                # Find the actual input element inside the ML container
-                inner_input = page.evaluate("""(sel) => {
-                    const el = document.querySelector(sel);
-                    if (!el) return null;
-                    const input = el.querySelector(
-                        'textarea, [contenteditable="true"], [role="textbox"], input'
-                    );
-                    if (!input) return null;
-                    if (input.id) return '#' + input.id;
-                    if (input.getAttribute('aria-label'))
-                        return input.tagName.toLowerCase()
-                            + '[aria-label="' + input.getAttribute('aria-label') + '"]';
-                    return sel + ' textarea, ' + sel + ' [contenteditable="true"]';
-                }""", ml_result["selector"])
+                inner_input = page.evaluate(
+                    "(s) => window.__UC_resolveInnerInput(s)",
+                    ml_result["selector"],
+                )
                 selector = inner_input or ml_result["selector"]
                 best_input = {"selector": selector, "score": ml_result["confidence"] * 10,
                               "contentEditable": True, "placeholder": ""}
@@ -1072,35 +1034,9 @@ class UCBrowser:
             logger.info("Send button: %s (score=%.1f)", btn_sel, buttons[0]["score"])
 
         # ── Set up real-time response watcher before submitting ──
-        # Find the likely response container (parent of the conversation area)
-        watch_started = page.evaluate("""(inputSel) => {
-            // Look for a scrollable ancestor that holds messages
-            const input = document.querySelector(inputSel);
-            if (!input) return false;
-            let cur = input;
-            for (let i = 0; i < 15 && cur; i++) {
-                cur = cur.parentElement;
-                if (!cur) break;
-                // A main/article/section container, or one with role
-                const tag = cur.tagName.toLowerCase();
-                const role = cur.getAttribute('role') || '';
-                if (tag === 'main' || role === 'main' || role === 'presentation' || role === 'region') {
-                    return window.__UC_watchContainer(
-                        cur.id ? '#' + cur.id : tag + (role ? '[role="' + role + '"]' : '')
-                    );
-                }
-                // Or a scrollable container
-                const style = getComputedStyle(cur);
-                if (cur.scrollHeight > cur.clientHeight + 100 &&
-                    (style.overflowY === 'auto' || style.overflowY === 'scroll')) {
-                    return window.__UC_watchContainer(
-                        cur.id ? '#' + cur.id : window.__UC_findNewContent.toString() ? 'body' : 'body'
-                    );
-                }
-            }
-            // Fallback: watch body
-            return window.__UC_watchContainer('body');
-        }""", selector)
+        watch_started = page.evaluate(
+            "(s) => window.__UC_setupResponseWatcher(s)", selector,
+        )
         if watch_started:
             logger.info("Response watcher active")
 
@@ -1115,12 +1051,9 @@ class UCBrowser:
 
         # ── Verify send: check if input cleared (postcondition) ──
         page.wait_for_timeout(500)
-        input_cleared = page.evaluate("""(sel) => {
-            const el = document.querySelector(sel);
-            if (!el) return true;
-            const val = el.value || el.textContent || '';
-            return val.trim().length === 0;
-        }""", selector)
+        input_cleared = page.evaluate(
+            "(s) => window.__UC_isInputCleared(s)", selector,
+        )
         if input_cleared:
             logger.info("Send verified: input cleared")
         else:
@@ -1149,110 +1082,207 @@ class UCBrowser:
 
         return response
 
+    def _lock_response_via_anchor(
+        self, page, sent_message: str,
+    ) -> Optional[str]:
+        """Find the AI response by anchoring on the user's message.
+
+        Algorithm:
+        1. Find DOM elements containing sent_message (the anchors).
+        2. For each anchor, find the response candidate that follows it.
+        3. Score each candidate via trigram newness against baseline.
+        4. Tag the highest-scoring candidate with data-uc-response.
+
+        Returns the locked selector (e.g. '[data-uc-response="1"]') or
+        None if no anchor produces a high-newness response.
+        """
+        if not sent_message:
+            return None
+        try:
+            anchors = page.evaluate(
+                "(m) => window.__UC_findAnchorCandidates(m, 5)", sent_message,
+            ) or []
+        except Exception:
+            return None
+
+        if not anchors:
+            logger.debug("Anchor: 0 anchors found for %r", sent_message[:40])
+            return None
+
+        best = None
+        best_ratio = 0.0
+        msg_low = sent_message.lower().strip()
+        scored_count = 0
+        rejected_low_ratio = 0
+        no_response = 0
+
+        for a in anchors:
+            try:
+                resp = page.evaluate(
+                    "(s) => window.__UC_findResponseAfterAnchor(s)",
+                    a.get("selector"),
+                )
+            except Exception:
+                continue
+            if not resp:
+                no_response += 1
+                continue
+            cand_text = (resp.get("text") or "").strip()
+            if not cand_text:
+                no_response += 1
+                continue
+            scored_count += 1
+            # Reject candidates that are echoes of the sent message
+            if msg_low in cand_text.lower() and len(cand_text) <= len(sent_message) + 5:
+                continue
+            # Score by trigram newness against the RAW baseline (do NOT add
+            # sent_message trigrams — the response may legitimately echo
+            # words from the prompt, e.g. user asks "say pineapple" and the
+            # response is "pineapple"). Echo-rejection is handled above.
+            try:
+                ratio = page.evaluate(
+                    """(text) => {
+                        if (!window._baselineTrigrams) return 1.0;
+                        const _tri = (t) => {
+                            const s = new Set();
+                            const lc = t.toLowerCase();
+                            for (let i = 0; i <= lc.length - 3; i++) s.add(lc.slice(i, i + 3));
+                            return s;
+                        };
+                        const bl = window._baselineTrigrams;
+                        const tris = _tri(text);
+                        if (!tris.size) return 0;
+                        let n = 0;
+                        for (const t of tris) if (!bl.has(t)) n++;
+                        return n / tris.size;
+                    }""",
+                    cand_text,
+                )
+            except Exception:
+                ratio = 0
+            if ratio is None:
+                ratio = 0
+            # Tightened threshold: disclaimers/footers score ~0.0-0.65,
+            # genuine AI responses score ~0.85-1.0. 0.7 cleanly separates.
+            if ratio < 0.7:
+                rejected_low_ratio += 1
+                logger.debug("Anchor candidate ratio=%.2f rejected (text=%r)",
+                             ratio, cand_text[:60])
+                continue
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best = resp
+
+        if not best:
+            logger.debug(
+                "Anchor: %d anchors, %d scored, %d rejected, %d no-response",
+                len(anchors), scored_count, rejected_low_ratio, no_response,
+            )
+            return None
+
+        try:
+            locked = page.evaluate(
+                "(s) => window.__UC_lockResponse(s)", best.get("selector"),
+            )
+        except Exception:
+            locked = None
+        if locked:
+            logger.info(
+                "Anchor-locked response: %s (newness=%.2f)", locked, best_ratio,
+            )
+        return locked
+
     def _wait_chat_response(
         self, page, timeout_s: int = 30, sent_message: str = "",
     ) -> Optional[str]:
-        """Wait for response using the full UC toolbox:
+        """Wait for response using anchor-lock primary + legacy fallback.
 
-        Layer 1 — Real-time MutationObserver (__UC_getObserved):
-            Captures new nodes/text as they stream in. Fastest signal.
-        Layer 2 — Scan-diff (__UC_findNewContent):
-            Discovers the response container via DOM diffing. Most reliable
-            for deeply nested content (ChatGPT depth=16).
-        Layer 3 — Trigram set difference (inline):
-            Filters response text from boilerplate by comparing trigrams
-            against the pre-send baseline. Eliminates nav/sidebar/footer.
+        Primary path:
+          1. Find user-message anchors in the DOM.
+          2. For each, look at its next sibling for a response candidate.
+          3. Score with trigram newness; lock the best one with data-uc-response.
+          4. Poll the locked element's innerText until stable.
 
-        Response is complete when text stabilises for 3 polls (1.5s at
-        500ms intervals) or streaming indicators disappear after 5s.
+        Fallback path (anchor-lock fails to find a candidate):
+          - Real-time observer (__UC_getObserved) for streaming text
+          - Scan-diff (__UC_findNewContent) to find the conversation container
+          - Trigram extraction (__UC_extractFromContainer) within the container
+
+        Response is complete when text stabilises for 3 polls (1.5s) or
+        streaming indicators disappear after 5s.
         """
         logger.info("Waiting for response (up to %ds)...", timeout_s)
 
-        response_selector = None
+        locked_selector = None
+        response_selector = None  # legacy scan-diff container
         last_text = ""
         stable_count = 0
-        poll_ms = 500  # Faster polling than before (was 1000)
+        poll_ms = 500
 
         for tick in range(timeout_s * 2):  # 2 ticks per second
             page.wait_for_timeout(poll_ms)
 
-            # ── Layer 1: Check real-time observer for new content ──
+            # ── Primary: try to anchor-lock every poll until locked ──
+            if not locked_selector:
+                locked_selector = self._lock_response_via_anchor(page, sent_message)
+
             current_text = ""
-            try:
-                observed = page.evaluate("window.__UC_getObserved()")
-                if observed:
-                    # Concatenate all non-own-message observed texts
-                    parts = []
-                    for obs in observed:
-                        t = obs.get("text", "").strip()
-                        if not t or len(t) < 5:
-                            continue
-                        # Skip if it contains the sent message
-                        if sent_message and sent_message.lower()[:40] in t.lower():
-                            continue
-                        parts.append(t)
-                    if parts:
-                        # Use the longest observed part as the response
-                        current_text = max(parts, key=len)
-            except Exception:
-                pass
 
-            # ── Layer 2: Scan-diff container discovery (first 10 ticks) ──
-            if not response_selector and tick < 20:
-                try:
-                    self.next_scan(page)
-                    new_content = self.find_new_content(page)
-                    if new_content:
-                        response_selector = new_content[0].get("selector")
-                        if response_selector:
-                            logger.info("Container (scan-diff): %s", response_selector)
-                            # Also start watching this specific container
-                            page.evaluate(
-                                "(s) => window.__UC_watchContainer(s)", response_selector,
-                            )
-                except Exception:
-                    pass
-
-            # ── Layer 3: Trigram-filtered extraction from container ──
-            if response_selector and not current_text:
+            if locked_selector:
+                # ── Locked: read only the tagged element ─────────
                 try:
                     current_text = page.evaluate(
-                        """(args) => {
-                            const el = document.querySelector(args[0]);
-                            if (!el) return '';
-                            const sentMsg = args[1];
-                            if (!window._baselineTrigrams) return el.innerText.trim();
-
-                            const _tri = (t) => {
-                                const s = new Set();
-                                const lc = t.toLowerCase();
-                                for (let i = 0; i <= lc.length - 3; i++) s.add(lc.slice(i, i + 3));
-                                return s;
-                            };
-                            const bl = window._baselineTrigrams;
-                            if (sentMsg) { for (const t of _tri(sentMsg)) bl.add(t); }
-
-                            let best = '', bestR = 0;
-                            for (const c of el.querySelectorAll('*')) {
-                                const ct = (c.innerText || '').trim();
-                                if (ct.length < 10 || ct.length > 5000 || c.children.length > 15) continue;
-                                if (sentMsg && ct.toLowerCase().includes(sentMsg.toLowerCase().slice(0, 40))) continue;
-                                const tris = _tri(ct);
-                                if (!tris.size) continue;
-                                let n = 0;
-                                for (const t of tris) { if (!bl.has(t)) n++; }
-                                const r = n / tris.size;
-                                if (r > bestR) { bestR = r; best = ct; }
-                            }
-                            return best && bestR > 0.3 ? best : el.innerText.trim();
-                        }""",
-                        [response_selector, sent_message],
-                    )
+                        "window.__UC_readLocked()",
+                    ) or ""
+                except Exception:
+                    pass
+            else:
+                # ── Fallback Layer 1: real-time observer ─────────
+                try:
+                    observed = page.evaluate("window.__UC_getObserved()")
+                    if observed:
+                        parts = []
+                        for obs in observed:
+                            t = obs.get("text", "").strip()
+                            if not t or len(t) < 5:
+                                continue
+                            if sent_message and sent_message.lower()[:40] in t.lower():
+                                continue
+                            parts.append(t)
+                        if parts:
+                            current_text = max(parts, key=len)
                 except Exception:
                     pass
 
+                # ── Fallback Layer 2: scan-diff container discovery ──
+                if not response_selector and tick < 20:
+                    try:
+                        self.next_scan(page)
+                        new_content = self.find_new_content(page)
+                        if new_content:
+                            response_selector = new_content[0].get("selector")
+                            if response_selector:
+                                logger.info("Container (scan-diff): %s", response_selector)
+                                page.evaluate(
+                                    "(s) => window.__UC_watchContainer(s)",
+                                    response_selector,
+                                )
+                    except Exception:
+                        pass
+
+                # ── Fallback Layer 3: trigram extraction in container ──
+                if response_selector and not current_text:
+                    try:
+                        current_text = page.evaluate(
+                            "(args) => window.__UC_extractFromContainer(args[0], args[1])",
+                            [response_selector, sent_message],
+                        ) or ""
+                    except Exception:
+                        pass
+
             # ── Stability check ──────────────────────────────────
-            if not current_text or len(current_text) < 15:
+            min_len = 1 if locked_selector else 15  # locked = trust short answers
+            if not current_text or len(current_text) < min_len:
                 continue
 
             if current_text == last_text:
@@ -1265,7 +1295,7 @@ class UCBrowser:
                 last_text = current_text
 
             # ── Streaming indicator check (after 5s minimum) ─────
-            if tick >= 10:  # 5 seconds at 500ms
+            if tick >= 10:
                 streaming = page.evaluate("""() => {
                     return document.querySelectorAll(
                         '[class*="streaming"], [class*="typing"], '

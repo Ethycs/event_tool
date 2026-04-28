@@ -12,8 +12,9 @@ from typing import Optional
 
 logger = logging.getLogger("event_harvester.web_session")
 
-_DATA_DIR = Path(__file__).resolve().parent.parent.parent.parent / "data"
-_EXT_DIR = Path(__file__).resolve().parent.parent.parent.parent / "ext" / "uc_extension"
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+_DATA_DIR = _REPO_ROOT / "data"
+_EXT_DIR = _REPO_ROOT / "ext" / "universal_controller" / "extension"
 STATE_FILE = _DATA_DIR / ".playwright_state.json"
 
 

@@ -1078,14 +1078,14 @@ def _decimate_text(text: str, max_chars: int = 2000) -> str:
     return text[region_start:region_end].strip()
 
 
-_JS_DIR = Path(__file__).resolve().parent.parent.parent.parent / "ext"
+_JS_DIR = Path(__file__).resolve().parent.parent.parent.parent / "ext" / "helpers"
 _EVENT_LINKS_JS = (_JS_DIR / "extract_event_links.js").read_text(encoding="utf-8")
 
 
 def _extract_event_links(page) -> list[dict]:
     """Extract event links by associating dates with links via DOM locality.
 
-    The JavaScript logic lives in ext/extract_event_links.js for proper
+    The JavaScript logic lives in ext/helpers/extract_event_links.js for proper
     syntax highlighting and independent testability.
 
     Returns list of {url, text, date_hint} — links co-located with dates.

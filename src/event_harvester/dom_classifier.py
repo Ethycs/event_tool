@@ -24,13 +24,12 @@ import numpy as np
 
 logger = logging.getLogger("event_harvester.dom_classifier")
 
-_MODEL_DIR = Path(__file__).resolve().parent.parent.parent / "ext" / "models" / "dom_classifier"
+_UC_DIR = Path(__file__).resolve().parent.parent.parent / "ext" / "universal_controller"
+_MODEL_DIR = _UC_DIR / "models" / "dom_classifier"
 _RASTER_PKL_PATH = _MODEL_DIR / "raster_classifier.pkl"
 _CODE_PKL_PATH = _MODEL_DIR / "code_classifier.pkl"
 _LABELS_PATH = _MODEL_DIR / "labels.json"
-_RASTERIZER_JS = (
-    Path(__file__).resolve().parent.parent.parent / "ext" / "rasterizer.js"
-).read_text(encoding="utf-8")
+_RASTERIZER_JS = (_UC_DIR / "ml" / "rasterizer.js").read_text(encoding="utf-8")
 
 DEFAULT_LABELS = [
     "search", "chat_input", "form_field", "modal",
