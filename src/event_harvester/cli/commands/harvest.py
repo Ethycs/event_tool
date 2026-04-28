@@ -65,6 +65,8 @@ async def harvest_cmd(args, cfg) -> int:
         cfg,
         load_path=args.load,
         skip_cache=bool(args.save),
+        web_source=getattr(args, "web_source", None),
+        no_cooldown=getattr(args, "no_cooldown", False),
         **platform_kwargs,
     )
 
@@ -126,9 +128,29 @@ async def harvest_cmd(args, cfg) -> int:
     print("[ LLM - extracting events ]")
     print(f"{'=' * W}\n")
 
+    # When --only is used, the user has explicitly scoped to specific
+    # sources — don't apply per-source caps that would silently drop
+    # events. Caps exist to prevent noisy sources from crowding out
+    # quiet ones in the default mixed-source pipeline; that concern
+    # doesn't apply when --only is set.
+    caps_for_llm = None if args.only is not None else cfg.caps
+    if args.only is not None:
+        logger.info("--only set; ignoring per-source caps")
+
     summary, events = extract_events_llm(
-        actionable, cfg.days_back, cfg.llm, caps=cfg.caps,
+        actionable, cfg.days_back, cfg.llm, caps=caps_for_llm,
     )
+
+    if getattr(args, "show_rejects", False):
+        from event_harvester.analysis import _extract_events_cloud
+        rejects = getattr(extract_events_llm, "_last_rejects", {})
+        rejects["llm_past"] = getattr(
+            _extract_events_cloud, "_last_llm_dropped", [],
+        )
+        rejects["llm_no_events"] = getattr(
+            _extract_events_cloud, "_last_llm_no_events", [],
+        )
+        _print_rejects(rejects)
 
     if not events:
         print("No events extracted.")
@@ -195,9 +217,27 @@ async def harvest_cmd(args, cfg) -> int:
 # ── Helpers ──────────────────────────────────────────────────────────
 
 
+def _source_key(event: dict) -> str:
+    """Extract a stable group key from an event's source field.
+
+    Source format from the LLM is typically '@author in #channel'.
+    The channel name is the most useful grouping key; fall back to
+    author or 'unknown'.
+    """
+    src = event.get("source", "") or "unknown"
+    if " in " in src:
+        channel = src.split(" in ", 1)[1].strip().lstrip("#")
+        return channel or "unknown"
+    return src.lstrip("@") or "unknown"
+
+
 def _print_events(events: list[dict], cfg) -> None:
-    """Print events, optionally grouped by source."""
-    from event_harvester.event_match import find_fingerprint
+    """Print events grouped by source, sorted by date (soonest first).
+
+    Events without parseable dates are listed under a TBD section
+    at the bottom of each source group.
+    """
+    from event_harvester.event_match import _normalize_date, find_fingerprint
 
     def _print_event(idx: int, t: dict) -> None:
         title = t.get("title") or "Untitled"
@@ -208,7 +248,7 @@ def _print_events(events: list[dict], cfg) -> None:
         notes = t.get("notes") or ""
 
         fp = find_fingerprint(t)
-        status = "in TickTick" if fp else "new"
+        status = "known" if fp else "new"
 
         print(f"  [{idx}] {BOLD}{title}{RESET} {DIM}({status}){RESET}")
         if date_str:
@@ -223,29 +263,31 @@ def _print_events(events: list[dict], cfg) -> None:
             print(f"     {DIM}source: {source}{RESET}")
         print()
 
-    if cfg.caps.group_by_source:
-        groups: dict[str, list[dict]] = defaultdict(list)
-        for t in events:
-            src = t.get("source", "") or "unknown"
-            if " in " in src:
-                channel = src.split(" in ", 1)[1].strip().lstrip("#")
-                key = channel or "unknown"
-            else:
-                key = src.lstrip("@") or "unknown"
-            groups[key].append(t)
+    # Bucket events by source group
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for t in events:
+        groups[_source_key(t)].append(t)
 
-        print(f"\n{BOLD}Events ({len(events)}) grouped by source{RESET}")
-        idx = 1
-        for source_key in sorted(groups.keys()):
-            bucket = groups[source_key]
-            print(f"\n{BOLD}── {source_key} ({len(bucket)}) ──{RESET}")
-            for t in bucket:
-                _print_event(idx, t)
-                idx += 1
-    else:
-        print(f"\n{BOLD}Events ({len(events)}){RESET}")
-        for i, t in enumerate(events, 1):
-            _print_event(i, t)
+    # Sort each bucket: dated events first (ascending), TBD at the bottom
+    for key in groups:
+        dated, tbd = [], []
+        for t in groups[key]:
+            iso = _normalize_date(t.get("date"))
+            if iso:
+                dated.append((iso, t))
+            else:
+                tbd.append(t)
+        dated.sort(key=lambda pair: pair[0])
+        groups[key] = [t for _, t in dated] + tbd
+
+    print(f"\n{BOLD}Events ({len(events)}) grouped by source, sorted by date{RESET}")
+    idx = 1
+    for source_key in sorted(groups.keys()):
+        bucket = groups[source_key]
+        print(f"\n{BOLD}── {source_key} ({len(bucket)}) ──{RESET}")
+        for t in bucket:
+            _print_event(idx, t)
+            idx += 1
 
 
 def _events_for_report(events: list[dict]) -> list[dict]:
@@ -269,3 +311,71 @@ def _events_for_report(events: list[dict]) -> list[dict]:
             "channel": channel,
         })
     return out
+
+
+def _print_rejects(rejects: dict[str, list]) -> None:
+    """Print reject summary to terminal and write full details to INI file."""
+    from pathlib import Path
+
+    stage_labels = {
+        "classifier": "Classifier",
+        "reranker": "Reranker",
+        "caps": "Per-source caps",
+        "llm_past": "LLM (past events)",
+        "llm_no_events": "LLM (no events extracted)",
+    }
+    stages = ("classifier", "reranker", "caps", "llm_past", "llm_no_events")
+
+    total_rejected = sum(len(rejects.get(s, [])) for s in stages)
+    if not total_rejected:
+        print(f"\n{DIM}No messages rejected (all passed through pipeline).{RESET}\n")
+        return
+
+    # Terminal summary
+    for stage in stages:
+        items = rejects.get(stage, [])
+        if items:
+            print(f"  {stage_labels[stage]}: {DIM}{len(items)} rejected{RESET}")
+
+    # Write INI file
+    out_path = Path("data/rejects.ini")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = []
+    idx = 0
+
+    # Message-level rejects (classifier, reranker, caps, llm_no_events)
+    for stage in ("classifier", "reranker", "caps", "llm_no_events"):
+        msgs = rejects.get(stage, [])
+        if not msgs:
+            continue
+        lines.append(f"; ── Rejected by {stage_labels[stage]} ({len(msgs)}) ──")
+        lines.append("")
+        for m in msgs:
+            idx += 1
+            content = m.get("content", "").replace("\n", " | ")[:300]
+            lines.append(f"[Reject.{idx}]")
+            lines.append(f"stage = {stage}")
+            lines.append(f"platform = {m.get('platform', '?')}")
+            lines.append(f"channel = {m.get('channel', '?')}")
+            lines.append(f"author = {m.get('author', '?')}")
+            lines.append(f"timestamp = {m.get('timestamp', '')[:16]}")
+            lines.append(f"content = {content}")
+            lines.append("")
+
+    # Event-level rejects (llm_past — events extracted then dropped)
+    past_events = rejects.get("llm_past", [])
+    if past_events:
+        lines.append(f"; ── Rejected by {stage_labels['llm_past']} ({len(past_events)}) ──")
+        lines.append("")
+        for ev in past_events:
+            idx += 1
+            lines.append(f"[Reject.{idx}]")
+            lines.append("stage = llm_past")
+            lines.append(f"title = {ev.get('title', '?')}")
+            lines.append(f"date = {ev.get('date', '?')}")
+            lines.append(f"source = {ev.get('source', '?')}")
+            lines.append(f"reason = {ev.get('reason', '?')}")
+            lines.append("")
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"\n  {total_rejected} total rejects -> {out_path}\n")

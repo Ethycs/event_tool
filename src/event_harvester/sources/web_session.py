@@ -209,11 +209,11 @@ def apply_uc_patterns(page, uc: dict) -> None:
 
 
 def web_login(urls: list[str] | None = None) -> None:
-    """Open a visible browser for manual login. Saves session state.
+    """Open real Chrome for manual login with full password manager access.
 
-    Opens each URL in a browser window. Log into your accounts,
-    then close the browser. The session cookies/storage are saved
-    to data/.playwright_state.json for future headless runs.
+    Launches the user's actual Chrome binary via subprocess (not Playwright-
+    controlled) so Google trusts it for password sync and autofill. Connects
+    via CDP to open tabs. Sessions persist in the real Chrome profile.
     """
     if urls is None:
         from event_harvester.sources.web_fetch import _load_web_sources
@@ -226,7 +226,7 @@ def web_login(urls: list[str] | None = None) -> None:
         from playwright.sync_api import sync_playwright
 
         print("Opening browser. Log into your event sites, then close the browser.")
-        print("Session will be saved for future runs.\n")
+        print("Sessions persist across runs in data/.chrome_profile/\n")
         print("  Suggested sites to log into:")
         for url in urls:
             print(f"    - {url}")

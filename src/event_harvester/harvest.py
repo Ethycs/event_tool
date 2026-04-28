@@ -19,90 +19,7 @@ logger = logging.getLogger("event_harvester")
 
 _DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 CACHE_FILE = _DATA_DIR / ".message_cache.json"
-WATERMARK_FILE = _DATA_DIR / ".watermarks.json"
 CACHE_MAX_AGE = timedelta(hours=4)
-
-
-def _load_watermarks() -> dict[str, dict]:
-    """Load per-channel watermarks.
-
-    Format: {
-        "platform:channel": {
-            "last_ts": "ISO timestamp of newest seen message",
-            "seen_ids": ["id1", "id2", ...]  (last N message IDs)
-        }
-    }
-    """
-    from event_harvester.utils import load_json
-    return load_json(WATERMARK_FILE)
-
-
-def _save_watermarks(watermarks: dict[str, dict]) -> None:
-    """Save per-channel watermarks."""
-    from event_harvester.utils import save_json
-    save_json(WATERMARK_FILE, watermarks)
-
-
-_MAX_IDS_PER_CHANNEL = 500  # Keep last N IDs to avoid unbounded growth
-
-
-def _update_watermarks(messages: list[dict], watermarks: dict[str, dict]) -> None:
-    """Update watermarks with IDs and timestamps from fetched messages."""
-    for m in messages:
-        key = f"{m['platform']}:{m.get('channel', '?')}"
-        wm = watermarks.setdefault(key, {"last_ts": "", "seen_ids": []})
-
-        ts = m.get("timestamp", "")
-        if ts > wm["last_ts"]:
-            wm["last_ts"] = ts
-
-        mid = m["id"]
-        if mid not in wm["seen_ids"]:
-            wm["seen_ids"].append(mid)
-
-    # Trim to last N IDs per channel
-    for wm in watermarks.values():
-        if len(wm["seen_ids"]) > _MAX_IDS_PER_CHANNEL:
-            wm["seen_ids"] = wm["seen_ids"][-_MAX_IDS_PER_CHANNEL:]
-
-
-def filter_seen(messages: list[dict], watermarks: dict[str, dict]) -> list[dict]:
-    """Filter out messages already seen in a previous run.
-
-    A message is "seen" if its ID is in the watermark's seen_ids set
-    OR its timestamp is <= the watermark timestamp (redundancy check).
-    """
-    if not watermarks:
-        return messages
-
-    # Pre-convert seen_ids lists to sets for O(1) lookup
-    seen_sets: dict[str, set] = {}
-    for wm_key, wm in watermarks.items():
-        seen_sets[wm_key] = set(wm.get("seen_ids", []))
-
-    new = []
-    n_skipped = 0
-    for m in messages:
-        key = f"{m['platform']}:{m.get('channel', '?')}"
-        wm = watermarks.get(key)
-        if not wm:
-            new.append(m)
-            continue
-
-        mid = m["id"]
-        ts = m.get("timestamp", "")
-
-        # Skip if ID already seen OR timestamp is at/before the watermark
-        if mid in seen_sets.get(key, set()) or ts <= wm.get("last_ts", ""):
-            n_skipped += 1
-            continue
-
-        new.append(m)
-
-    if n_skipped:
-        logger.info("Watermarks: skipped %d already-seen messages, %d new.", n_skipped, len(new))
-
-    return new
 
 
 _WEB_EVENT_DOMAINS = (
@@ -121,6 +38,8 @@ async def harvest_messages(
     no_signal: bool = False,
     no_web: bool = False,
     skip_cache: bool = False,
+    web_source: str | None = None,
+    no_cooldown: bool = False,
 ) -> list[dict]:
     """Fetch messages from sources, with auto-caching.
 
@@ -203,33 +122,31 @@ async def harvest_messages(
 
     if not no_web:
         print("[ Web Sources ]")
-        web_msgs = fetch_web_sources(
-            max_events=cfg.web.max_events,
-            timeout_ms=cfg.web.timeout_ms,
-        )
+        web_kw: dict = {
+            "max_events": cfg.web.max_events,
+            "timeout_ms": cfg.web.timeout_ms,
+            "no_cooldown": no_cooldown,
+        }
+        if web_source:
+            from event_harvester.sources.web_fetch import _load_web_sources
+            all_web = _load_web_sources()
+            matched = [s for s in all_web if s.get("name", "").lower() == web_source.lower()]
+            if not matched:
+                names = ", ".join(s.get("name", s["url"]) for s in all_web)
+                logger.warning("Web source '%s' not found. Available: %s", web_source, names)
+            else:
+                web_kw["sources"] = matched
+        web_msgs = fetch_web_sources(**web_kw)
         messages.extend(web_msgs)
         print()
 
-    # ── Filter already-seen messages ──────────────────────────────────────
-    watermarks = _load_watermarks()
-    new_messages = filter_seen(messages, watermarks)
-    if len(messages) != len(new_messages):
-        print(
-            f"{DIM}Watermarks: {len(messages) - len(new_messages)} already-seen skipped, "
-            f"{len(new_messages)} new.{RESET}\n"
-        )
-
-    # ── Update watermarks with all fetched messages ────────────────────
-    _update_watermarks(messages, watermarks)
-    _save_watermarks(watermarks)
-
     # ── Auto-save to cache (decimate web content to reduce cache size) ──
-    if new_messages:
+    if messages:
         try:
             from event_harvester.sources.web_fetch import _decimate_text
 
             cache_msgs = []
-            for m in new_messages:
+            for m in messages:
                 if m.get("platform") == "web" and len(m.get("content", "")) > 2000:
                     m = {**m, "content": _decimate_text(m["content"])}
                 cache_msgs.append(m)
@@ -246,7 +163,7 @@ async def harvest_messages(
         except Exception as e:
             logger.debug("Failed to write message cache: %s", e)
 
-    return new_messages
+    return messages
 
 
 def save_messages(messages: list[dict], path: str) -> None:

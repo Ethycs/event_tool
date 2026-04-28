@@ -202,7 +202,20 @@ def _detect_mode(uc, page, src: dict) -> str:
 
 def _wait_cloudflare(page, headless: bool = True) -> str:
     """Wait for Cloudflare challenge to resolve. Returns page HTML."""
-    html = page.content()
+    try:
+        page.wait_for_load_state("load", timeout=15000)
+    except Exception:
+        pass
+    # Retry page.content() — native Chrome CDP may still be navigating
+    html = None
+    for _ in range(5):
+        try:
+            html = page.content()
+            break
+        except Exception:
+            page.wait_for_timeout(1000)
+    if html is None:
+        html = page.content()  # final attempt, let it raise
     if "just a moment" not in html.lower() and "security verification" not in html.lower():
         return html
     if headless:
@@ -222,11 +235,83 @@ def _wait_cloudflare(page, headless: bool = True) -> str:
     return html
 
 
+# ── Calcium calendar parser (erobay etc.) ────────────────────────────
+
+_CALCIUM_VENUE_RE = re.compile(r'<table[^>]*class="c_([^"]*)"')
+_CALCIUM_TIME_RE = re.compile(r'class="TimeLabel">([^<]+)<')
+_CALCIUM_NOSCRIPT_RE = re.compile(r'<noscript><a href="([^"]+)">([^<]+)</a>')
+_CALCIUM_DATE_RE = re.compile(r'Date=(\d{4})%2F(\d{1,2})%2F(\d{1,2})')
+
+
+def _parse_calcium_links(html: str) -> list[dict]:
+    """Parse a Calcium (Perl CGI) calendar into event link dicts.
+
+    Returns the same format as _extract_event_links():
+        [{url, text, date_hint, time, venue}]
+
+    Extracts from <noscript> fallback links (server-generated URLs).
+    Pulls time from .TimeLabel and venue from the parent table class.
+    """
+    from html import unescape
+
+    seen_ids: set[str] = set()
+    links: list[dict] = []
+
+    # Split HTML on c_ table boundaries — each block is one event
+    blocks = re.split(r'(?=<table[^>]*class="c_)', html)
+
+    for block in blocks:
+        venue_m = _CALCIUM_VENUE_RE.match(block)
+        if not venue_m:
+            continue
+        venue_raw = venue_m.group(1)
+
+        # Venue: "WickedGrounds" → "Wicked Grounds"
+        venue = re.sub(r"([A-Z])", r" \1", venue_raw).strip()
+
+        # Time
+        time_m = _CALCIUM_TIME_RE.search(block)
+        time_str = time_m.group(1).strip() if time_m else ""
+
+        # Noscript link (server-generated URL + title)
+        ns_m = _CALCIUM_NOSCRIPT_RE.search(block)
+        if not ns_m:
+            continue
+        event_url = unescape(ns_m.group(1))
+        title = unescape(ns_m.group(2)).strip()
+
+        # Extract date from URL params
+        date_m = _CALCIUM_DATE_RE.search(event_url)
+        if not date_m:
+            continue
+        date_str = f"{date_m.group(1)}-{int(date_m.group(2)):02d}-{int(date_m.group(3)):02d}"
+
+        # Extract event ID for dedup (appears twice per event in HTML)
+        id_m = re.search(r"ID=(\d+)", event_url)
+        event_id = id_m.group(1) if id_m else title
+        dedup_key = f"{event_id}:{date_str}"
+        if dedup_key in seen_ids:
+            continue
+        seen_ids.add(dedup_key)
+
+        links.append({
+            "url": event_url,
+            "text": title,
+            "date_hint": date_str,
+            "time": time_str,
+            "venue": venue,
+        })
+
+    logger.info("Calcium parser: %d event links.", len(links))
+    return links
+
+
 def _do_calendar(uc, src: dict, timeout_ms: int, max_events: int, page=None) -> list[dict]:
     """Calendar mode: load page, extract date↔link pairs, fetch detail pages."""
     from urllib.parse import urlparse
 
     url = src["url"]
+    domain = urlparse(url).netloc
     logger.info("Calendar: %s", src.get("name", url))
 
     if page is None:
@@ -235,12 +320,56 @@ def _do_calendar(uc, src: dict, timeout_ms: int, max_events: int, page=None) -> 
         if "just a moment" in html.lower():
             page.close()
             return []
+    else:
+        try:
+            page.wait_for_load_state("load", timeout=10000)
+        except Exception:
+            pass
+        html = page.content()
+
+    # Calcium calendar (e.g. erobay) — parse links from static HTML,
+    # then fetch detail pages through the normal pipeline below.
+    if "function PopupWindow" in html:
+        event_links = _parse_calcium_links(html)
+        page.close()
+        if not event_links:
+            return []
+        # Filter already-known events, then fetch detail pages
+        event_links = _filter_known_links(event_links)
+        logger.info("%s: %d calcium links to fetch.", src.get("name"), len(event_links))
+        if not event_links:
+            return []
+        results = _fetch_event_details_parallel(
+            uc._context, uc._stealth_plugin, event_links, timeout_ms,
+        )
+        from urllib.parse import unquote
+
+        messages = []
+        for lnk, text in results:
+            if text:
+                _save_link_fingerprint(lnk)
+                # Prepend inline metadata the detail page may not have
+                header_parts = []
+                if lnk.get("time"):
+                    header_parts.append(f"time: {lnk['time']}")
+                if lnk.get("venue"):
+                    header_parts.append(f"location: {lnk['venue']}")
+                if header_parts:
+                    text = "\n".join(header_parts) + "\n" + text
+                messages.append({
+                    "platform": "web",
+                    "id": f"web:{hash(lnk['url'])}",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "author": domain,
+                    "channel": unquote(lnk["url"])[:120],
+                    "content": text[:5000],
+                })
+        return messages
 
     # UC obstacle clearing
     uc.detect_all(page)
     uc.dismiss_cookies(page)
     uc.close_modal(page)
-    domain = urlparse(url).netloc
 
     # Scroll to load lazy content before extracting links
     scroll_secs = src.get("scroll_seconds", 3)
@@ -654,6 +783,7 @@ def fetch_web_sources(
     sources: list[dict] | None = None,
     max_events: int = 30,
     timeout_ms: int = 30000,
+    no_cooldown: bool = False,
 ) -> list[dict]:
     """Fetch events from all configured web sources.
 
@@ -669,7 +799,7 @@ def fetch_web_sources(
     active = []
     for src in sources:
         cd_hours = src.get("cooldown_hours", -1)
-        if cd_hours >= 0 and _is_on_cooldown(src["url"], timedelta(hours=cd_hours)):
+        if not no_cooldown and cd_hours >= 0 and _is_on_cooldown(src["url"], timedelta(hours=cd_hours)):
             logger.info("Skipping %s (on cooldown).", src.get("name", src["url"]))
         else:
             active.append(src)
@@ -1044,6 +1174,25 @@ def _extract_structured_data(html: str) -> dict | None:
     return None
 
 
+_DEAD_PAGE_RE = re.compile(
+    r"event\s+(?:has\s+been\s+)?(?:deleted|removed|cancelled|canceled)"
+    r"|no\s+longer\s+available"
+    r"|this\s+event\s+(?:was|has\s+been)\s+(?:deleted|removed|cancelled|canceled)"
+    r"|page\s+not\s+found"
+    r"|404\s+not\s+found"
+    r"|event\s+not\s+found",
+    re.IGNORECASE,
+)
+
+
+def _is_dead_page(html: str) -> bool:
+    """Detect pages for deleted, cancelled, or removed events."""
+    # Check visible text only (strip tags for a lightweight scan)
+    text = re.sub(r"<[^>]+>", " ", html)
+    # Only check the first 3000 chars — dead-page notices are always near the top
+    return bool(_DEAD_PAGE_RE.search(text[:3000]))
+
+
 def _fetch_event_detail(context, stealth, url: str, timeout_ms: int) -> str | None:
     """Fetch a single event detail page.
 
@@ -1072,6 +1221,11 @@ def _fetch_event_detail(context, stealth, url: str, timeout_ms: int) -> str | No
                     break
 
         page.close()
+
+        # Detect dead/deleted/cancelled pages
+        if _is_dead_page(html):
+            logger.info("Dead page (deleted/cancelled/not found): %s", url[:80])
+            return None
 
         # Try structured data first
         structured = _extract_structured_data(html)

@@ -50,7 +50,7 @@ def _add_harvest_args(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--group-by-source", action="store_true",
-        help="Sort and display events grouped by source",
+        help="(deprecated) Terminal display is always grouped by source. Kept for compatibility.",
     )
 
     p.add_argument(
@@ -65,6 +65,10 @@ def _add_harvest_args(p: argparse.ArgumentParser) -> None:
         "--dry-run", action="store_true",
         help="Show tasks that would be created without creating them",
     )
+    p.add_argument(
+        "--show-rejects", action="store_true",
+        help="Show messages rejected at each pipeline stage (classifier, reranker, caps)",
+    )
 
     p.add_argument(
         "--save", metavar="FILE",
@@ -73,6 +77,15 @@ def _add_harvest_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--load", metavar="FILE",
         help="Load messages from JSON instead of harvesting",
+    )
+
+    p.add_argument(
+        "--web-source", metavar="NAME",
+        help="Only fetch this web source by name (e.g. erobay, luma)",
+    )
+    p.add_argument(
+        "--no-cooldown", action="store_true",
+        help="Ignore web source cooldowns (force re-fetch)",
     )
 
     p.add_argument(

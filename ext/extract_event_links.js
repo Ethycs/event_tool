@@ -150,9 +150,10 @@
     }
 
     // ── Step 4b: JavaScript links with embedded data ────────────────
-    // Some calendars use javascript: hrefs that encode the event name,
-    // date, and ID directly. Extract time and venue from DOM context.
-    if (results.length < 3) {
+    // Some calendars (e.g. erobay/Calcium) use javascript: hrefs that
+    // encode the event name, date, and ID directly. Always runs — these
+    // links are invisible to Steps 1-4 which only see real hrefs.
+    {
         const jsLinks = document.querySelectorAll('a[href^="JavaScript:" i], a[href^="javascript:" i]');
         const jsDateRe = /(\d{4})\/+(\d{1,2})\/+(\d{1,2})/;
         for (const a of jsLinks) {
@@ -181,16 +182,23 @@
             }
 
             // Build event detail URL from PopupWindow params
-            const idMatch = href.match(/['"]\s*,\s*['"]\d{4}\/\d+\/\d+['"]\s*,\s*['"](\d+)/);
+            // PopupWindow(calName, date, id, source, width, height)
             const calMatch = href.match(/PopupWindow\s*\(\s*['"]([^'"]+)/);
+            const argsMatch = href.match(/PopupWindow\s*\(\s*['"][^'"]*['"]\s*,\s*['"][^'"]*['"]\s*,\s*['"](\d+)['"]\s*,\s*['"]([^'"]*)['"]/);
             let eventUrl = location.origin + location.pathname;
-            if (idMatch && calMatch) {
+            if (argsMatch && calMatch) {
                 const calName = calMatch[1];
-                const eventId = idMatch[1];
-                eventUrl = location.origin + '/calendar/Calcium40.pl?CalendarName='
-                    + encodeURIComponent(calName)
-                    + '&Op=PopupWindow&Date=' + encodeURIComponent(dm[0])
-                    + '&ID=' + eventId;
+                const eventId = argsMatch[1];
+                const source = argsMatch[2];
+                // Use escape() not encodeURIComponent — the original PopupWindow
+                // function uses escape() which preserves forward slashes in dates.
+                // encodeURIComponent encodes / to %2F which breaks erobay's lookup.
+                eventUrl = location.origin + '/calendar/Calcium40.pl?Op=PopupWindow'
+                    + '&Amount=Month&NavType=Absolute&Type=Block'
+                    + '&CalendarName=' + escape(calName)
+                    + '&Date=' + escape(dm[0])
+                    + '&ID=' + eventId
+                    + (source ? '&Source=' + escape(source) : '');
             }
 
             results.push({

@@ -284,13 +284,13 @@ def has_trained_models() -> bool:
 def filter_actionable(messages: list[dict]) -> list[dict]:
     """Filter messages to only actionable ones using trained classifier(s).
 
-    Uses the email classifier for Gmail, chat classifier for Discord/Telegram.
-    If no model exists for a platform, those messages pass through unfiltered.
+    Uses the email classifier for Gmail, chat classifier for Discord/Telegram/Signal.
+    Web messages pass through unfiltered — they're pre-curated event pages
+    from targeted sources, already filtered by DOM extraction, fingerprint
+    dedup, and dead-page detection before reaching this point.
     """
     has_email = EMAIL_MODEL_PATH.exists()
     has_chat = CHAT_MODEL_PATH.exists()
-
-    # Also check legacy single model
     has_legacy = _LEGACY_MODEL_PATH.exists()
 
     if not has_email and not has_chat and not has_legacy:
@@ -301,18 +301,24 @@ def filter_actionable(messages: list[dict]) -> list[dict]:
         )
         return messages
 
+    # Web messages are pre-curated event pages — skip classification
+    to_classify = [m for m in messages if m.get("platform") != "web"]
+    web_msgs = [m for m in messages if m.get("platform") == "web"]
+
+    if not to_classify:
+        return messages
+
     if has_legacy and not has_email and not has_chat:
-        # Use legacy single model
-        preds = predict(messages, model_path=_LEGACY_MODEL_PATH)
+        preds = predict(to_classify, model_path=_LEGACY_MODEL_PATH)
     else:
-        preds = predict(messages)
+        preds = predict(to_classify)
 
-    actionable = [m for m, is_act in zip(messages, preds) if is_act]
+    actionable = [m for m, is_act in zip(to_classify, preds) if is_act]
+    actionable.extend(web_msgs)
 
+    n_filtered = len(to_classify) - (len(actionable) - len(web_msgs))
     logger.info(
-        "Classifier: %d / %d messages are actionable (filtered %d noise).",
-        len(actionable),
-        len(messages),
-        len(messages) - len(actionable),
+        "Classifier: %d / %d actionable (filtered %d noise, %d web passthrough).",
+        len(actionable), len(messages), n_filtered, len(web_msgs),
     )
     return actionable

@@ -254,10 +254,15 @@ def extract_events_llm(
     total = len(messages)
     cap_total = caps.total if caps else 150
 
+    # Track rejections at each stage
+    rejects: dict[str, list[dict]] = {}
+
     # Stage 1: classifier filter (if trained models exist)
     if has_trained_models():
         after_clf = classifier_filter(messages)
         n_after_clf = len(after_clf)
+        clf_ids = {id(m) for m in after_clf}
+        rejects["classifier"] = [m for m in messages if id(m) not in clf_ids]
 
         # Stage 2: reranker if available, else score-based prioritize
         try:
@@ -267,11 +272,17 @@ def extract_events_llm(
             logger.warning("sentence-transformers not installed, falling back to regex priority.")
             reranked = sorted(after_clf, key=score_message, reverse=True)
 
+        reranked_ids = {id(m) for m in reranked}
+        rejects["reranker"] = [m for m in after_clf if id(m) not in reranked_ids]
+
         # Stage 3: per-source caps (if configured) — runs AFTER scoring
         if caps:
             filtered = prioritize_with_caps(reranked, caps)
         else:
             filtered = reranked[:cap_total]
+
+        filtered_ids = {id(m) for m in filtered}
+        rejects["caps"] = [m for m in reranked if id(m) not in filtered_ids]
 
         logger.info(
             "Event extraction: %d -> %d (classifier) -> %d (rerank/score) -> %d (caps) -> LLM (%s)",
@@ -283,10 +294,17 @@ def extract_events_llm(
             filtered = prioritize_with_caps(messages, caps)
         else:
             filtered = prioritize(messages, max_messages=cap_total)
+
+        filtered_ids = {id(m) for m in filtered}
+        rejects["caps"] = [m for m in messages if id(m) not in filtered_ids]
+
         logger.info(
             "Event extraction: %d -> %d messages (priority) -> LLM (%s)",
             total, len(filtered), cfg.display_name,
         )
+
+    # Stash rejects for callers that want them
+    extract_events_llm._last_rejects = rejects
 
     if cfg.backend == "local":
         return _extract_events_local(filtered, days_back, cfg)
@@ -325,6 +343,8 @@ def _extract_events_cloud(
 
     all_tasks: list[dict] = []
     raw_outputs: list[str] = []
+    llm_dropped: list[dict] = []
+    llm_no_events: list[dict] = []  # messages in batches that yielded 0 events
 
     def _process_batch_with_raw(batch):
         try:
@@ -337,21 +357,31 @@ def _extract_events_cloud(
                 max_tokens=4096,
             )
             _, tasks = _parse_event_ini(raw)
-            return tasks, raw
+            dropped = getattr(_parse_event_ini, "_last_dropped", [])
+            return tasks, raw, dropped, batch if not tasks else []
         except Exception as e:
             logger.error("Batch failed: %s", e)
-            return [], ""
+            return [], "", [{"title": "(batch error)", "reason": str(e)}], batch
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
         futures = [pool.submit(_process_batch_with_raw, b) for b in batches]
         for f in concurrent.futures.as_completed(futures):
-            tasks, raw = f.result()
+            tasks, raw, dropped, no_event_msgs = f.result()
             all_tasks.extend(tasks)
+            llm_dropped.extend(dropped)
+            llm_no_events.extend(no_event_msgs)
             if raw:
                 raw_outputs.append(raw)
 
     if not all_tasks and raw_outputs:
-        logger.warning("No events parsed. First batch raw output:\n%s", raw_outputs[0][:1000])
+        logger.warning(
+            "No events parsed. First batch raw output:\n%s",
+            raw_outputs[0][:1000],
+        )
+
+    # Stash LLM-stage rejects for --show-rejects
+    _extract_events_cloud._last_llm_dropped = llm_dropped
+    _extract_events_cloud._last_llm_no_events = llm_no_events
 
     # Deduplicate
     from event_harvester.event_match import dedup_events
@@ -411,6 +441,8 @@ def _parse_event_ini(raw: str) -> tuple[str, list[dict]]:
     """Parse INI-formatted LLM output into event dicts.
 
     Drops events with dates that resolve to the past.
+    Stashes dropped events in _parse_event_ini._last_dropped for
+    --show-rejects reporting.
     """
     import configparser
     from datetime import date as date_type
@@ -419,6 +451,7 @@ def _parse_event_ini(raw: str) -> tuple[str, list[dict]]:
     today = date_type.today()
     sections = _parse_llm_ini(raw)
     events = []
+    dropped: list[dict] = []
 
     for section_name, fields in sections.items():
         if not section_name.lower().startswith("event"):
@@ -441,6 +474,10 @@ def _parse_event_ini(raw: str) -> tuple[str, list[dict]]:
                 first_date = date_str.split(" to ")[0]
                 parsed = dateutil_parser.parse(first_date, fuzzy=True).date()
                 if parsed < today:
+                    dropped.append({
+                        "title": title, "date": date_str, "source": source,
+                        "reason": f"past date ({parsed.isoformat()})",
+                    })
                     continue
             except (ValueError, OverflowError):
                 pass
@@ -471,4 +508,5 @@ def _parse_event_ini(raw: str) -> tuple[str, list[dict]]:
             "due_in_days": None,
         })
 
+    _parse_event_ini._last_dropped = dropped
     return "", events

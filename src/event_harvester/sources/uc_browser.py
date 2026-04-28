@@ -32,6 +32,9 @@ Usage::
 """
 
 import logging
+import os
+import shutil
+import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -40,7 +43,111 @@ logger = logging.getLogger("event_harvester.uc_browser")
 
 _EXT_DIR = Path(__file__).resolve().parent.parent.parent.parent / "ext" / "uc_extension"
 _CHROME_PROFILE = Path("data/.chrome_profile").resolve()
+_NATIVE_PROFILE = Path("data/.native_chrome_profile").resolve()
 _STATE_FILE = Path("data/.playwright_state.json")
+
+
+def _find_real_chrome_profile() -> Path | None:
+    """Find the user's real Chrome profile directory."""
+    if sys.platform == "win32":
+        local = os.environ.get("LOCALAPPDATA", "")
+        if local:
+            p = Path(local) / "Google" / "Chrome" / "User Data"
+            if p.exists():
+                return p
+    else:
+        p = Path.home() / ".config" / "google-chrome"
+        if p.exists():
+            return p
+    return None
+
+
+def _is_chrome_running() -> bool:
+    """Check if Chrome is already running."""
+    import subprocess as sp
+
+    try:
+        if sys.platform == "win32":
+            result = sp.run(
+                ["tasklist", "/FI", "IMAGENAME eq chrome.exe", "/NH"],
+                capture_output=True, text=True, timeout=5,
+            )
+            return "chrome.exe" in result.stdout.lower()
+        else:
+            result = sp.run(["pgrep", "-x", "chrome"], capture_output=True, timeout=5)
+            return result.returncode == 0
+    except Exception:
+        return False
+
+
+_SKIP_DIRS = frozenset({
+    "Cache", "Code Cache", "GPUCache", "DawnGraphiteCache", "DawnWebGPUCache",
+    "Service Worker", "blob_storage", "File System", "IndexedDB",
+    "Session Storage", "Local Storage", "GCM Store",
+    "BrowserMetrics", "CdmStorage", "optimization_guide_prediction_model_downloads",
+})
+
+
+def _copy_chrome_auth(src_profile: Path, dst_dir: Path) -> None:
+    """Copy Chrome profile to a working directory for CDP use.
+
+    Copies the full Default profile minus large cache/storage directories.
+    Chrome needs a consistent profile state to start — partial copies crash.
+    """
+    # Top-level files (Local State has the encryption key)
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for item in src_profile.iterdir():
+        if item.is_file():
+            try:
+                shutil.copy2(str(item), str(dst_dir / item.name))
+            except Exception:
+                pass
+
+    # Default profile — full copy minus caches
+    default_src = src_profile / "Default"
+    default_dst = dst_dir / "Default"
+    if not default_src.exists():
+        return
+
+    default_dst.mkdir(parents=True, exist_ok=True)
+    for item in default_src.iterdir():
+        dst_item = default_dst / item.name
+        if item.name in _SKIP_DIRS:
+            continue
+        try:
+            if item.is_dir():
+                if not dst_item.exists():
+                    shutil.copytree(str(item), str(dst_item), dirs_exist_ok=True)
+            else:
+                shutil.copy2(str(item), str(dst_item))
+        except Exception:
+            pass  # skip locked/inaccessible files
+
+    logger.info("Copied Chrome profile to %s", dst_dir)
+
+
+def _inject_chrome_cookies(context) -> int:
+    """Inject cookies from the user's real Chrome into a Playwright context.
+
+    Uses rookiepy to decrypt Chrome cookies, converts to Playwright format,
+    and adds them to the context. Returns number of cookies injected.
+    """
+    try:
+        from event_harvester.sources.web_session import (
+            cookies_to_playwright,
+            get_chrome_cookies,
+        )
+
+        raw = get_chrome_cookies()
+        if not raw:
+            return 0
+        pw_cookies = cookies_to_playwright(raw)
+        context.add_cookies(pw_cookies)
+        logger.info("Injected %d cookies from Chrome.", len(pw_cookies))
+        return len(pw_cookies)
+    except Exception as e:
+        logger.debug("Cookie injection skipped: %s", e)
+        return 0
 
 
 class UCBrowser:
@@ -129,6 +236,17 @@ class UCBrowser:
                     *ext_args,
                 ],
             )
+            # Inject saved cookies from web_login (stored in .playwright_state.json)
+            if _STATE_FILE.exists():
+                try:
+                    import json
+                    state = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
+                    cookies = state.get("cookies", [])
+                    if cookies:
+                        self._context.add_cookies(cookies)
+                        logger.info("Injected %d cookies from saved session.", len(cookies))
+                except Exception as e:
+                    logger.debug("Cookie injection from state file skipped: %s", e)
         else:
             # Installed Chrome + logged-in profile (same as fetch_event_pages)
             _CHROME_PROFILE.parent.mkdir(parents=True, exist_ok=True)
@@ -152,7 +270,6 @@ class UCBrowser:
         No automation flags, real user profile, real extensions — Chrome
         runs exactly as the user would launch it, plus a debug port.
         """
-        import shutil
         import subprocess
         import time as _time
 
@@ -178,10 +295,16 @@ class UCBrowser:
             return
 
         port = 9222
-        # Use a copy of the real Chrome profile to avoid lock conflicts
-        real_profile = Path.home() / r"AppData\Local\Google\Chrome\User Data"
-        profile_dir = str(_CHROME_PROFILE.parent / ".native_chrome_profile")
+        # Chrome requires a non-default --user-data-dir for remote debugging,
+        # so we always copy auth files to a working directory.
+        real_profile = _find_real_chrome_profile()
+        profile_dir = str(_NATIVE_PROFILE)
         Path(profile_dir).mkdir(parents=True, exist_ok=True)
+        if real_profile:
+            _copy_chrome_auth(real_profile, Path(profile_dir))
+            logger.info("Copied Chrome auth to %s", profile_dir)
+        else:
+            logger.info("Real Chrome profile not found, using empty profile.")
 
         cmd = [
             chrome_path,
