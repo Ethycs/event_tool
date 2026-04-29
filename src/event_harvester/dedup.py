@@ -6,7 +6,7 @@ Uses event_match for structured comparison by title, date, location, and link.
 
 import logging
 
-from event_harvester.event_match import events_match, find_fingerprint
+from event_harvester.event_match import events_match, find_acted_fingerprint
 
 logger = logging.getLogger("event_harvester.dedup")
 
@@ -37,8 +37,10 @@ def dedup_events_against_ticktick(events, existing_tasks, reranker_model=None):
     to_create, to_update, to_skip = [], [], []
 
     for event in events:
-        # Check fingerprint first (fast)
-        fp = find_fingerprint(event)
+        # Skip only if the user has explicitly approved or declined this
+        # event before — auto-saved fingerprints (e.g. from web link
+        # dedup) shouldn't suppress events the user has never seen.
+        fp = find_acted_fingerprint(event)
         if fp:
             to_skip.append(event)
             continue

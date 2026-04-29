@@ -244,6 +244,12 @@ def extract_events_llm(
     If `caps` (CapConfig) is provided, applies per-source quotas before
     LLM extraction. Messages are scored first, then capped per source,
     so noisy sources can't crowd out high-signal ones.
+
+    Pipeline order: classifier -> per-source caps -> reranker -> LLM.
+    Caps run before the reranker so each source gets its quota of
+    candidates *before* global ranking trims to top_k. Reranking first
+    would let a noisy source monopolize the top-k and starve other
+    sources of any survivors regardless of their per-source cap.
     """
     if not cfg.is_configured:
         logger.warning("LLM not configured - skipping analysis.")
@@ -254,39 +260,35 @@ def extract_events_llm(
     total = len(messages)
     cap_total = caps.total if caps else 150
 
-    # Track rejections at each stage
     rejects: dict[str, list[dict]] = {}
 
-    # Stage 1: classifier filter (if trained models exist)
     if has_trained_models():
         after_clf = classifier_filter(messages)
         n_after_clf = len(after_clf)
         clf_ids = {id(m) for m in after_clf}
         rejects["classifier"] = [m for m in messages if id(m) not in clf_ids]
 
-        # Stage 2: reranker if available, else score-based prioritize
+        if caps:
+            after_caps = prioritize_with_caps(after_clf, caps)
+        else:
+            after_caps = sorted(after_clf, key=score_message, reverse=True)[:cap_total]
+
+        caps_ids = {id(m) for m in after_caps}
+        rejects["caps"] = [m for m in after_clf if id(m) not in caps_ids]
+
         try:
             from event_harvester.reranker import rerank_messages
-            reranked = rerank_messages(after_clf, top_k=cap_total)
+            filtered = rerank_messages(after_caps, top_k=cap_total)
         except ImportError:
             logger.warning("sentence-transformers not installed, falling back to regex priority.")
-            reranked = sorted(after_clf, key=score_message, reverse=True)
-
-        reranked_ids = {id(m) for m in reranked}
-        rejects["reranker"] = [m for m in after_clf if id(m) not in reranked_ids]
-
-        # Stage 3: per-source caps (if configured) — runs AFTER scoring
-        if caps:
-            filtered = prioritize_with_caps(reranked, caps)
-        else:
-            filtered = reranked[:cap_total]
+            filtered = sorted(after_caps, key=score_message, reverse=True)
 
         filtered_ids = {id(m) for m in filtered}
-        rejects["caps"] = [m for m in reranked if id(m) not in filtered_ids]
+        rejects["reranker"] = [m for m in after_caps if id(m) not in filtered_ids]
 
         logger.info(
-            "Event extraction: %d -> %d (classifier) -> %d (rerank/score) -> %d (caps) -> LLM (%s)",
-            total, n_after_clf, len(reranked), len(filtered), cfg.display_name,
+            "Event extraction: %d -> %d (classifier) -> %d (caps) -> %d (rerank/score) -> LLM (%s)",
+            total, n_after_clf, len(after_caps), len(filtered), cfg.display_name,
         )
     else:
         # No classifier — score, then per-source cap (or global cap)

@@ -23,6 +23,13 @@ def _normalize_date(date_val) -> str | None:
 
     Accepts ISO strings, free-text dates (parsed via dateutil), or None.
     Returns None if the date cannot be parsed — never returns junk.
+
+    Free-text guard: dateutil's fuzzy parser silently fabricates dates
+    from strings with stray digits ("Event 2" → today-month-02). We
+    parse twice with widely-spaced default years and require month and
+    day to agree between the two parses — disagreement means the value
+    came from the default rather than the input. Year may default
+    (so "April 27" still resolves to the current year).
     """
     if not date_val:
         return None
@@ -32,21 +39,35 @@ def _normalize_date(date_val) -> str | None:
     if not s:
         return None
 
-    # Fast path: already ISO
     try:
         return date.fromisoformat(s[:10]).isoformat()
     except ValueError:
         pass
 
-    # Slow path: parse free text via dateutil
     try:
+        from datetime import datetime
         from dateutil import parser as dateutil_parser
 
-        parsed = dateutil_parser.parse(s, fuzzy=True, default=None)
-        if parsed is None:
-            return None
-        return parsed.date().isoformat()
+        d_low = dateutil_parser.parse(s, fuzzy=True, default=datetime(1900, 1, 1))
+        d_high = dateutil_parser.parse(s, fuzzy=True, default=datetime(2099, 12, 31))
     except (ValueError, OverflowError, TypeError):
+        return None
+
+    if d_low.month != d_high.month or d_low.day != d_high.day:
+        return None
+
+    if d_low.year == d_high.year:
+        year = d_low.year
+    elif d_low.year == 1900 and d_high.year == 2099:
+        year = date.today().year
+    else:
+        return None
+
+    if year < 2000 or year > 2100:
+        return None
+    try:
+        return date(year, d_low.month, d_low.day).isoformat()
+    except ValueError:
         return None
 
 
@@ -187,11 +208,26 @@ def load_fingerprints() -> list[dict]:
     return pruned
 
 
-def save_fingerprint(event: dict, ticktick_id: str | None = None) -> None:
+def save_fingerprint(
+    event: dict,
+    ticktick_id: str | None = None,
+    *,
+    status: str = "auto",
+) -> None:
     """Add a fingerprint for an event to the store.
 
     Dates are normalized to ISO YYYY-MM-DD on write so the pruning logic
     in load_fingerprints() can correctly drop expired entries.
+
+    `status` records *why* the entry was saved:
+      - "auto"      — saved during a fetch/extract pass (e.g. web link
+                      dedup); should NOT cause future events to be hidden
+                      from the user.
+      - "approved"  — user clicked Approve in the UI.
+      - "declined"  — user clicked Decline in the UI.
+
+    Only "approved" and "declined" entries cause `find_acted_fingerprint`
+    to filter — auto entries serve as cheap pre-fetch dedup hints only.
     """
     fps = load_fingerprints()
 
@@ -202,6 +238,7 @@ def save_fingerprint(event: dict, ticktick_id: str | None = None) -> None:
         "location": event.get("location"),
         "link": event.get("link"),
         "ticktick_id": ticktick_id,
+        "status": status,
         "created_at": date.today().isoformat(),
     }
 
@@ -209,10 +246,37 @@ def save_fingerprint(event: dict, ticktick_id: str | None = None) -> None:
     save_json(FINGERPRINT_FILE, fps)
 
 
+_ACTED_STATUSES = frozenset({"approved", "declined"})
+
+
 def find_fingerprint(event: dict) -> dict | None:
-    """Find a matching fingerprint for the given event."""
+    """Find a matching fingerprint for the given event.
+
+    Matches against ALL stored fingerprints regardless of status — used
+    for pre-fetch link dedup in web sources, where any prior sighting is
+    a useful skip hint.
+    """
     fps = load_fingerprints()
     for fp in fps:
+        is_match, score = events_match(event, fp)
+        if is_match:
+            return fp
+    return None
+
+
+def find_acted_fingerprint(event: dict) -> dict | None:
+    """Find a matching fingerprint, but only if the user has acted on it.
+
+    Returns the fingerprint only when its status is "approved" or
+    "declined" — i.e. the user has explicitly confirmed they have seen
+    this event. Auto-saved entries (web link dedup, etc.) are ignored.
+
+    Use this for the user-visible "hide previously seen events" filter.
+    """
+    fps = load_fingerprints()
+    for fp in fps:
+        if fp.get("status") not in _ACTED_STATUSES:
+            continue
         is_match, score = events_match(event, fp)
         if is_match:
             return fp

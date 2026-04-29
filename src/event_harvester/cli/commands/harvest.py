@@ -237,7 +237,7 @@ def _print_events(events: list[dict], cfg) -> None:
     Events without parseable dates are listed under a TBD section
     at the bottom of each source group.
     """
-    from event_harvester.event_match import _normalize_date, find_fingerprint
+    from event_harvester.event_match import _normalize_date, find_acted_fingerprint
 
     def _print_event(idx: int, t: dict) -> None:
         title = t.get("title") or "Untitled"
@@ -247,8 +247,8 @@ def _print_events(events: list[dict], cfg) -> None:
         source = t.get("source") or ""
         notes = t.get("notes") or ""
 
-        fp = find_fingerprint(t)
-        status = "known" if fp else "new"
+        fp = find_acted_fingerprint(t)
+        status = (fp.get("status") if fp else None) or "new"
 
         print(f"  [{idx}] {BOLD}{title}{RESET} {DIM}({status}){RESET}")
         if date_str:

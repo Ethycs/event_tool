@@ -115,6 +115,28 @@ class WebConfig:
     sources_file: str = "data/web_sources.json"
     max_events: int = 30
     timeout_ms: int = 30000
+    no_cooldown: bool = False  # if True, ignore per-source cooldowns
+
+
+@dataclass
+class SourceConfig:
+    """Per-source enable flags. Used by the UI; CLI still has --only/--skip
+    which override these for one run."""
+    discord: bool = True
+    telegram: bool = True
+    gmail: bool = True
+    signal: bool = True
+    web: bool = True
+
+    def to_no_kwargs(self) -> dict[str, bool]:
+        """Translate to the no_<source> kwargs harvest_messages expects."""
+        return {
+            "no_discord": not self.discord,
+            "no_telegram": not self.telegram,
+            "no_gmail": not self.gmail,
+            "no_signal": not self.signal,
+            "no_web": not self.web,
+        }
 
 
 @dataclass
@@ -134,8 +156,14 @@ class CapConfig:
     group_by_source: bool = False  # if True, output is bucketed by source
 
     def get(self, platform: str) -> int:
-        """Look up cap for a platform name (case-insensitive)."""
-        return getattr(self, platform.lower(), self.total)
+        """Look up cap for a platform name (case-insensitive).
+
+        Unknown platforms fall back to the web cap rather than the global
+        total, since web_fetch tags messages with sub-source names
+        (luma, instagram, eventbrite, ...) that aren't core attributes
+        but should still respect a per-source ceiling.
+        """
+        return getattr(self, platform.lower(), self.web)
 
 
 @dataclass
@@ -148,7 +176,12 @@ class AppConfig:
     ticktick: TickTickConfig = field(default_factory=TickTickConfig)
     web: WebConfig = field(default_factory=WebConfig)
     caps: CapConfig = field(default_factory=CapConfig)
+    sources: SourceConfig = field(default_factory=SourceConfig)
     days_back: int = 7
+
+    # Pipeline behavior toggles (UI-controllable)
+    skip_analyze: bool = False  # skip LLM extraction, return raw harvest
+    dry_run: bool = False       # never create real TickTick tasks
 
     # Obsidian output
     obsidian_events_dir: str = ""
@@ -217,6 +250,7 @@ def load_config() -> AppConfig:
             sources_file=os.getenv("WEB_SOURCES_FILE", "data/web_sources.json"),
             max_events=int(os.getenv("WEB_MAX_EVENTS", "30")),
             timeout_ms=int(os.getenv("WEB_TIMEOUT_MS", "30000")),
+            no_cooldown=os.getenv("WEB_NO_COOLDOWN", "").lower() in ("1", "true", "yes"),
         ),
         caps=CapConfig(
             discord=int(os.getenv("CAP_DISCORD", "50")),
@@ -227,6 +261,15 @@ def load_config() -> AppConfig:
             total=int(os.getenv("CAP_TOTAL", "150")),
             group_by_source=os.getenv("CAP_GROUP_BY_SOURCE", "").lower() in ("1", "true", "yes"),
         ),
+        sources=SourceConfig(
+            discord=os.getenv("SOURCE_DISCORD", "1").lower() not in ("0", "false", "no"),
+            telegram=os.getenv("SOURCE_TELEGRAM", "1").lower() not in ("0", "false", "no"),
+            gmail=os.getenv("SOURCE_GMAIL", "1").lower() not in ("0", "false", "no"),
+            signal=os.getenv("SOURCE_SIGNAL", "1").lower() not in ("0", "false", "no"),
+            web=os.getenv("SOURCE_WEB", "1").lower() not in ("0", "false", "no"),
+        ),
+        skip_analyze=os.getenv("SKIP_ANALYZE", "").lower() in ("1", "true", "yes"),
+        dry_run=os.getenv("DRY_RUN", "").lower() in ("1", "true", "yes"),
         obsidian_events_dir=os.getenv("OBSIDIAN_EVENTS_DIR", ""),
         obsidian_recruiters_dir=os.getenv("OBSIDIAN_RECRUITERS_DIR", ""),
         days_back=days_back,
