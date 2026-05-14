@@ -127,6 +127,7 @@ async def harvest_messages(
             "max_events": cfg.web.max_events,
             "timeout_ms": cfg.web.timeout_ms,
             "no_cooldown": no_cooldown,
+            "parallel": cfg.web.parallel,
         }
         # Merge filter sources: explicit `web_sources` list wins, then
         # the single-name `web_source` (back-compat shim), then

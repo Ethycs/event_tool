@@ -119,6 +119,11 @@ class WebConfig:
     # Names of web sub-sources to restrict to (empty = all). Set by a
     # profile, the --web-source CLI flag, or the WEB_SOURCE_NAMES env var.
     selected_names: list[str] = field(default_factory=list)
+    # How many parallel UCBrowser instances to run for non-Cloudflare
+    # ("standard") web sources. Each costs ~200-300MB; Cloudflare-protected
+    # sources (native_chrome=True) stay serial regardless. 1 = single
+    # browser (old behavior).
+    parallel: int = 3
 
 
 @dataclass
@@ -256,6 +261,7 @@ def load_config() -> AppConfig:
             timeout_ms=int(os.getenv("WEB_TIMEOUT_MS", "30000")),
             no_cooldown=os.getenv("WEB_NO_COOLDOWN", "").lower() in ("1", "true", "yes"),
             selected_names=_parse_csv_env("WEB_SOURCE_NAMES"),
+            parallel=max(1, int(os.getenv("WEB_PARALLEL", "3"))),
         ),
         caps=CapConfig(
             discord=int(os.getenv("CAP_DISCORD", "50")),

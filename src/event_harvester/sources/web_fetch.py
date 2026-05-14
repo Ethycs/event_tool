@@ -779,16 +779,37 @@ def _do_chat(uc, src: dict) -> list[dict]:
 
 # ── Unified entry point ──────────────────────────────────────────────
 
+def _chunk_sources(sources: list[dict], n: int) -> list[list[dict]]:
+    """Split ``sources`` into ``n`` round-robin chunks of similar size.
+
+    Used to dispatch the standard (non-Cloudflare) sources across
+    ``n`` parallel UCBrowser instances. Round-robin balances the slow
+    feed/calendar sources across workers rather than dumping them all
+    on one. Empty chunks are dropped from the result.
+    """
+    if not sources or n <= 1:
+        return [list(sources)] if sources else []
+    n = min(n, len(sources))
+    out: list[list[dict]] = [[] for _ in range(n)]
+    for i, src in enumerate(sources):
+        out[i % n].append(src)
+    return [c for c in out if c]
+
+
 def fetch_web_sources(
     sources: list[dict] | None = None,
     max_events: int = 30,
     timeout_ms: int = 30000,
     no_cooldown: bool = False,
+    parallel: int = 1,
 ) -> list[dict]:
     """Fetch events from all configured web sources.
 
-    Groups sources by headless/visible, launches one UCBrowser per group,
-    dispatches each source to its mode handler.
+    Standard (non-Cloudflare) sources are split across ``parallel``
+    UCBrowser instances running concurrently; Cloudflare-protected
+    sources (``native_chrome: true``) stay in a single serial group to
+    keep request rates low. Setting ``parallel=1`` restores the
+    one-browser-for-everything behavior.
     """
     if sources is None:
         sources = _load_web_sources()
@@ -890,10 +911,24 @@ def fetch_web_sources(
                     logger.error("Failed %s (%s): %s", name, mode, e)
         return messages, cf_retries
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+    # Split standard sources across ``parallel`` UCBrowsers; native_chrome
+    # stays in one bucket. Each chunk runs in its own worker thread with
+    # its own Playwright instance.
+    standard_chunks = _chunk_sources(standard_srcs, parallel)
+    worker_count = len(standard_chunks) + (1 if native_srcs else 0)
+    if worker_count <= 0:
+        return []
+    if len(standard_chunks) > 1:
+        logger.info(
+            "Web fetch: %d standard source(s) across %d parallel browser(s); "
+            "%d native_chrome source(s) serial.",
+            len(standard_srcs), len(standard_chunks), len(native_srcs),
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as pool:
         futures = []
-        if standard_srcs:
-            futures.append(pool.submit(_process_group, standard_srcs))
+        for chunk in standard_chunks:
+            futures.append(pool.submit(_process_group, chunk))
         if native_srcs:
             futures.append(pool.submit(_process_group, native_srcs, native_chrome=True))
 
