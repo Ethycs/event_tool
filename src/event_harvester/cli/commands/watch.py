@@ -3,6 +3,7 @@
 import logging
 
 from event_harvester.cli.parse_helpers import resolve_platforms
+from event_harvester.profiles import apply_profile_by_name
 from event_harvester.watch import watch_mode
 
 logger = logging.getLogger("event_harvester")
@@ -10,6 +11,10 @@ logger = logging.getLogger("event_harvester")
 
 async def watch_cmd(args, cfg) -> int:
     """Run watch mode. Currently supports Discord and Telegram only."""
+    if getattr(args, "profile", None):
+        if not apply_profile_by_name(cfg, args.profile):
+            return 2
+
     platform_kwargs = resolve_platforms(args.only, args.skip)
     no_telegram = platform_kwargs["no_telegram"]
     no_discord = platform_kwargs["no_discord"]

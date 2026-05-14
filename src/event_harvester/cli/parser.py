@@ -8,6 +8,7 @@ Subcommand structure:
     event-harvester recruiters grade|reparse FILE
     event-harvester classifier train|eval --labels FILE
     event-harvester serve
+    event-harvester mcp [--transport stdio|streamable-http]
 
 Bare invocation `event-harvester --days 14 --skip web` is normalized
 to `event-harvester harvest --days 14 --skip web` BEFORE argparse runs
@@ -87,6 +88,10 @@ def _add_harvest_args(p: argparse.ArgumentParser) -> None:
         "--no-cooldown", action="store_true",
         help="Ignore web source cooldowns (force re-fetch)",
     )
+    p.add_argument(
+        "--profile", metavar="NAME",
+        help="Apply a named profile from data/profiles.json before per-flag overrides",
+    )
 
     p.add_argument(
         "--report", nargs="?", const="events_report.md", default=None,
@@ -162,6 +167,10 @@ def build_parser() -> argparse.ArgumentParser:
     src_w = p_watch.add_mutually_exclusive_group()
     src_w.add_argument("--only", type=parse_platform_csv, default=None, metavar="PLATFORMS")
     src_w.add_argument("--skip", type=parse_platform_csv, default=None, metavar="PLATFORMS")
+    p_watch.add_argument(
+        "--profile", metavar="NAME",
+        help="Apply a named profile from data/profiles.json",
+    )
     _add_root_flags(p_watch)
 
     # ── web ──
@@ -293,6 +302,40 @@ def build_parser() -> argparse.ArgumentParser:
     src_s = p_serve.add_mutually_exclusive_group()
     src_s.add_argument("--only", type=parse_platform_csv, default=None, metavar="PLATFORMS")
     src_s.add_argument("--skip", type=parse_platform_csv, default=None, metavar="PLATFORMS")
+    p_serve.add_argument(
+        "--profile", metavar="NAME",
+        help="Apply a named profile from data/profiles.json on launch",
+    )
     _add_root_flags(p_serve)
+
+    # ── MCP ──
+    p_mcp = sub.add_parser(
+        "mcp",
+        help="Run the Model Context Protocol server",
+        description="Expose Event Harvester tools and resources to MCP clients.",
+    )
+    p_mcp.add_argument(
+        "--transport",
+        choices=["stdio", "streamable-http"],
+        default="stdio",
+        help="MCP transport to use (default: stdio)",
+    )
+    p_mcp.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host for streamable-http transport (default: 127.0.0.1)",
+    )
+    p_mcp.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="Port for streamable-http transport (default: 8765)",
+    )
+    p_mcp.add_argument(
+        "--path",
+        default="/mcp",
+        help="HTTP path for streamable-http transport (default: /mcp)",
+    )
+    _add_root_flags(p_mcp)
 
     return parser

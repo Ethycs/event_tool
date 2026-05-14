@@ -39,6 +39,7 @@ async def harvest_messages(
     no_web: bool = False,
     skip_cache: bool = False,
     web_source: str | None = None,
+    web_sources: list[str] | None = None,
     no_cooldown: bool = False,
 ) -> list[dict]:
     """Fetch messages from sources, with auto-caching.
@@ -127,14 +128,34 @@ async def harvest_messages(
             "timeout_ms": cfg.web.timeout_ms,
             "no_cooldown": no_cooldown,
         }
-        if web_source:
+        # Merge filter sources: explicit `web_sources` list wins, then
+        # the single-name `web_source` (back-compat shim), then
+        # `cfg.web.selected_names` from env/profile.
+        filter_names: list[str] = []
+        if web_sources:
+            filter_names = list(web_sources)
+        elif web_source:
+            filter_names = [web_source]
+        elif cfg.web.selected_names:
+            filter_names = list(cfg.web.selected_names)
+        if filter_names:
             from event_harvester.sources.web_fetch import _load_web_sources
             all_web = _load_web_sources()
-            matched = [s for s in all_web if s.get("name", "").lower() == web_source.lower()]
+            wanted = {n.lower() for n in filter_names}
+            matched = [s for s in all_web if s.get("name", "").lower() in wanted]
             if not matched:
                 names = ", ".join(s.get("name", s["url"]) for s in all_web)
-                logger.warning("Web source '%s' not found. Available: %s", web_source, names)
+                logger.warning(
+                    "Web sources %s not found. Available: %s",
+                    filter_names, names,
+                )
             else:
+                missing = wanted - {s.get("name", "").lower() for s in matched}
+                if missing:
+                    logger.warning(
+                        "Profile lists web sources not in %s: %s",
+                        cfg.web.sources_file, sorted(missing),
+                    )
                 web_kw["sources"] = matched
         web_msgs = fetch_web_sources(**web_kw)
         messages.extend(web_msgs)

@@ -14,6 +14,7 @@ from collections import defaultdict
 from event_harvester.analysis import extract_events_llm
 from event_harvester.cli.parse_helpers import apply_caps_to_config, resolve_platforms
 from event_harvester.config import validate_config
+from event_harvester.profiles import apply_profile_by_name as _apply_profile_by_name
 from event_harvester.display import (
     BOLD,
     DIM,
@@ -37,6 +38,12 @@ async def harvest_cmd(args, cfg) -> int:
     # Apply CLI overrides to config
     if args.days is not None:
         cfg.days_back = args.days
+
+    # Apply profile FIRST so explicit --cap / --web-source flags below win.
+    if getattr(args, "profile", None):
+        if not _apply_profile_by_name(cfg, args.profile):
+            return 2
+
     apply_caps_to_config(cfg, args.cap)
     if args.group_by_source:
         cfg.caps.group_by_source = True

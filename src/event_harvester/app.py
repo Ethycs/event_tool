@@ -19,6 +19,7 @@ from typing import Awaitable, Callable, Optional
 import flet as ft
 
 from event_harvester.event_match import find_acted_fingerprint, save_fingerprint
+from event_harvester.profiles import apply_profile, find_profile, load_profiles
 
 logger = logging.getLogger("event_harvester.app")
 
@@ -181,6 +182,14 @@ class EventsApp:
         self._stage_rows: dict[str, ft.Row] = {}
         self._log_column = None
         self._cap_fields: dict[str, ft.TextField] = {}
+        self._no_cap_checkbox: Optional[ft.Checkbox] = None
+        self._cap_refresh_button: Optional[ft.FilledTonalButton] = None
+        self._profile_dropdown: Optional[ft.Dropdown] = None
+        self._profiles_cache: list = []
+        self._active_profile_name: Optional[str] = None
+        # Snapshot of cap field strings taken when "No cap" is toggled
+        # ON, so the previous values can be restored on toggle OFF.
+        self._cap_field_cache: Optional[dict[str, str]] = None
         self._source_checkboxes: dict[str, ft.Checkbox] = {}
         self._days_field: Optional[ft.TextField] = None
         self._behavior_checkboxes: dict[str, ft.Checkbox] = {}
@@ -283,6 +292,36 @@ class EventsApp:
 
     def _on_search_change(self, e):
         self._rebuild_cards()
+
+    def _on_no_cap_toggle(self, e) -> None:
+        """Toggle cap-field disabled state and swap values with the
+        unlimited sentinel.
+
+        Toggling ON: snapshot current field strings into the cache,
+        then set every field to "-1" so the unlimited state is visible.
+        Toggling OFF: restore the snapshot if we have one.
+        """
+        no_cap = bool(self._no_cap_checkbox.value) if self._no_cap_checkbox else False
+        running = self._state in ("running", "paused")
+
+        if no_cap:
+            if self._cap_field_cache is None:
+                self._cap_field_cache = {
+                    key: (f.value or "") for key, f in self._cap_fields.items()
+                }
+            for f in self._cap_fields.values():
+                f.value = "-1"
+        else:
+            if self._cap_field_cache is not None:
+                for key, f in self._cap_fields.items():
+                    cached = self._cap_field_cache.get(key)
+                    if cached is not None:
+                        f.value = cached
+                self._cap_field_cache = None
+
+        for f in self._cap_fields.values():
+            f.disabled = no_cap or running
+        self._refresh_page()
 
     def _filtered_events(self) -> list[dict]:
         status = self._status_filter.value if self._status_filter else "All"
@@ -431,23 +470,20 @@ class EventsApp:
 
             if stage == "llm_past":
                 rows = []
-                for ev in items[:50]:
+                for ev in items:
                     rows.append(ft.Text(
                         f"{ev.get('title', '?')} — {ev.get('date', '?')} ({ev.get('reason', '?')})",
                         size=12, color=ft.Colors.ON_SURFACE_VARIANT,
+                        selectable=True,
                     ))
             else:
                 rows = []
-                for m in items[:50]:
+                for m in items:
                     snippet = (m.get("content") or "")[:100].replace("\n", " ")
                     rows.append(ft.Text(
                         f"{m.get('author', '?')}: {snippet}",
                         size=12, color=ft.Colors.ON_SURFACE_VARIANT,
-                    ))
-                if len(items) > 50:
-                    rows.append(ft.Text(
-                        f"... and {len(items) - 50} more",
-                        size=12, italic=True,
+                        selectable=True,
                     ))
 
             panels.append(ft.ExpansionPanel(
@@ -518,6 +554,103 @@ class EventsApp:
 
     # ── View rendering ──────────────────────────────────────────────────
 
+    def _build_profile_row(self) -> ft.Row:
+        """Profile picker row, mounted at the top of the config card."""
+        try:
+            self._profiles_cache = load_profiles()
+        except Exception as e:
+            logger.warning("Failed to load profiles: %s", e)
+            self._profiles_cache = []
+
+        # Auto-match against the currently-applied web_sources so a
+        # --profile CLI invocation shows up pre-selected in the UI.
+        if self._active_profile_name is None and self.cfg.web.selected_names:
+            current = {s.lower() for s in self.cfg.web.selected_names}
+            for p in self._profiles_cache:
+                if {s.lower() for s in p.web_sources} == current:
+                    self._active_profile_name = p.name
+                    break
+
+        options = [ft.dropdown.Option("(custom)")]
+        for p in self._profiles_cache:
+            options.append(ft.dropdown.Option(p.name))
+
+        self._profile_dropdown = ft.Dropdown(
+            label="Profile",
+            value=self._active_profile_name or "(custom)",
+            options=options,
+            width=220,
+            dense=True,
+            on_select=self._on_profile_select,
+        )
+
+        # Static description text, updated in _on_profile_select
+        active = next(
+            (p for p in self._profiles_cache if p.name == self._active_profile_name),
+            None,
+        )
+        desc_text = ft.Text(
+            active.description if active else "Hand-edit data/profiles.json to add more.",
+            size=11,
+            italic=True,
+            color=ft.Colors.OUTLINE,
+        )
+
+        return ft.Row(
+            [self._profile_dropdown, desc_text],
+            spacing=12,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+
+    def _on_profile_select(self, e) -> None:
+        if self._profile_dropdown is None:
+            return
+        value = self._profile_dropdown.value or "(custom)"
+        if value == "(custom)":
+            self._active_profile_name = None
+            # Leave cfg as-is; user edits caps freely.
+            return
+        profile = find_profile(self._profiles_cache, value)
+        if profile is None:
+            logger.warning("Profile %r vanished from cache", value)
+            return
+        # Read whatever the user typed BEFORE applying the profile, so
+        # source toggles / days / behavior flags they edited are kept.
+        if self._cap_fields:
+            self._read_config_from_fields()
+        apply_profile(self.cfg, profile)
+        self._active_profile_name = profile.name
+        # Re-render the current view so the new cap values and web-source
+        # label show up in the form.
+        if self._pipeline_done:
+            self._render_events_view()
+        else:
+            self._render_progress_view()
+
+    def _build_caps_header_row(self) -> ft.Row:
+        """The 'Per-source caps' label row + No-cap checkbox + Refresh."""
+        self._cap_refresh_button = ft.FilledTonalButton(
+            "Refresh",
+            icon=ft.Icons.REFRESH,
+            on_click=self._start_clicked,
+            tooltip="Apply current caps and re-run the pipeline.",
+        )
+        return ft.Row(
+            [
+                ft.Text(
+                    "Per-source caps",
+                    size=12,
+                    weight=ft.FontWeight.BOLD,
+                    color=ft.Colors.OUTLINE,
+                ),
+                self._no_cap_checkbox,
+                ft.Container(expand=True),
+                self._cap_refresh_button,
+            ],
+            spacing=12,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+
     def _build_config_section(self) -> ft.Container:
         """Build the per-source caps + days/sources/behavior config card.
 
@@ -537,16 +670,33 @@ class EventsApp:
         ]
         cap_field_controls = []
         for key, label in cap_specs:
-            current = getattr(self.cfg.caps, key, 0)
+            # When no_cap is on, show "-1" in every field so the user
+            # sees the unlimited state explicitly. Otherwise show the
+            # configured value.
+            if self.cfg.caps.no_cap:
+                display = "-1"
+            else:
+                display = str(getattr(self.cfg.caps, key, 0))
             field = ft.TextField(
                 label=label,
-                value=str(current),
+                value=display,
                 width=110,
                 text_align=ft.TextAlign.CENTER,
                 dense=True,
+                disabled=self.cfg.caps.no_cap,
             )
             self._cap_fields[key] = field
             cap_field_controls.append(field)
+
+        # No-cap checkbox — when on, all six fields above are bypassed
+        # (no per-source or total trimming) and visually disabled.
+        self._no_cap_checkbox = ft.Checkbox(
+            label="No cap (run full set)",
+            value=self.cfg.caps.no_cap,
+            on_change=self._on_no_cap_toggle,
+            tooltip="Bypass per-source and global caps. "
+                    "Tip: set -1 in any single field to remove just that cap.",
+        )
 
         self._days_field = ft.TextField(
             label="Days back",
@@ -601,6 +751,15 @@ class EventsApp:
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
 
+        web_names = list(self.cfg.web.selected_names)
+        web_label = ft.Text(
+            f"Web sources: {', '.join(web_names) if web_names else 'all'}",
+            size=11,
+            italic=True,
+            color=ft.Colors.OUTLINE,
+            selectable=True,
+        )
+
         return ft.Container(
             content=ft.Column(
                 [
@@ -610,20 +769,18 @@ class EventsApp:
                         weight=ft.FontWeight.BOLD,
                         color=ft.Colors.OUTLINE,
                     ),
+                    self._build_profile_row(),
+                    ft.Divider(height=1),
                     toggles_row,
                     ft.Divider(height=1),
-                    ft.Text(
-                        "Per-source caps",
-                        size=12,
-                        weight=ft.FontWeight.BOLD,
-                        color=ft.Colors.OUTLINE,
-                    ),
+                    self._build_caps_header_row(),
                     ft.Row(
                         cap_field_controls,
                         spacing=8,
                         scroll=ft.ScrollMode.AUTO,
                         vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
+                    web_label,
                 ],
                 spacing=8,
             ),
@@ -904,15 +1061,19 @@ class EventsApp:
         """Pull current UI-control values into cfg.
 
         Covers: per-source caps, days_back, source enable flags, web
-        cooldown bypass, skip-analyze, dry-run. Called on Start so the
-        next pipeline run honors any UI edits.
+        cooldown bypass, skip-analyze, dry-run, no-cap. Called on Start
+        so the next pipeline run honors any UI edits.
         """
+        if self._no_cap_checkbox is not None:
+            self.cfg.caps.no_cap = bool(self._no_cap_checkbox.value)
+
         for key, field in self._cap_fields.items():
             try:
                 value = int((field.value or "").strip())
             except (TypeError, ValueError):
                 continue
-            if value < 0:
+            # -1 is the "unlimited" sentinel; reject anything below that.
+            if value < -1:
                 continue
             setattr(self.cfg.caps, key, value)
 
@@ -1012,14 +1173,23 @@ class EventsApp:
         stop_btn.disabled = not (running or paused)
         # Config controls are editable only when not actively running.
         frozen = running or paused
+        no_cap_on = bool(self._no_cap_checkbox.value) if self._no_cap_checkbox else False
+        # Cap text fields stay disabled when no_cap is on (even while idle)
+        # so the user can see they're inert.
         for f in self._cap_fields.values():
-            f.disabled = frozen
+            f.disabled = frozen or no_cap_on
         for cb in self._source_checkboxes.values():
             cb.disabled = frozen
         for cb in self._behavior_checkboxes.values():
             cb.disabled = frozen
+        if self._no_cap_checkbox is not None:
+            self._no_cap_checkbox.disabled = frozen
         if self._days_field is not None:
             self._days_field.disabled = frozen
+        if self._cap_refresh_button is not None:
+            self._cap_refresh_button.disabled = frozen
+        if self._profile_dropdown is not None:
+            self._profile_dropdown.disabled = frozen
         self._refresh_page()
 
     # ── Entry point ─────────────────────────────────────────────────────

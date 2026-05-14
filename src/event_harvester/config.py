@@ -116,6 +116,9 @@ class WebConfig:
     max_events: int = 30
     timeout_ms: int = 30000
     no_cooldown: bool = False  # if True, ignore per-source cooldowns
+    # Names of web sub-sources to restrict to (empty = all). Set by a
+    # profile, the --web-source CLI flag, or the WEB_SOURCE_NAMES env var.
+    selected_names: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -154,6 +157,7 @@ class CapConfig:
     web: int = 30
     total: int = 150           # global ceiling after per-source caps
     group_by_source: bool = False  # if True, output is bucketed by source
+    no_cap: bool = False       # if True, all per-source and total caps are bypassed
 
     def get(self, platform: str) -> int:
         """Look up cap for a platform name (case-insensitive).
@@ -251,6 +255,7 @@ def load_config() -> AppConfig:
             max_events=int(os.getenv("WEB_MAX_EVENTS", "30")),
             timeout_ms=int(os.getenv("WEB_TIMEOUT_MS", "30000")),
             no_cooldown=os.getenv("WEB_NO_COOLDOWN", "").lower() in ("1", "true", "yes"),
+            selected_names=_parse_csv_env("WEB_SOURCE_NAMES"),
         ),
         caps=CapConfig(
             discord=int(os.getenv("CAP_DISCORD", "50")),

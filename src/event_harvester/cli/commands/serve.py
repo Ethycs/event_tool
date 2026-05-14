@@ -11,6 +11,7 @@ import logging
 from event_harvester.analysis import extract_events_llm
 from event_harvester.cli.parse_helpers import resolve_platforms
 from event_harvester.event_match import find_acted_fingerprint
+from event_harvester.profiles import apply_profile_by_name
 
 logger = logging.getLogger("event_harvester")
 
@@ -27,6 +28,12 @@ async def serve_cmd(args, cfg) -> int:
         cfg.sources.gmail = not no_kwargs["no_gmail"]
         cfg.sources.signal = not no_kwargs["no_signal"]
         cfg.sources.web = not no_kwargs["no_web"]
+
+    # Apply profile (if any) before launching the UI so the dropdown
+    # starts on the right entry and caps/web_sources reflect the choice.
+    if getattr(args, "profile", None):
+        if not apply_profile_by_name(cfg, args.profile):
+            return 2
 
     async def run_pipeline(reporter, app) -> None:
         from event_harvester.harvest import harvest_messages

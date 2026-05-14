@@ -77,7 +77,11 @@ def build_prompt(messages: list[dict], days_back: int) -> str:
             hint_str = f" ({'; '.join(hints)})" if hints else ""
             lines.append(f"  [{ts}] {author}:{hint_str} {content}")
         lines.append("")
-    return "\n".join(lines)
+    # Escape every literal '%' so a downstream printf-style formatter
+    # (litellm / httpx logging path) doesn't choke on values like
+    # '% OFF', URL-encoded fragments ('%3A'), etc. Doubled '%%' collapses
+    # back to '%' on printf and the LLM tolerates the doubling otherwise.
+    return "\n".join(lines).replace("%", "%%")
 
 
 _EVENT_EXTRACTION_PROMPT = """\
@@ -155,7 +159,18 @@ def prioritize_with_caps(messages: list[dict], caps) -> list[dict]:
     This prevents noisy sources (e.g., 500 Telegram messages) from
     crowding out high-signal events from quieter sources (e.g., 6 web
     events).
+
+    If `caps.no_cap` is set, all per-source and total trimming is
+    bypassed — messages are still scored and sorted (so the LLM gets
+    the highest-signal items first) but every message survives.
     """
+    if getattr(caps, "no_cap", False):
+        logger.info(
+            "no_cap=True: skipping per-source and global caps (%d messages).",
+            len(messages),
+        )
+        return sorted(messages, key=score_message, reverse=True)
+
     from collections import defaultdict
 
     # Bucket by platform
@@ -164,25 +179,34 @@ def prioritize_with_caps(messages: list[dict], caps) -> list[dict]:
         platform = (m.get("platform") or "unknown").lower()
         buckets[platform].append(m)
 
-    # Score-then-cap per bucket
+    # Score-then-cap per bucket. A negative cap (e.g. -1) means
+    # "unlimited for this source" — keep all messages in the bucket.
     capped_buckets: dict[str, list[dict]] = {}
     for platform, msgs in buckets.items():
         scored = sorted(msgs, key=score_message, reverse=True)
         cap = caps.get(platform)
-        kept = scored[:cap]
+        if cap < 0:
+            kept = scored
+        else:
+            kept = scored[:cap]
         capped_buckets[platform] = kept
-        if len(scored) > cap:
+        if cap >= 0 and len(scored) > cap:
             logger.info(
                 "  %s: %d -> %d (per-source cap)", platform, len(scored), cap,
             )
+        elif cap < 0:
+            logger.info(
+                "  %s: %d (no cap)", platform, len(scored),
+            )
 
-    # Merge and re-sort by score, then apply global ceiling
+    # Merge and re-sort by score, then apply global ceiling.
+    # A negative caps.total means "no global ceiling".
     merged: list[dict] = []
     for msgs in capped_buckets.values():
         merged.extend(msgs)
     merged.sort(key=score_message, reverse=True)
 
-    if len(merged) > caps.total:
+    if caps.total >= 0 and len(merged) > caps.total:
         logger.info(
             "Global cap: %d -> %d messages (after per-source caps).",
             len(merged), caps.total,
@@ -210,8 +234,11 @@ def prioritize_grouped(messages: list[dict], caps) -> dict[str, list[dict]]:
     for platform, msgs in buckets.items():
         scored = sorted(msgs, key=score_message, reverse=True)
         cap = caps.get(platform)
-        grouped[platform] = scored[:cap]
-        if len(scored) > cap:
+        if cap < 0:
+            grouped[platform] = scored
+        else:
+            grouped[platform] = scored[:cap]
+        if cap >= 0 and len(scored) > cap:
             logger.info(
                 "  %s: %d -> %d (per-source cap)", platform, len(scored), cap,
             )
@@ -258,7 +285,13 @@ def extract_events_llm(
     from event_harvester.classifier import filter_actionable as classifier_filter, has_trained_models
 
     total = len(messages)
-    cap_total = caps.total if caps else 150
+    if caps and (getattr(caps, "no_cap", False) or caps.total < 0):
+        # no_cap or caps.total = -1 bypasses both per-source and global
+        # trimming. Use the message count itself as the rerank top_k so
+        # nothing is dropped.
+        cap_total = max(total, 1)
+    else:
+        cap_total = caps.total if caps else 150
 
     rejects: dict[str, list[dict]] = {}
 
@@ -339,8 +372,8 @@ def _extract_events_cloud(
             if not tasks:
                 logger.debug("Batch raw output:\n%s", raw[:500])
             return tasks
-        except Exception as e:
-            logger.error("Batch failed: %s", e)
+        except Exception:
+            logger.exception("Batch failed")
             return []
 
     all_tasks: list[dict] = []
@@ -362,7 +395,7 @@ def _extract_events_cloud(
             dropped = getattr(_parse_event_ini, "_last_dropped", [])
             return tasks, raw, dropped, batch if not tasks else []
         except Exception as e:
-            logger.error("Batch failed: %s", e)
+            logger.exception("Batch failed (%s)", type(e).__name__)
             return [], "", [{"title": "(batch error)", "reason": str(e)}], batch
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
@@ -421,8 +454,8 @@ def _extract_events_local(
                 cfg=cfg,
                 max_tokens=4096,
             )
-        except Exception as e:
-            logger.error("LLM call failed on batch %d: %s", batch_num, e)
+        except Exception:
+            logger.exception("LLM call failed on batch %d", batch_num)
             continue
 
         batch_summary, batch_tasks = _parse_event_ini(raw)
