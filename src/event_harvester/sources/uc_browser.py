@@ -36,15 +36,45 @@ import os
 import shutil
 import sys
 import time
+import warnings
+from enum import Enum
 from pathlib import Path
 from typing import Optional
 
+from playwright.sync_api import Error as PlaywrightError
+
 logger = logging.getLogger("event_harvester.uc_browser")
+
+
+class BrowserMode(str, Enum):
+    """Browser launch mode for UCBrowser.
+
+    - CHROME: Installed Chrome via Playwright channel="chrome" + persistent
+      profile at data/.chrome_profile. Best for logged-in scraping
+      (Instagram, LinkedIn, etc.).
+    - CHROMIUM_EXT: Playwright's bundled Chromium with the UC extension
+      loaded. Best for chat automation, pattern detection, anchor-locking.
+    - NATIVE_CDP: Launch the user's actual Chrome via subprocess + CDP.
+      No automation flags, real profile, real extensions. Best for
+      Cloudflare-protected sites.
+    - HEADLESS: Headless Chrome, no extension. Best for CI/batch scraping
+      where saved storage_state covers auth.
+    """
+
+    CHROME = "chrome"
+    CHROMIUM_EXT = "chromium-ext"
+    NATIVE_CDP = "native-cdp"
+    HEADLESS = "headless"
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 _EXT_DIR = _REPO_ROOT / "ext" / "universal_controller" / "extension"
 _CHROME_PROFILE = Path("data/.chrome_profile").resolve()
-_NATIVE_PROFILE = Path("data/.native_chrome_profile").resolve()
+# Clean profile dir for native_chrome=True mode. We deliberately do NOT
+# copy the user's full Chrome User Data into here any more — only the
+# KeePassXC-Browser extension is loaded via --load-extension. The old
+# data/.native_chrome_profile path is left untouched for backwards
+# compatibility; users can delete it manually.
+_NATIVE_PROFILE = Path("data/.uc_chrome_profile").resolve()
 _STATE_FILE = Path("data/.playwright_state.json")
 
 
@@ -77,7 +107,8 @@ def _is_chrome_running() -> bool:
         else:
             result = sp.run(["pgrep", "-x", "chrome"], capture_output=True, timeout=5)
             return result.returncode == 0
-    except Exception:
+    except Exception as e:
+        logger.debug("_is_chrome_running check failed: %s", e)
         return False
 
 
@@ -87,6 +118,50 @@ _SKIP_DIRS = frozenset({
     "Session Storage", "Local Storage", "GCM Store",
     "BrowserMetrics", "CdmStorage", "optimization_guide_prediction_model_downloads",
 })
+
+# Official KeePassXC-Browser extension ID (Chrome Web Store)
+_KEEPASSXC_EXT_ID = "oboonakemofpalcgghocfoadofidjkkk"
+_KEEPASSXC_DST = Path("data/.keepassxc_extension").resolve()
+
+
+def _ensure_keepassxc_extension() -> Path | None:
+    """Locate the KeePassXC-Browser extension in the user's installed
+    Chrome and stage it as a clean unpacked copy under
+    ``data/.keepassxc_extension`` for ``--load-extension``.
+
+    Returns the staged path on success, or None if the extension isn't
+    installed locally. The copy strips Chrome's ``_metadata`` directory
+    (which can confuse unpacked-extension loading) but keeps everything
+    else.
+    """
+    real_profile = _find_real_chrome_profile()
+    if real_profile is None:
+        return None
+    ext_root = real_profile / "Default" / "Extensions" / _KEEPASSXC_EXT_ID
+    if not ext_root.exists():
+        return None
+    versions = sorted(p for p in ext_root.iterdir() if p.is_dir())
+    if not versions:
+        return None
+    source = versions[-1]  # latest version directory
+
+    try:
+        if _KEEPASSXC_DST.exists():
+            shutil.rmtree(_KEEPASSXC_DST)
+        _KEEPASSXC_DST.mkdir(parents=True, exist_ok=True)
+        for item in source.iterdir():
+            if item.name == "_metadata":
+                continue
+            dst = _KEEPASSXC_DST / item.name
+            if item.is_dir():
+                shutil.copytree(str(item), str(dst))
+            else:
+                shutil.copy2(str(item), str(dst))
+        logger.info("Staged KeePassXC extension from %s -> %s", source, _KEEPASSXC_DST)
+        return _KEEPASSXC_DST
+    except Exception as e:
+        logger.warning("Failed to stage KeePassXC extension: %s", e)
+        return None
 
 
 def _copy_chrome_auth(src_profile: Path, dst_dir: Path) -> None:
@@ -101,8 +176,8 @@ def _copy_chrome_auth(src_profile: Path, dst_dir: Path) -> None:
         if item.is_file():
             try:
                 shutil.copy2(str(item), str(dst_dir / item.name))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Skip top-level file %s: %s", item.name, e)
 
     # Default profile — full copy minus caches
     default_src = src_profile / "Default"
@@ -121,8 +196,9 @@ def _copy_chrome_auth(src_profile: Path, dst_dir: Path) -> None:
                     shutil.copytree(str(item), str(dst_item), dirs_exist_ok=True)
             else:
                 shutil.copy2(str(item), str(dst_item))
-        except Exception:
-            pass  # skip locked/inaccessible files
+        except Exception as e:
+            # Locked/inaccessible files are expected (Chrome may hold handles)
+            logger.debug("Skip locked profile item %s: %s", item.name, e)
 
     logger.info("Copied Chrome profile to %s", dst_dir)
 
@@ -160,24 +236,69 @@ class UCBrowser:
 
     def __init__(
         self,
-        headless: bool = False,
+        mode: Optional[BrowserMode] = None,
+        *,
         channel: str = "chrome",
         stealth: bool = True,
         timeout_ms: int = 30000,
-        use_extension: bool = True,
-        native_chrome: bool = False,
+        # Legacy flags — deprecated, prefer `mode` instead.
+        headless: Optional[bool] = None,
+        use_extension: Optional[bool] = None,
+        native_chrome: Optional[bool] = None,
     ):
-        self.headless = headless
+        # Resolve mode from explicit param or legacy flags
+        if mode is None:
+            mode = self._infer_mode_from_legacy_flags(
+                headless, use_extension, native_chrome,
+            )
+        elif any(x is not None for x in (headless, use_extension, native_chrome)):
+            warnings.warn(
+                "UCBrowser: legacy flags (headless/use_extension/native_chrome) "
+                "are ignored when `mode` is given; pass only one.",
+                DeprecationWarning, stacklevel=2,
+            )
+        self.mode = mode
         self.channel = channel
         self.use_stealth = stealth
         self.timeout_ms = timeout_ms
-        self.use_extension = use_extension
-        self.native_chrome = native_chrome
         self._pw = None
         self._context = None
         self._browser = None
         self._stealth_plugin = None
         self._chrome_proc = None
+
+    @staticmethod
+    def _infer_mode_from_legacy_flags(
+        headless: Optional[bool],
+        use_extension: Optional[bool],
+        native_chrome: Optional[bool],
+    ) -> BrowserMode:
+        """Map the old boolean flags to a BrowserMode."""
+        # Default precedence (matches the old start() conditional order):
+        #   native_chrome > headless > use_extension > chrome
+        if native_chrome:
+            return BrowserMode.NATIVE_CDP
+        if headless and not use_extension:
+            return BrowserMode.HEADLESS
+        # Default ON: use_extension was True by default in the old API,
+        # so anyone not passing flags lands on CHROMIUM_EXT.
+        if use_extension is None or use_extension:
+            return BrowserMode.CHROMIUM_EXT
+        return BrowserMode.CHROME
+
+    # ── Legacy flag compatibility shims (deprecated) ────────────────────
+
+    @property
+    def headless(self) -> bool:
+        return self.mode == BrowserMode.HEADLESS
+
+    @property
+    def use_extension(self) -> bool:
+        return self.mode == BrowserMode.CHROMIUM_EXT
+
+    @property
+    def native_chrome(self) -> bool:
+        return self.mode == BrowserMode.NATIVE_CDP
 
     def __enter__(self):
         self.start()
@@ -187,83 +308,90 @@ class UCBrowser:
         self.close()
 
     def start(self) -> None:
-        """Launch the browser.
-
-        Modes:
-        - native_chrome=True: Launch actual Chrome via subprocess + CDP.
-          No automation flags, real profile, real extensions. Best for
-          Cloudflare-protected sites.
-        - Default: Installed Chrome via Playwright's channel="chrome".
-        - use_extension=True: Playwright Chromium + UC extension.
-        """
+        """Launch the browser according to self.mode."""
         from playwright.sync_api import sync_playwright
 
         self._pw = sync_playwright().start()
 
-        if self.native_chrome:
-            self._start_native_chrome()
-            return
+        starters = {
+            BrowserMode.NATIVE_CDP: self._start_native_chrome,
+            BrowserMode.HEADLESS: self._start_headless,
+            BrowserMode.CHROMIUM_EXT: self._start_chromium_ext,
+            BrowserMode.CHROME: self._start_chrome,
+        }
+        try:
+            starters[self.mode]()
+        except KeyError:
+            raise ValueError(f"Unknown BrowserMode: {self.mode}")
 
-        if self.headless and not self.use_extension:
-            self._browser = self._pw.chromium.launch(
-                headless=True, channel=self.channel,
+        if self.use_stealth and self.mode != BrowserMode.NATIVE_CDP:
+            self._init_stealth()
+
+    def _start_headless(self) -> None:
+        """Headless Chrome with saved storage_state for auth."""
+        self._browser = self._pw.chromium.launch(
+            headless=True, channel=self.channel,
+        )
+        if _STATE_FILE.exists():
+            self._context = self._browser.new_context(
+                storage_state=str(_STATE_FILE),
             )
-            if _STATE_FILE.exists():
-                self._context = self._browser.new_context(
-                    storage_state=str(_STATE_FILE),
-                )
-            else:
-                self._context = self._browser.new_context()
-        elif self.use_extension:
-            # Chromium + extension (branded Chrome blocks --load-extension)
-            ext_args = []
-            if _EXT_DIR.is_dir() and (_EXT_DIR / "manifest.json").exists():
-                ext_path = str(_EXT_DIR.resolve())
-                ext_args = [
-                    f"--load-extension={ext_path}",
-                    f"--disable-extensions-except={ext_path}",
-                ]
-                logger.info("Loading UC extension from %s", ext_path)
-            else:
-                logger.warning("UC extension not found at %s", _EXT_DIR)
-            profile_dir = str((_CHROME_PROFILE.parent / ".uc_chromium_profile").resolve())
-            Path(profile_dir).mkdir(parents=True, exist_ok=True)
-            self._context = self._pw.chromium.launch_persistent_context(
-                profile_dir,
-                headless=False,
-                channel=None,  # Playwright's bundled Chromium
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    *ext_args,
-                ],
-            )
-            # Inject saved cookies from web_login (stored in .playwright_state.json)
-            if _STATE_FILE.exists():
-                try:
-                    import json
-                    state = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
-                    cookies = state.get("cookies", [])
-                    if cookies:
-                        self._context.add_cookies(cookies)
-                        logger.info("Injected %d cookies from saved session.", len(cookies))
-                except Exception as e:
-                    logger.debug("Cookie injection from state file skipped: %s", e)
         else:
-            # Installed Chrome + logged-in profile (same as fetch_event_pages)
-            _CHROME_PROFILE.parent.mkdir(parents=True, exist_ok=True)
-            self._context = self._pw.chromium.launch_persistent_context(
-                str(_CHROME_PROFILE),
-                headless=False,
-                channel=self.channel,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
+            self._context = self._browser.new_context()
 
-        if self.use_stealth:
+    def _start_chromium_ext(self) -> None:
+        """Playwright Chromium + UC extension (branded Chrome blocks
+        --load-extension, so use bundled Chromium)."""
+        ext_args = []
+        if _EXT_DIR.is_dir() and (_EXT_DIR / "manifest.json").exists():
+            ext_path = str(_EXT_DIR.resolve())
+            ext_args = [
+                f"--load-extension={ext_path}",
+                f"--disable-extensions-except={ext_path}",
+            ]
+            logger.info("Loading UC extension from %s", ext_path)
+        else:
+            logger.warning("UC extension not found at %s", _EXT_DIR)
+        profile_dir = str((_CHROME_PROFILE.parent / ".uc_chromium_profile").resolve())
+        Path(profile_dir).mkdir(parents=True, exist_ok=True)
+        self._context = self._pw.chromium.launch_persistent_context(
+            profile_dir,
+            headless=False,
+            channel=None,  # Playwright's bundled Chromium
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                *ext_args,
+            ],
+        )
+        # Inject saved cookies from web_login (stored in .playwright_state.json)
+        if _STATE_FILE.exists():
             try:
-                from playwright_stealth import Stealth
-                self._stealth_plugin = Stealth()
-            except ImportError:
-                logger.warning("playwright-stealth not installed, skipping stealth")
+                import json
+                state = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
+                cookies = state.get("cookies", [])
+                if cookies:
+                    self._context.add_cookies(cookies)
+                    logger.info("Injected %d cookies from saved session.", len(cookies))
+            except Exception as e:
+                logger.debug("Cookie injection from state file skipped: %s", e)
+
+    def _start_chrome(self) -> None:
+        """Installed Chrome + logged-in persistent profile."""
+        _CHROME_PROFILE.parent.mkdir(parents=True, exist_ok=True)
+        self._context = self._pw.chromium.launch_persistent_context(
+            str(_CHROME_PROFILE),
+            headless=False,
+            channel=self.channel,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+
+    def _init_stealth(self) -> None:
+        """Apply playwright-stealth plugin if available."""
+        try:
+            from playwright_stealth import Stealth
+            self._stealth_plugin = Stealth()
+        except ImportError:
+            logger.warning("playwright-stealth not installed, skipping stealth")
 
     def _start_native_chrome(self) -> None:
         """Launch actual Chrome via subprocess, connect Playwright via CDP.
@@ -296,28 +424,45 @@ class UCBrowser:
             return
 
         port = 9222
-        # Chrome requires a non-default --user-data-dir for remote debugging,
-        # so we always copy auth files to a working directory.
-        real_profile = _find_real_chrome_profile()
+        # Chrome requires a non-default --user-data-dir for remote
+        # debugging. We use a fresh, otherwise-empty profile and only
+        # load the KeePassXC-Browser extension (if it's installed in
+        # the user's real Chrome) so logins can autofill from the
+        # KeePassXC desktop database. Skipping the full Default-profile
+        # copy avoids the "Failed to load extension from <data/...>"
+        # noise that came from Chrome trying to re-resolve every other
+        # extension referenced in the copied Preferences.
         profile_dir = str(_NATIVE_PROFILE)
         Path(profile_dir).mkdir(parents=True, exist_ok=True)
-        if real_profile:
-            _copy_chrome_auth(real_profile, Path(profile_dir))
-            logger.info("Copied Chrome auth to %s", profile_dir)
-        else:
-            logger.info("Real Chrome profile not found, using empty profile.")
 
         cmd = [
             chrome_path,
             f"--remote-debugging-port={port}",
             f"--user-data-dir={profile_dir}",
+            "--no-first-run",
+            "--no-default-browser-check",
         ]
+
+        keepass_path = _ensure_keepassxc_extension()
+        if keepass_path is not None:
+            cmd.extend([
+                f"--load-extension={keepass_path}",
+                f"--disable-extensions-except={keepass_path}",
+            ])
+            logger.info("Loading KeePassXC extension from %s", keepass_path)
+        else:
+            logger.info(
+                "KeePassXC extension not found in installed Chrome; "
+                "launching without autofill support.",
+            )
+
         logger.info("Launching native Chrome: %s", " ".join(cmd[:2]))
         self._chrome_proc = subprocess.Popen(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
 
-        # Wait for CDP to be ready
+        # Wait for CDP to be ready (retry until Chrome's debug port comes up)
+        last_err = None
         for _ in range(15):
             _time.sleep(1)
             try:
@@ -325,9 +470,12 @@ class UCBrowser:
                     f"http://localhost:{port}",
                 )
                 break
-            except Exception:
+            except Exception as e:
+                last_err = e
                 continue
         else:
+            if last_err:
+                logger.debug("CDP connect retries exhausted, last error: %s", last_err)
             logger.error("Failed to connect to native Chrome on port %d", port)
             self._chrome_proc.kill()
             self._chrome_proc = None
@@ -342,25 +490,26 @@ class UCBrowser:
         if self._context:
             try:
                 self._context.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("context.close() failed during teardown: %s", e)
         if self._browser:
             try:
                 self._browser.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("browser.close() failed during teardown: %s", e)
         if self._chrome_proc:
             try:
                 self._chrome_proc.terminate()
                 self._chrome_proc.wait(timeout=5)
-            except Exception:
+            except Exception as e:
+                logger.debug("chrome_proc.terminate() failed, killing: %s", e)
                 self._chrome_proc.kill()
             self._chrome_proc = None
         if self._pw:
             try:
                 self._pw.stop()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("playwright.stop() failed during teardown: %s", e)
         self._context = self._browser = self._pw = None
 
     # ── Page management ─────────────────────────────────────────────────
@@ -403,8 +552,8 @@ class UCBrowser:
                 body = response.text()
                 if len(body) > 100:
                     captured.append((response.url, body))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("response handler error for %s: %s", response.url, e)
 
         page.on("response", _on_response)
         page.goto(url, timeout=self.timeout_ms, wait_until="domcontentloaded")
@@ -419,8 +568,8 @@ class UCBrowser:
                 timeout=timeout_ms,
             )
             return True
-        except Exception:
-            logger.debug("UC extension not ready on %s", page.url)
+        except PlaywrightError as e:
+            logger.debug("UC extension not ready on %s: %s", page.url, e)
             return False
 
     # ── Scan-diff-bind workflow (interaction-based) ─────────────────────
@@ -551,7 +700,8 @@ class UCBrowser:
         try:
             uc = page.evaluate("window.__UC")
             return (uc or {}).get("patterns", {})
-        except Exception:
+        except PlaywrightError as e:
+            logger.debug("get_patterns failed: %s", e)
             return {}
 
     # ── Pattern-driven actions ──────────────────────────────────────────
@@ -561,7 +711,8 @@ class UCBrowser:
         self.detect(page, "cookie")
         try:
             return page.evaluate("window.__UC_dismiss()") is True
-        except Exception:
+        except PlaywrightError as e:
+            logger.debug("dismiss_cookies failed: %s", e)
             return False
 
     def search(self, page, query: str, submit: bool = True) -> bool:
@@ -584,7 +735,7 @@ class UCBrowser:
                 page.press(selector, "Enter")
                 page.wait_for_timeout(2000)
             return True
-        except Exception as e:
+        except PlaywrightError as e:
             logger.debug("Playwright fill failed (%s), trying JS", e)
             try:
                 filled = page.evaluate("(q) => window.__UC_fillSearch(q)", query)
@@ -592,7 +743,8 @@ class UCBrowser:
                     page.press(selector, "Enter")
                     page.wait_for_timeout(2000)
                 return bool(filled)
-            except Exception:
+            except PlaywrightError as e2:
+                logger.debug("JS-fallback fill failed: %s", e2)
                 return False
 
     def get_feed_text(self, page) -> str:
@@ -600,7 +752,8 @@ class UCBrowser:
         self.detect(page, "feed")
         try:
             return page.evaluate("window.__UC_getVisibleText()") or ""
-        except Exception:
+        except PlaywrightError as e:
+            logger.debug("get_feed_text via UC failed, falling back: %s", e)
             return page.evaluate("document.body.innerText") or ""
 
     def get_feed_items(self, page) -> list[str]:
@@ -621,7 +774,8 @@ class UCBrowser:
                 }""",
                 item_sel,
             )
-        except Exception:
+        except PlaywrightError as e:
+            logger.debug("get_feed_items via item_selector failed: %s", e)
             return [self.get_feed_text(page)]
 
     def scroll_feed(self, page, seconds: int = 15, on_item: callable = None) -> list[str]:
@@ -709,8 +863,8 @@ class UCBrowser:
                 btn.click()
                 page.wait_for_timeout(2000)
                 return True
-        except Exception:
-            pass
+        except PlaywrightError as e:
+            logger.debug("submit_form click failed: %s", e)
         return False
 
     def close_modal(self, page) -> bool:
@@ -724,8 +878,8 @@ class UCBrowser:
                 page.click(dismiss_sel)
                 page.wait_for_timeout(500)
                 return True
-            except Exception:
-                pass
+            except PlaywrightError as e:
+                logger.debug("close_modal click failed: %s", e)
         return False
 
     def has_login_wall(self, page) -> bool:
@@ -739,56 +893,64 @@ class UCBrowser:
         """Detect and bind a pattern, creating a UC action API for it."""
         try:
             return page.evaluate("(p) => window.__UC_bind(p)", pattern_name)
-        except Exception:
+        except PlaywrightError as e:
+            logger.debug("bind(%s) failed: %s", pattern_name, e)
             return None
 
     def chat_send(self, page, text: str) -> bool:
         """Send a chat message using UC's framework-aware setText."""
         try:
             return page.evaluate("(t) => window.__UC_chatSend(t)", text) is True
-        except Exception:
+        except PlaywrightError as e:
+            logger.debug("chat_send failed: %s", e)
             return False
 
     def chat_get_messages(self, page) -> list:
         """Get all visible chat messages."""
         try:
             return page.evaluate("window.__UC_chatGetMessages()") or []
-        except Exception:
+        except PlaywrightError as e:
+            logger.debug("chat_get_messages failed: %s", e)
             return []
 
     def form_fill_uc(self, page, data: dict) -> bool:
         """Fill form using UC's priority-based field matching (name > id > type > placeholder)."""
         try:
             return page.evaluate("(d) => window.__UC_formFill(d)", data) is not False
-        except Exception:
+        except PlaywrightError as e:
+            logger.debug("form_fill_uc failed: %s", e)
             return False
 
     def form_get_values(self, page) -> dict:
         """Get current form field values."""
         try:
             return page.evaluate("window.__UC_formGetValues()") or {}
-        except Exception:
+        except PlaywrightError as e:
+            logger.debug("form_get_values failed: %s", e)
             return {}
 
     def dropdown_toggle(self, page) -> bool:
         """Toggle detected dropdown."""
         try:
             return page.evaluate("window.__UC_dropdownToggle()") is True
-        except Exception:
+        except PlaywrightError as e:
+            logger.debug("dropdown_toggle failed: %s", e)
             return False
 
     def dropdown_select(self, page, value: str) -> bool:
         """Select a dropdown option by text."""
         try:
             return page.evaluate("(v) => window.__UC_dropdownSelect(v)", value) is True
-        except Exception:
+        except PlaywrightError as e:
+            logger.debug("dropdown_select failed: %s", e)
             return False
 
     def modal_close_uc(self, page) -> bool:
         """Close modal using UC's method (button click + Escape fallback)."""
         try:
             return page.evaluate("window.__UC_modalClose()") is True
-        except Exception:
+        except PlaywrightError as e:
+            logger.debug("modal_close_uc failed: %s", e)
             return False
 
     # ── Advanced: LLM context, heap scan, passive, signatures ──────────
@@ -797,63 +959,72 @@ class UCBrowser:
         """Extract LLM-formatted context for a detected pattern."""
         try:
             return page.evaluate("(p) => window.__UC_getLLMContext(p)", pattern_name)
-        except Exception:
+        except PlaywrightError as e:
+            logger.debug("get_llm_context failed: %s", e)
             return None
 
     def heap_scan(self, page, pattern_name: str = None) -> Optional[dict]:
         """Scan React/Vue/Angular internals for the detected element."""
         try:
             return page.evaluate("(p) => window.__UC_heapScan(p)", pattern_name)
-        except Exception:
+        except PlaywrightError as e:
+            logger.debug("heap_scan failed: %s", e)
             return None
 
     def scan_framework(self, page) -> Optional[dict]:
         """Detect which frontend framework the page uses."""
         try:
             return page.evaluate("window.__UC_scanFramework()")
-        except Exception:
+        except PlaywrightError as e:
+            logger.debug("scan_framework failed: %s", e)
             return None
 
     def start_passive(self, page) -> bool:
         """Start passive detection (MutationObserver + event correlation)."""
         try:
             return page.evaluate("window.__UC_startPassive()") is True
-        except Exception:
+        except PlaywrightError as e:
+            logger.debug("start_passive failed: %s", e)
             return False
 
     def stop_passive(self, page) -> bool:
         """Stop passive detection."""
         try:
             return page.evaluate("window.__UC_stopPassive()") is True
-        except Exception:
+        except PlaywrightError as e:
+            logger.debug("stop_passive failed: %s", e)
             return False
 
     def get_passive_results(self, page) -> list:
         """Get patterns inferred by passive detection."""
         try:
             return page.evaluate("window.__UC_getPassiveResults()") or []
-        except Exception:
+        except PlaywrightError as e:
+            logger.debug("get_passive_results failed: %s", e)
             return []
 
     def save_signature(self, page, pattern_name: str) -> Optional[dict]:
         """Save a confirmed-working pattern binding for future auto-bind."""
         try:
             return page.evaluate("(p) => window.__UC_saveSignature(p)", pattern_name)
-        except Exception:
+        except PlaywrightError as e:
+            logger.debug("save_signature(%s) failed: %s", pattern_name, e)
             return None
 
     def load_signatures(self, page) -> list:
         """Load saved signatures for the current site."""
         try:
             return page.evaluate("window.__UC_loadSignatures()") or []
-        except Exception:
+        except PlaywrightError as e:
+            logger.debug("load_signatures failed: %s", e)
             return []
 
     def auto_bind_signatures(self, page) -> list:
         """Auto-bind patterns from saved signatures."""
         try:
             return page.evaluate("window.__UC_autoBindSignatures()") or []
-        except Exception:
+        except PlaywrightError as e:
+            logger.debug("auto_bind_signatures failed: %s", e)
             return []
 
     # ── Generic input/button discovery ────────────────────────────────
@@ -864,7 +1035,8 @@ class UCBrowser:
             return []
         try:
             return page.evaluate("window.__UC_findInputs()") or []
-        except Exception:
+        except PlaywrightError as e:
+            logger.debug("find_inputs failed: %s", e)
             return []
 
     def find_buttons(self, page, input_selector: str = None) -> list[dict]:
@@ -873,7 +1045,8 @@ class UCBrowser:
             return []
         try:
             return page.evaluate("(s) => window.__UC_findButtons(s)", input_selector) or []
-        except Exception:
+        except PlaywrightError as e:
+            logger.debug("find_buttons failed: %s", e)
             return []
 
     def set_text(self, page, selector: str, text: str) -> dict:
@@ -882,14 +1055,16 @@ class UCBrowser:
             return page.evaluate(
                 "(args) => window.__UC_setText(args[0], args[1])", [selector, text],
             ) or {"success": False}
-        except Exception as e:
+        except PlaywrightError as e:
+            logger.debug("set_text failed: %s", e)
             return {"success": False, "error": str(e)}
 
     def find_new_content(self, page) -> list[dict]:
         """After a scan-diff, find where new content appeared (children-added, text-grew)."""
         try:
             return page.evaluate("window.__UC_findNewContent()") or []
-        except Exception:
+        except PlaywrightError as e:
+            logger.debug("find_new_content failed: %s", e)
             return []
 
     # ── ML-enhanced detection ────────────────────────────────────────────
@@ -942,8 +1117,8 @@ class UCBrowser:
                     "ML found chat_input (conf=%.2f) at %s — bound to UC chat API.",
                     best["confidence"], best["selector"],
                 )
-            except Exception:
-                pass
+            except PlaywrightError as e:
+                logger.debug("ml_find_chat bind failed: %s", e)
 
         return best
 
@@ -1005,8 +1180,8 @@ class UCBrowser:
         try:
             bl = page.evaluate("window.__UC_captureBaseline()")
             logger.info("Trigram baseline: %d trigrams", bl.get("trigrams", 0))
-        except Exception:
-            pass
+        except PlaywrightError as e:
+            logger.debug("captureBaseline failed: %s", e)
         # Scan-diff baseline (for container discovery)
         self.first_scan(page)
 
@@ -1020,8 +1195,8 @@ class UCBrowser:
                     page.type(selector, message, delay=10)
                 else:
                     page.fill(selector, message)
-            except Exception as e:
-                logger.error("Failed to type: %s", e)
+            except PlaywrightError as e:
+                logger.error("Failed to type via Playwright fallback: %s", e)
                 return None
         else:
             logger.info("setText OK (method=%s)", result.get("method"))
@@ -1044,7 +1219,8 @@ class UCBrowser:
         if btn_sel:
             try:
                 page.click(btn_sel)
-            except Exception:
+            except PlaywrightError as e:
+                logger.debug("Send button click failed (%s), pressing Enter", e)
                 page.press(selector, "Enter")
         else:
             page.press(selector, "Enter")
@@ -1069,16 +1245,16 @@ class UCBrowser:
                 self.bind(page, "chat")
                 self.save_signature(page, "chat")
                 logger.info("Signature saved for %s", page.url)
-            except Exception:
-                pass
+            except PlaywrightError as e:
+                logger.debug("Signature save failed: %s", e)
 
         # ── Check passive detection results ──────────────────────
         try:
             passive = self.get_passive_results(page)
             if passive:
                 logger.info("Passive detected %d pattern(s)", len(passive))
-        except Exception:
-            pass
+        except PlaywrightError as e:
+            logger.debug("get_passive_results failed: %s", e)
 
         return response
 
@@ -1102,7 +1278,8 @@ class UCBrowser:
             anchors = page.evaluate(
                 "(m) => window.__UC_findAnchorCandidates(m, 5)", sent_message,
             ) or []
-        except Exception:
+        except PlaywrightError as e:
+            logger.debug("findAnchorCandidates failed: %s", e)
             return None
 
         if not anchors:
@@ -1122,7 +1299,9 @@ class UCBrowser:
                     "(s) => window.__UC_findResponseAfterAnchor(s)",
                     a.get("selector"),
                 )
-            except Exception:
+            except PlaywrightError as e:
+                logger.debug("findResponseAfterAnchor failed for %r: %s",
+                             a.get("selector", "")[:40], e)
                 continue
             if not resp:
                 no_response += 1
@@ -1158,7 +1337,8 @@ class UCBrowser:
                     }""",
                     cand_text,
                 )
-            except Exception:
+            except PlaywrightError as e:
+                logger.debug("trigram ratio eval failed: %s", e)
                 ratio = 0
             if ratio is None:
                 ratio = 0
@@ -1184,7 +1364,8 @@ class UCBrowser:
             locked = page.evaluate(
                 "(s) => window.__UC_lockResponse(s)", best.get("selector"),
             )
-        except Exception:
+        except PlaywrightError as e:
+            logger.debug("lockResponse failed: %s", e)
             locked = None
         if locked:
             logger.info(
@@ -1234,8 +1415,8 @@ class UCBrowser:
                     current_text = page.evaluate(
                         "window.__UC_readLocked()",
                     ) or ""
-                except Exception:
-                    pass
+                except PlaywrightError as e:
+                    logger.debug("readLocked at tick %d failed: %s", tick, e)
             else:
                 # ── Fallback Layer 1: real-time observer ─────────
                 try:
@@ -1251,8 +1432,8 @@ class UCBrowser:
                             parts.append(t)
                         if parts:
                             current_text = max(parts, key=len)
-                except Exception:
-                    pass
+                except PlaywrightError as e:
+                    logger.debug("getObserved at tick %d failed: %s", tick, e)
 
                 # ── Fallback Layer 2: scan-diff container discovery ──
                 if not response_selector and tick < 20:
@@ -1267,8 +1448,8 @@ class UCBrowser:
                                     "(s) => window.__UC_watchContainer(s)",
                                     response_selector,
                                 )
-                    except Exception:
-                        pass
+                    except PlaywrightError as e:
+                        logger.debug("scan-diff discovery at tick %d failed: %s", tick, e)
 
                 # ── Fallback Layer 3: trigram extraction in container ──
                 if response_selector and not current_text:
@@ -1277,8 +1458,8 @@ class UCBrowser:
                             "(args) => window.__UC_extractFromContainer(args[0], args[1])",
                             [response_selector, sent_message],
                         ) or ""
-                    except Exception:
-                        pass
+                    except PlaywrightError as e:
+                        logger.debug("extractFromContainer at tick %d failed: %s", tick, e)
 
             # ── Stability check ──────────────────────────────────
             min_len = 1 if locked_selector else 15  # locked = trust short answers
@@ -1309,8 +1490,8 @@ class UCBrowser:
         # Stop observer
         try:
             page.evaluate("window.__UC_stopWatching()")
-        except Exception:
-            pass
+        except PlaywrightError as e:
+            logger.debug("stopWatching during teardown failed: %s", e)
 
         if last_text:
             logger.warning("Timed out, partial response (%d chars).", len(last_text))
