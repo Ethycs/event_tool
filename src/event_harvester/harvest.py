@@ -1,5 +1,6 @@
 """Message harvesting from sources with auto-caching."""
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timedelta, timezone
@@ -7,6 +8,7 @@ from pathlib import Path
 
 from event_harvester.config import AppConfig
 from event_harvester.display import DIM, RESET
+from event_harvester.logging_tags import tag_task
 from event_harvester.sources import (
     fetch_gmail_messages,
     fetch_web_sources,
@@ -14,8 +16,10 @@ from event_harvester.sources import (
     read_signal_messages,
     read_telegram_messages,
 )
+from event_harvester.tracing import get_tracer
 
 logger = logging.getLogger("event_harvester")
+tracer = get_tracer("event_harvester.harvest")
 
 _DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 CACHE_FILE = _DATA_DIR / ".message_cache.json"
@@ -88,102 +92,232 @@ async def harvest_messages(
         except Exception:
             logger.debug("Message cache invalid, re-fetching.")
 
-    # ── Harvest from sources ──────────────────────────────────────────────
+    # ── Harvest from sources (concurrent) ─────────────────────────────────
     cutoff = datetime.now(timezone.utc) - timedelta(days=cfg.days_back)
-    messages: list[dict] = []
 
-    if not no_discord:
-        print("[ Discord ]")
-        messages.extend(
-            read_discord_messages(cutoff, override_path=cfg.discord.cache_path)
-        )
-        print()
+    # Per-source async wrappers. Each wrapper sets a task_tag so log
+    # records emitted while it runs get prefixed in the UI handler, and
+    # prints the existing banner once at task entry. Each wrapper is
+    # wrapped in an OpenTelemetry span ``harvest.<name>``.
 
-    if not no_telegram:
-        print("[ Telegram ]")
-        messages.extend(
-            await read_telegram_messages(
-                cutoff,
-                cfg.telegram,
-                channels_allowlist=cfg.telegram_channels,
-                channels_blocklist=cfg.telegram_exclude,
-            )
-        )
-        print()
+    async def _run_discord() -> list[dict]:
+        with tag_task("discord"):
+            print("[ Discord ]")
+            try:
+                with tracer.start_as_current_span("harvest.discord") as span:
+                    span.set_attribute("source.name", "discord")
+                    try:
+                        msgs = await asyncio.to_thread(
+                            read_discord_messages,
+                            cutoff,
+                            override_path=cfg.discord.cache_path,
+                        )
+                        span.set_attribute("message.count", len(msgs or []))
+                        return msgs
+                    except Exception as e:
+                        span.set_attribute("error.message", str(e))
+                        span.record_exception(e)
+                        raise
+            finally:
+                print()
 
-    if not no_gmail:
-        print("[ Gmail ]")
-        messages.extend(fetch_gmail_messages(cfg.gmail, cutoff))
-        print()
+    async def _run_telegram() -> list[dict]:
+        with tag_task("telegram"):
+            print("[ Telegram ]")
+            try:
+                with tracer.start_as_current_span("harvest.telegram") as span:
+                    span.set_attribute("source.name", "telegram")
+                    try:
+                        msgs = await read_telegram_messages(
+                            cutoff,
+                            cfg.telegram,
+                            channels_allowlist=cfg.telegram_channels,
+                            channels_blocklist=cfg.telegram_exclude,
+                        )
+                        span.set_attribute("message.count", len(msgs or []))
+                        return msgs
+                    except Exception as e:
+                        span.set_attribute("error.message", str(e))
+                        span.record_exception(e)
+                        raise
+            finally:
+                print()
 
-    if not no_signal:
-        print("[ Signal ]")
-        messages.extend(read_signal_messages(cutoff, override_path=cfg.signal.db_path))
-        print()
+    async def _run_gmail() -> list[dict]:
+        with tag_task("gmail"):
+            print("[ Gmail ]")
+            try:
+                with tracer.start_as_current_span("harvest.gmail") as span:
+                    span.set_attribute("source.name", "gmail")
+                    try:
+                        msgs = await asyncio.to_thread(
+                            fetch_gmail_messages, cfg.gmail, cutoff,
+                        )
+                        span.set_attribute("message.count", len(msgs or []))
+                        return msgs
+                    except Exception as e:
+                        span.set_attribute("error.message", str(e))
+                        span.record_exception(e)
+                        raise
+            finally:
+                print()
 
-    if not no_web:
-        print("[ Web Sources ]")
-        web_kw: dict = {
-            "max_events": cfg.web.max_events,
-            "timeout_ms": cfg.web.timeout_ms,
-            "no_cooldown": no_cooldown,
-            "parallel": cfg.web.parallel,
-        }
-        # Merge filter sources: explicit `web_sources` list wins, then
-        # the single-name `web_source` (back-compat shim), then
-        # `cfg.web.selected_names` from env/profile.
-        filter_names: list[str] = []
-        if web_sources:
-            filter_names = list(web_sources)
-        elif web_source:
-            filter_names = [web_source]
-        elif cfg.web.selected_names:
-            filter_names = list(cfg.web.selected_names)
-        if filter_names:
-            from event_harvester.sources.web_fetch import _load_web_sources
-            all_web = _load_web_sources()
-            wanted = {n.lower() for n in filter_names}
-            matched = [s for s in all_web if s.get("name", "").lower() in wanted]
-            if not matched:
-                names = ", ".join(s.get("name", s["url"]) for s in all_web)
-                logger.warning(
-                    "Web sources %s not found. Available: %s",
-                    filter_names, names,
-                )
-            else:
-                missing = wanted - {s.get("name", "").lower() for s in matched}
-                if missing:
-                    logger.warning(
-                        "Profile lists web sources not in %s: %s",
-                        cfg.web.sources_file, sorted(missing),
-                    )
-                web_kw["sources"] = matched
-        web_msgs = fetch_web_sources(**web_kw)
-        messages.extend(web_msgs)
-        print()
+    async def _run_signal() -> list[dict]:
+        with tag_task("signal"):
+            print("[ Signal ]")
+            try:
+                with tracer.start_as_current_span("harvest.signal") as span:
+                    span.set_attribute("source.name", "signal")
+                    try:
+                        msgs = await asyncio.to_thread(
+                            read_signal_messages,
+                            cutoff,
+                            override_path=cfg.signal.db_path,
+                        )
+                        span.set_attribute("message.count", len(msgs or []))
+                        return msgs
+                    except Exception as e:
+                        span.set_attribute("error.message", str(e))
+                        span.record_exception(e)
+                        raise
+            finally:
+                print()
 
-    # ── Auto-save to cache (decimate web content to reduce cache size) ──
-    if messages:
+    async def _run_web() -> list[dict]:
+        with tag_task("web"):
+            print("[ Web Sources ]")
+            try:
+                with tracer.start_as_current_span("harvest.web") as span:
+                    span.set_attribute("source.name", "web")
+                    try:
+                        web_kw: dict = {
+                            "max_events": cfg.web.max_events,
+                            "timeout_ms": cfg.web.timeout_ms,
+                            "no_cooldown": no_cooldown,
+                            "parallel": cfg.web.parallel,
+                            "debug_trace": getattr(cfg.web, "debug_trace", False),
+                            "debug_screenshots": getattr(cfg.web, "debug_screenshots", False),
+                        }
+                        # Merge filter sources: explicit `web_sources` list wins,
+                        # then the single-name `web_source` (back-compat shim),
+                        # then `cfg.web.selected_names` from env/profile.
+                        filter_names: list[str] = []
+                        if web_sources:
+                            filter_names = list(web_sources)
+                        elif web_source:
+                            filter_names = [web_source]
+                        elif cfg.web.selected_names:
+                            filter_names = list(cfg.web.selected_names)
+                        if filter_names:
+                            from event_harvester.sources.web_fetch import _load_web_sources
+                            all_web = _load_web_sources()
+                            wanted = {n.lower() for n in filter_names}
+                            matched = [
+                                s for s in all_web
+                                if s.get("name", "").lower() in wanted
+                            ]
+                            if not matched:
+                                names = ", ".join(
+                                    s.get("name", s["url"]) for s in all_web
+                                )
+                                logger.warning(
+                                    "Web sources %s not found. Available: %s",
+                                    filter_names, names,
+                                )
+                            else:
+                                missing = wanted - {
+                                    s.get("name", "").lower() for s in matched
+                                }
+                                if missing:
+                                    logger.warning(
+                                        "Profile lists web sources not in %s: %s",
+                                        cfg.web.sources_file, sorted(missing),
+                                    )
+                                web_kw["sources"] = matched
+                        msgs = await asyncio.to_thread(fetch_web_sources, **web_kw)
+                        span.set_attribute("message.count", len(msgs or []))
+                        return msgs
+                    except Exception as e:
+                        span.set_attribute("error.message", str(e))
+                        span.record_exception(e)
+                        raise
+            finally:
+                print()
+
+    # Build the task list in deterministic source order. Native-async
+    # sources (telegram, web) get scheduled directly; sync sources get
+    # wrapped via asyncio.to_thread inside their _run_* helpers above.
+    source_specs: list[tuple[str, bool, "asyncio.coroutines"]] = [
+        ("discord", no_discord, _run_discord),
+        ("telegram", no_telegram, _run_telegram),
+        ("gmail", no_gmail, _run_gmail),
+        ("signal", no_signal, _run_signal),
+        ("web", no_web, _run_web),
+    ]
+
+    # Root "harvest" span. Per-source spans become children of this one
+    # by virtue of being started inside the same task contexts.
+    with tracer.start_as_current_span("harvest") as _root_span:
+        _root_span.set_attribute("days", cfg.days_back)
+        _root_span.set_attribute("source.count", len(active_sources))
+        # `cap.limit` is best-effort — caps live on cfg.caps.total when
+        # configured; -1 means "no cap".
         try:
-            from event_harvester.sources.web_fetch import _decimate_text
-
-            cache_msgs = []
-            for m in messages:
-                if m.get("platform") == "web" and len(m.get("content", "")) > 2000:
-                    m = {**m, "content": _decimate_text(m["content"])}
-                cache_msgs.append(m)
-
-            CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            CACHE_FILE.write_text(
-                json.dumps({
-                    "cached_at": datetime.now(timezone.utc).isoformat(),
-                    "sources": active_sources,
-                    "messages": cache_msgs,
-                }, ensure_ascii=False),
-                encoding="utf-8",
+            _root_span.set_attribute(
+                "cap.limit", int(getattr(cfg.caps, "total", -1)),
             )
-        except Exception as e:
-            logger.debug("Failed to write message cache: %s", e)
+        except Exception:
+            pass
+
+        tasks: list[asyncio.Task] = []
+        task_names: list[str] = []
+        for name, skip, runner in source_specs:
+            if skip:
+                continue
+            task = asyncio.create_task(runner(), name=f"harvest.{name}")
+            tasks.append(task)
+            task_names.append(name)
+
+        gathered = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Map results by source name so we can re-assemble in the canonical
+        # order regardless of which task finished first.
+        results: dict[str, list[dict]] = {}
+        for name, outcome in zip(task_names, gathered):
+            if isinstance(outcome, BaseException):
+                logger.error("%s source failed: %s", name, outcome)
+                results[name] = []
+            else:
+                results[name] = outcome or []
+
+        messages: list[dict] = []
+        for name, _, _ in source_specs:
+            if name in results:
+                messages.extend(results[name])
+        _root_span.set_attribute("message.count", len(messages))
+
+        # ── Auto-save to cache (decimate web content to reduce cache size) ──
+        if messages:
+            try:
+                from event_harvester.sources.web_fetch import _decimate_text
+
+                cache_msgs = []
+                for m in messages:
+                    if m.get("platform") == "web" and len(m.get("content", "")) > 2000:
+                        m = {**m, "content": _decimate_text(m["content"])}
+                    cache_msgs.append(m)
+
+                CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+                CACHE_FILE.write_text(
+                    json.dumps({
+                        "cached_at": datetime.now(timezone.utc).isoformat(),
+                        "sources": active_sources,
+                        "messages": cache_msgs,
+                    }, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            except Exception as e:
+                logger.debug("Failed to write message cache: %s", e)
 
     return messages
 

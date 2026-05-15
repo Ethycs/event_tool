@@ -6,8 +6,10 @@ import re
 
 from event_harvester.config import LLMConfig
 from event_harvester.llm import chat_completion
+from event_harvester.tracing import get_tracer
 
 logger = logging.getLogger("event_harvester.analysis")
+tracer = get_tracer("event_harvester.analysis")
 
 
 from event_harvester.utils import parse_llm_ini
@@ -381,25 +383,30 @@ def _extract_events_cloud(
     llm_dropped: list[dict] = []
     llm_no_events: list[dict] = []  # messages in batches that yielded 0 events
 
-    def _process_batch_with_raw(batch):
-        try:
-            raw = chat_completion(
-                messages=[
-                    {"role": "system", "content": _EVENT_EXTRACTION_PROMPT},
-                    {"role": "user", "content": build_prompt(batch, days_back)},
-                ],
-                cfg=cfg,
-                max_tokens=4096,
-            )
-            _, tasks = _parse_event_ini(raw)
-            dropped = getattr(_parse_event_ini, "_last_dropped", [])
-            return tasks, raw, dropped, batch if not tasks else []
-        except Exception as e:
-            logger.exception("Batch failed (%s)", type(e).__name__)
-            return [], "", [{"title": "(batch error)", "reason": str(e)}], batch
+    def _process_batch_with_raw(batch, i):
+        with tracer.start_as_current_span(f"extract.batch.{i}") as span:
+            span.set_attribute("batch.size", len(batch))
+            try:
+                raw = chat_completion(
+                    messages=[
+                        {"role": "system", "content": _EVENT_EXTRACTION_PROMPT},
+                        {"role": "user", "content": build_prompt(batch, days_back)},
+                    ],
+                    cfg=cfg,
+                    max_tokens=4096,
+                )
+                _, tasks = _parse_event_ini(raw)
+                dropped = getattr(_parse_event_ini, "_last_dropped", [])
+                span.set_attribute("events.extracted", len(tasks))
+                return tasks, raw, dropped, batch if not tasks else []
+            except Exception as e:
+                logger.exception("Batch failed (%s)", type(e).__name__)
+                span.set_attribute("error.message", str(e))
+                span.record_exception(e)
+                return [], "", [{"title": "(batch error)", "reason": str(e)}], batch
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
-        futures = [pool.submit(_process_batch_with_raw, b) for b in batches]
+        futures = [pool.submit(_process_batch_with_raw, b, i) for i, b in enumerate(batches)]
         for f in concurrent.futures.as_completed(futures):
             tasks, raw, dropped, no_event_msgs = f.result()
             all_tasks.extend(tasks)
@@ -418,9 +425,14 @@ def _extract_events_cloud(
     _extract_events_cloud._last_llm_dropped = llm_dropped
     _extract_events_cloud._last_llm_no_events = llm_no_events
 
-    # Deduplicate
+    # Deduplicate (fingerprint match pass)
     from event_harvester.event_match import dedup_events
-    unique = dedup_events(all_tasks)
+    with tracer.start_as_current_span("match.fingerprints") as span:
+        unique = dedup_events(all_tasks)
+        # match.count = how many duplicates were collapsed
+        span.set_attribute("match.count", max(0, len(all_tasks) - len(unique)))
+        span.set_attribute("events.in", len(all_tasks))
+        span.set_attribute("events.out", len(unique))
 
     return "", unique
 
@@ -445,29 +457,38 @@ def _extract_events_local(
         total_batches = (len(messages) + batch_size - 1) // batch_size
         logger.info("Task extraction batch %d/%d (%d messages)", batch_num, total_batches, len(batch))
 
-        try:
-            raw = chat_completion(
-                messages=[
-                    {"role": "system", "content": _EVENT_EXTRACTION_PROMPT},
-                    {"role": "user", "content": build_prompt(batch, days_back)},
-                ],
-                cfg=cfg,
-                max_tokens=4096,
-            )
-        except Exception:
-            logger.exception("LLM call failed on batch %d", batch_num)
-            continue
+        with tracer.start_as_current_span(f"extract.batch.{batch_num - 1}") as span:
+            span.set_attribute("batch.size", len(batch))
+            try:
+                raw = chat_completion(
+                    messages=[
+                        {"role": "system", "content": _EVENT_EXTRACTION_PROMPT},
+                        {"role": "user", "content": build_prompt(batch, days_back)},
+                    ],
+                    cfg=cfg,
+                    max_tokens=4096,
+                )
+            except Exception as e:
+                logger.exception("LLM call failed on batch %d", batch_num)
+                span.set_attribute("error.message", str(e))
+                span.record_exception(e)
+                continue
 
-        batch_summary, batch_tasks = _parse_event_ini(raw)
-        if not batch_tasks:
-            logger.debug("Batch %d raw LLM output:\n%s", batch_num, raw[:500])
-        if not summary and batch_summary:
-            summary = batch_summary
-        all_tasks.extend(batch_tasks)
+            batch_summary, batch_tasks = _parse_event_ini(raw)
+            span.set_attribute("events.extracted", len(batch_tasks))
+            if not batch_tasks:
+                logger.debug("Batch %d raw LLM output:\n%s", batch_num, raw[:500])
+            if not summary and batch_summary:
+                summary = batch_summary
+            all_tasks.extend(batch_tasks)
 
-    # Deduplicate
+    # Deduplicate (fingerprint match pass)
     from event_harvester.event_match import dedup_events
-    unique = dedup_events(all_tasks)
+    with tracer.start_as_current_span("match.fingerprints") as span:
+        unique = dedup_events(all_tasks)
+        span.set_attribute("match.count", max(0, len(all_tasks) - len(unique)))
+        span.set_attribute("events.in", len(all_tasks))
+        span.set_attribute("events.out", len(unique))
 
     return summary, unique
 

@@ -16,6 +16,7 @@ import sys
 
 from event_harvester.cli.commands.classifier import classifier_cmd
 from event_harvester.cli.commands.harvest import harvest_cmd
+from event_harvester.cli.commands.mcp import mcp_cmd
 from event_harvester.cli.commands.recruiters import recruiters_cmd
 from event_harvester.cli.commands.serve import serve_cmd
 from event_harvester.cli.commands.watch import watch_cmd
@@ -26,7 +27,7 @@ from event_harvester.config import load_config
 logger = logging.getLogger("event_harvester")
 
 KNOWN_COMMANDS = frozenset({
-    "harvest", "watch", "web", "recruiters", "classifier", "serve",
+    "harvest", "watch", "web", "recruiters", "classifier", "serve", "mcp",
 })
 
 _HANDLERS = {
@@ -36,6 +37,7 @@ _HANDLERS = {
     "recruiters": recruiters_cmd,
     "classifier": classifier_cmd,
     "serve": serve_cmd,
+    "mcp": mcp_cmd,
 }
 
 
@@ -92,6 +94,20 @@ async def main() -> int:
     args = parser.parse_args(argv)
 
     _setup_logging(args.verbose, args.quiet)
+
+    # Initialize OpenTelemetry tracing for commands that opt in via
+    # --debug-otel, or globally if OTEL_EXPORTER_OTLP_ENDPOINT is set.
+    # This must run before any harvest/analysis/serve code so the root
+    # spans get exported.
+    try:
+        import os
+        from event_harvester.tracing import init_tracing
+        init_tracing(
+            debug=getattr(args, "debug_otel", False),
+            otlp_endpoint=os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT"),
+        )
+    except Exception as e:
+        logger.warning("init_tracing failed: %s", e)
 
     cfg = load_config()
 

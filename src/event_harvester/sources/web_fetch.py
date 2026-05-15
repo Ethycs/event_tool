@@ -11,7 +11,10 @@ import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from event_harvester.tracing import get_tracer
+
 logger = logging.getLogger("event_harvester.web_fetch")
+tracer = get_tracer("event_harvester.web_fetch")
 
 _DATA_DIR = Path(__file__).resolve().parent.parent.parent.parent / "data"
 _COOLDOWN_FILE = _DATA_DIR / ".web_cooldowns.json"
@@ -306,16 +309,38 @@ def _parse_calcium_links(html: str) -> list[dict]:
     return links
 
 
-def _do_calendar(uc, src: dict, timeout_ms: int, max_events: int, page=None) -> list[dict]:
+def _do_calendar(uc, src: dict, timeout_ms: int, max_events: int, page=None, tracer=None, capture=None) -> list[dict]:
+    """Calendar mode (OTel-wrapped). Body lives in ``_do_calendar_inner``."""
+    name = src.get("name", "web")
+    mode = "calendar"
+    otel_tracer = get_tracer("event_harvester.web_fetch")
+    with otel_tracer.start_as_current_span(f"web.{name}.{mode}") as span:
+        span.set_attribute("source.name", name)
+        span.set_attribute("source.mode", mode)
+        try:
+            messages = _do_calendar_inner(
+                uc, src, timeout_ms, max_events,
+                page=page, tracer=tracer, capture=capture,
+            )
+            span.set_attribute("message.count", len(messages))
+            return messages
+        except Exception as e:
+            span.set_attribute("error.message", str(e))
+            span.record_exception(e)
+            raise
+
+
+def _do_calendar_inner(uc, src: dict, timeout_ms: int, max_events: int, page=None, tracer=None, capture=None) -> list[dict]:
     """Calendar mode: load page, extract date↔link pairs, fetch detail pages."""
     from urllib.parse import urlparse
 
     url = src["url"]
+    name = src.get("name", "web")
     domain = urlparse(url).netloc
     logger.info("Calendar: %s", src.get("name", url))
 
     if page is None:
-        page = uc.open(url)
+        page = uc.open(url, source_name=name, tracer=tracer, capture=capture)
         html = _wait_cloudflare(page, headless=False)
         if "just a moment" in html.lower():
             page.close()
@@ -478,7 +503,28 @@ def _do_calendar(uc, src: dict, timeout_ms: int, max_events: int, page=None) -> 
     }]
 
 
-def _do_feed(uc, src: dict, max_events: int = 30, page=None) -> list[dict]:
+def _do_feed(uc, src: dict, max_events: int = 30, page=None, tracer=None, capture=None) -> list[dict]:
+    """Feed mode (OTel-wrapped). Body lives in ``_do_feed_inner``."""
+    name = src.get("name", "web")
+    mode = "feed"
+    otel_tracer = get_tracer("event_harvester.web_fetch")
+    with otel_tracer.start_as_current_span(f"web.{name}.{mode}") as span:
+        span.set_attribute("source.name", name)
+        span.set_attribute("source.mode", mode)
+        try:
+            messages = _do_feed_inner(
+                uc, src, max_events=max_events,
+                page=page, tracer=tracer, capture=capture,
+            )
+            span.set_attribute("message.count", len(messages))
+            return messages
+        except Exception as e:
+            span.set_attribute("error.message", str(e))
+            span.record_exception(e)
+            raise
+
+
+def _do_feed_inner(uc, src: dict, max_events: int = 30, page=None, tracer=None, capture=None) -> list[dict]:
     """Feed mode: scroll page while intercepting API responses.
 
     Note: page param is accepted for interface consistency but feed mode
@@ -498,7 +544,9 @@ def _do_feed(uc, src: dict, max_events: int = 30, page=None) -> list[dict]:
 
     logger.info("Feed: scrolling %s for %ds...", name, scroll_secs)
 
-    page, captured = uc.open_with_intercept(url, api_pattern)
+    page, captured = uc.open_with_intercept(
+        url, api_pattern, source_name=name, tracer=tracer, capture=capture,
+    )
     page.wait_for_timeout(3000)
 
     # UC obstacle clearing + feed detection
@@ -513,9 +561,14 @@ def _do_feed(uc, src: dict, max_events: int = 30, page=None) -> list[dict]:
         feed_selector = patterns["feed"][0].get("selector")
         logger.info("UC: scrolling detected feed container: %s", feed_selector)
 
-    # Scroll (targeted if feed detected, full-page otherwise)
+    # Scroll (targeted if feed detected, full-page otherwise). When
+    # screenshots are enabled, snap a PNG roughly every 5s during the
+    # dwell so the GIF later shows the feed actually loading.
     end_time = _time.time() + scroll_secs
     scroll_count = 0
+    feed_pngs: list = []
+    last_snap = 0.0
+    snap_interval_s = 5.0
     while _time.time() < end_time:
         if feed_selector:
             page.evaluate(
@@ -530,6 +583,20 @@ def _do_feed(uc, src: dict, max_events: int = 30, page=None) -> list[dict]:
             page.evaluate("window.scrollBy(0, window.innerHeight * 2)")
         page.wait_for_timeout(800)
         scroll_count += 1
+
+        # Periodic GIF frame — only when capture is on. next_step()
+        # claims a step id but does NOT write a JSONL row (just advances
+        # the counter), which is what we want for raw frame captures.
+        if capture is not None and tracer is not None:
+            now = _time.time()
+            if now - last_snap >= snap_interval_s:
+                last_snap = now
+                try:
+                    p = capture.snap(page, step=tracer.next_step())
+                    if p is not None:
+                        feed_pngs.append(p)
+                except Exception as e:  # noqa: BLE001 — capture is duck-typed
+                    logger.debug("feed-snap failed for %s: %s", name, e)
 
     # Get page text — prefer feed container
     if feed_selector:
@@ -580,10 +647,44 @@ def _do_feed(uc, src: dict, max_events: int = 30, page=None) -> list[dict]:
             "content": page_text[:5000],
         })
 
+    # Snapshot the final URL before closing the page so we can attach
+    # it to the feed-gif trace row below.
+    final_url = url
+    try:
+        final_url = page.url or url
+    except Exception:
+        pass
     page.close()
+
+    # Assemble scroll-sequence GIF from the dwell-loop frames. Skips
+    # cleanly when capture is off or no frames were captured. Pillow
+    # missing -> gif_from_pngs returns None; we just don't record a row.
+    if capture is not None and tracer is not None and feed_pngs:
+        try:
+            gif_path = capture.gif_from_pngs(
+                feed_pngs, output=capture.out_dir / "feed.gif",
+            )
+            if gif_path is not None:
+                try:
+                    rel = str(gif_path.relative_to(tracer.out_dir))
+                except ValueError:
+                    rel = str(gif_path)
+                tracer.record(
+                    kind="feed-gif", url=final_url, image=rel,
+                    label="scroll-sequence",
+                )
+        except Exception as e:  # noqa: BLE001 — capture is duck-typed
+            logger.debug("feed-gif assembly failed for %s: %s", name, e)
 
     # Parse captured API responses
     for resp_url, resp_body in captured:
+        if tracer is not None:
+            try:
+                tracer.record(
+                    kind="xhr", url=resp_url, parent=None, label="feed-scroll",
+                )
+            except Exception:
+                pass
         try:
             data = json_mod.loads(resp_body)
             posts = _extract_posts_from_api(data, resp_url, name)
@@ -594,7 +695,28 @@ def _do_feed(uc, src: dict, max_events: int = 30, page=None) -> list[dict]:
     return messages
 
 
-def _do_search(uc, src: dict, timeout_ms: int, max_events: int, page=None) -> list[dict]:
+def _do_search(uc, src: dict, timeout_ms: int, max_events: int, page=None, tracer=None, capture=None) -> list[dict]:
+    """Search mode (OTel-wrapped). Body lives in ``_do_search_inner``."""
+    name = src.get("name", "web")
+    mode = "search"
+    otel_tracer = get_tracer("event_harvester.web_fetch")
+    with otel_tracer.start_as_current_span(f"web.{name}.{mode}") as span:
+        span.set_attribute("source.name", name)
+        span.set_attribute("source.mode", mode)
+        try:
+            messages = _do_search_inner(
+                uc, src, timeout_ms, max_events,
+                page=page, tracer=tracer, capture=capture,
+            )
+            span.set_attribute("message.count", len(messages))
+            return messages
+        except Exception as e:
+            span.set_attribute("error.message", str(e))
+            span.record_exception(e)
+            raise
+
+
+def _do_search_inner(uc, src: dict, timeout_ms: int, max_events: int, page=None, tracer=None, capture=None) -> list[dict]:
     """Search mode: detect search bar, query, scroll, extract event links."""
     from urllib.parse import urlparse
 
@@ -606,7 +728,7 @@ def _do_search(uc, src: dict, timeout_ms: int, max_events: int, page=None) -> li
     logger.info("Search: %s", name)
 
     if page is None:
-        page = uc.open(url)
+        page = uc.open(url, source_name=name, tracer=tracer, capture=capture)
     uc.detect_all(page)
     uc.dismiss_cookies(page)
     uc.close_modal(page)
@@ -709,13 +831,32 @@ def _do_search(uc, src: dict, timeout_ms: int, max_events: int, page=None) -> li
     return messages
 
 
-def _do_raw(uc, src: dict, page=None) -> list[dict]:
+def _do_raw(uc, src: dict, page=None, tracer=None, capture=None) -> list[dict]:
+    """Raw mode (OTel-wrapped). Body lives in ``_do_raw_inner``."""
+    name = src.get("name", "web")
+    mode = "raw"
+    otel_tracer = get_tracer("event_harvester.web_fetch")
+    with otel_tracer.start_as_current_span(f"web.{name}.{mode}") as span:
+        span.set_attribute("source.name", name)
+        span.set_attribute("source.mode", mode)
+        try:
+            messages = _do_raw_inner(uc, src, page=page, tracer=tracer, capture=capture)
+            span.set_attribute("message.count", len(messages))
+            return messages
+        except Exception as e:
+            span.set_attribute("error.message", str(e))
+            span.record_exception(e)
+            raise
+
+
+def _do_raw_inner(uc, src: dict, page=None, tracer=None, capture=None) -> list[dict]:
     """Raw mode: just load page and grab text."""
     from urllib.parse import urlparse
 
     url = src["url"]
+    name = src.get("name", "web")
     if page is None:
-        page = uc.open(url)
+        page = uc.open(url, source_name=name, tracer=tracer, capture=capture)
         html = _wait_cloudflare(page, headless=False)
     else:
         html = page.content()
@@ -737,7 +878,25 @@ def _do_raw(uc, src: dict, page=None) -> list[dict]:
     }]
 
 
-def _do_chat(uc, src: dict) -> list[dict]:
+def _do_chat(uc, src: dict, tracer=None, capture=None) -> list[dict]:
+    """Chat mode (OTel-wrapped). Body lives in ``_do_chat_inner``."""
+    name = src.get("name", "chat")
+    mode = "chat"
+    otel_tracer = get_tracer("event_harvester.web_fetch")
+    with otel_tracer.start_as_current_span(f"web.{name}.{mode}") as span:
+        span.set_attribute("source.name", name)
+        span.set_attribute("source.mode", mode)
+        try:
+            messages = _do_chat_inner(uc, src, tracer=tracer, capture=capture)
+            span.set_attribute("message.count", len(messages))
+            return messages
+        except Exception as e:
+            span.set_attribute("error.message", str(e))
+            span.record_exception(e)
+            raise
+
+
+def _do_chat_inner(uc, src: dict, tracer=None, capture=None) -> list[dict]:
     """Chat mode: query an AI chatbot and extract events from its response."""
     from urllib.parse import urlparse
 
@@ -748,7 +907,7 @@ def _do_chat(uc, src: dict) -> list[dict]:
 
     logger.info("Chat: %s (query: %s...)", name, query[:60])
 
-    page = uc.open(url, wait_ms=5000)
+    page = uc.open(url, wait_ms=5000, source_name=name, tracer=tracer, capture=capture)
     uc.dismiss_cookies(page)
     uc.close_modal(page)
 
@@ -802,6 +961,8 @@ def fetch_web_sources(
     timeout_ms: int = 30000,
     no_cooldown: bool = False,
     parallel: int = 1,
+    debug_trace: bool = False,
+    debug_screenshots: bool = False,
 ) -> list[dict]:
     """Fetch events from all configured web sources.
 
@@ -810,7 +971,20 @@ def fetch_web_sources(
     sources (``native_chrome: true``) stay in a single serial group to
     keep request rates low. Setting ``parallel=1`` restores the
     one-browser-for-everything behavior.
+
+    ``debug_trace`` (default off): when True, every page session is
+    recorded to ``data/.web_traces/<source>/<run-id>.jsonl`` via the
+    NavigationTracer. Useful for debugging which URLs a source actually
+    hit during a run.
+
+    ``debug_screenshots`` (default off): when True, capture per-step
+    PNG screenshots alongside the JSONL trace and assemble a
+    scroll-sequence GIF for feed sources. Implies ``debug_trace``.
     """
+    # Screenshots imply trace — see config.load_config(). Re-apply here
+    # so direct callers (tests, scripts) get the same implication.
+    if debug_screenshots:
+        debug_trace = True
     if sources is None:
         sources = _load_web_sources()
     if not sources:
@@ -833,82 +1007,141 @@ def fetch_web_sources(
 
     import concurrent.futures
 
+    def _make_tracer_and_capture(source_name: str):
+        """Build a (tracer, capture, run_id) triple for one source.
+
+        Returns ``(None, None, None)`` when ``debug_trace`` is off. When
+        ``debug_screenshots`` is also on, the capture writes to a
+        ``<tracer.out_dir>/<source>/<run_id>/`` subdirectory so the
+        JSONL row's ``image`` field can be stored relative to
+        ``tracer.out_dir`` as ``<source>/<run_id>/<step>.png``.
+        """
+        if not debug_trace:
+            return None, None, None
+        from event_harvester.navigation_trace import NavigationTracer
+        import time as _t
+        import secrets as _sec
+        run_id = _t.strftime("%Y%m%dT%H%M%S") + "_" + _sec.token_hex(2)
+        tracer = None
+        try:
+            tracer = NavigationTracer(source_name=source_name, run_id=run_id)
+        except Exception as e:
+            logger.debug("NavigationTracer init failed for %s: %s", source_name, e)
+            return None, None, None
+        capture = None
+        if debug_screenshots:
+            # Lazy import: keeps screenshot module out of the import
+            # graph when --debug-web-screenshots is off.
+            try:
+                from event_harvester.screenshot_capture import ScreenshotCapture
+                capture = ScreenshotCapture(
+                    out_dir=tracer.out_dir / source_name / run_id,
+                )
+            except Exception as e:
+                logger.debug("ScreenshotCapture init failed for %s: %s", source_name, e)
+                capture = None
+        return tracer, capture, run_id
+
     def _process_group(group: list[dict], **uc_kwargs) -> list[dict]:
         from event_harvester.sources.uc_browser import UCBrowser
 
+        tracer_otel = get_tracer("event_harvester.web_fetch")
         messages = []
         cf_retries = []
         with UCBrowser(**uc_kwargs) as uc:
             for src in group:
                 mode = src.get("mode")
                 name = src.get("name", src["url"])
-                try:
-                    # Chat mode doesn't need page pre-open
-                    if mode == "chat":
-                        msgs = _do_chat(uc, src)
+                tracer, capture, _run_id = _make_tracer_and_capture(name)
+                with tracer_otel.start_as_current_span(f"web.{name}") as src_span:
+                    src_span.set_attribute("source.name", name)
+                    src_span.set_attribute("source.url", src.get("url", ""))
+                    src_span.set_attribute("source.mode", src.get("mode", "auto") or "auto")
+                    try:
+                        # Chat mode doesn't need page pre-open
+                        if mode == "chat":
+                            msgs = _do_chat(uc, src, tracer=tracer, capture=capture)
+                            messages.extend(msgs)
+                            if msgs:
+                                _save_cooldown(src["url"])
+                            logger.info("%s: %d messages.", name, len(msgs))
+                            continue
+
+                        # All other modes: open page, detect mode if needed
+                        page = uc.open(
+                            src["url"], source_name=name, tracer=tracer, capture=capture,
+                        )
+                        html = _wait_cloudflare(page, headless=False)
+
+                        # Cloudflare blocked — queue for native Chrome retry
+                        if "just a moment" in html.lower():
+                            if not uc_kwargs.get("native_chrome"):
+                                logger.info("%s: Cloudflare — queuing for native Chrome retry.", name)
+                                cf_retries.append(src)
+                                page.close()
+                                continue
+
+                        # Auto-mode: check saved signatures, then detect
+                        if not mode or mode == "auto":
+                            uc.detect_all(page)
+                            uc.dismiss_cookies(page)
+                            uc.close_modal(page)
+
+                            # Check saved signature first
+                            try:
+                                sigs = uc.load_signatures(page)
+                                mode_sig = next(
+                                    (s for s in sigs if s.get("pattern", "").startswith("mode:")),
+                                    None,
+                                )
+                                if mode_sig:
+                                    mode = mode_sig["pattern"].split(":")[1]
+                                    logger.info("%s: saved signature → mode=%s", name, mode)
+                            except Exception:
+                                pass
+
+                            if not mode or mode == "auto":
+                                mode = _detect_mode(uc, page, src)
+                                logger.info("%s: auto-detected mode=%s", name, mode)
+
+                        # Dispatch with pre-opened page
+                        if mode == "calendar":
+                            msgs = _do_calendar(uc, src, timeout_ms, max_events, page=page, tracer=tracer, capture=capture)
+                        elif mode == "feed":
+                            msgs = _do_feed(uc, src, max_events, page=page, tracer=tracer, capture=capture)
+                        elif mode == "search":
+                            msgs = _do_search(uc, src, timeout_ms, max_events, page=page, tracer=tracer, capture=capture)
+                        else:
+                            msgs = _do_raw(uc, src, page=page, tracer=tracer, capture=capture)
+
+                        # Save mode as signature on success
+                        if msgs:
+                            try:
+                                uc.save_signature(page, f"mode:{mode}")
+                            except Exception:
+                                pass
                         messages.extend(msgs)
                         if msgs:
                             _save_cooldown(src["url"])
                         logger.info("%s: %d messages.", name, len(msgs))
-                        continue
-
-                    # All other modes: open page, detect mode if needed
-                    page = uc.open(src["url"])
-                    html = _wait_cloudflare(page, headless=False)
-
-                    # Cloudflare blocked — queue for native Chrome retry
-                    if "just a moment" in html.lower():
-                        if not uc_kwargs.get("native_chrome"):
-                            logger.info("%s: Cloudflare — queuing for native Chrome retry.", name)
-                            cf_retries.append(src)
-                            page.close()
-                            continue
-
-                    # Auto-mode: check saved signatures, then detect
-                    if not mode or mode == "auto":
-                        uc.detect_all(page)
-                        uc.dismiss_cookies(page)
-                        uc.close_modal(page)
-
-                        # Check saved signature first
+                    except Exception as e:
+                        logger.error("Failed %s (%s): %s", name, mode, e)
+                        src_span.set_attribute("error.message", str(e))
                         try:
-                            sigs = uc.load_signatures(page)
-                            mode_sig = next(
-                                (s for s in sigs if s.get("pattern", "").startswith("mode:")),
-                                None,
-                            )
-                            if mode_sig:
-                                mode = mode_sig["pattern"].split(":")[1]
-                                logger.info("%s: saved signature → mode=%s", name, mode)
+                            src_span.record_exception(e)
                         except Exception:
                             pass
-
-                        if not mode or mode == "auto":
-                            mode = _detect_mode(uc, page, src)
-                            logger.info("%s: auto-detected mode=%s", name, mode)
-
-                    # Dispatch with pre-opened page
-                    if mode == "calendar":
-                        msgs = _do_calendar(uc, src, timeout_ms, max_events, page=page)
-                    elif mode == "feed":
-                        msgs = _do_feed(uc, src, max_events, page=page)
-                    elif mode == "search":
-                        msgs = _do_search(uc, src, timeout_ms, max_events, page=page)
-                    else:
-                        msgs = _do_raw(uc, src, page=page)
-
-                    # Save mode as signature on success
-                    if msgs:
-                        try:
-                            uc.save_signature(page, f"mode:{mode}")
-                        except Exception:
-                            pass
-                    messages.extend(msgs)
-                    if msgs:
-                        _save_cooldown(src["url"])
-                    logger.info("%s: %d messages.", name, len(msgs))
-                except Exception as e:
-                    logger.error("Failed %s (%s): %s", name, mode, e)
+                    finally:
+                        if tracer is not None:
+                            try:
+                                tracer.close()
+                            except Exception:
+                                pass
+                        if capture is not None:
+                            try:
+                                capture.close()
+                            except Exception:
+                                pass
         return messages, cf_retries
 
     # Split standard sources across ``parallel`` UCBrowsers; native_chrome

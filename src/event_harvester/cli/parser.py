@@ -89,6 +89,14 @@ def _add_harvest_args(p: argparse.ArgumentParser) -> None:
         help="Ignore web source cooldowns (force re-fetch)",
     )
     p.add_argument(
+        "--debug-web-trace", action="store_true",
+        help="Record web page navigation events to data/.web_traces/ (JSONL per source)",
+    )
+    p.add_argument(
+        "--debug-web-screenshots", action="store_true",
+        help="Capture per-step PNG screenshots + feed GIFs alongside the JSONL trace (implies --debug-web-trace)",
+    )
+    p.add_argument(
         "--profile", metavar="NAME",
         help="Apply a named profile from data/profiles.json before per-flag overrides",
     )
@@ -111,6 +119,10 @@ def _add_harvest_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--auto-trash", action="store_true",
         help="Auto-trash recruiter emails scoring below 20 (with --grade-recruiters)",
+    )
+    p.add_argument(
+        "--debug-otel", action="store_true",
+        help="Enable OpenTelemetry console span exporter (prints spans to stderr)",
     )
 
 
@@ -170,6 +182,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_watch.add_argument(
         "--profile", metavar="NAME",
         help="Apply a named profile from data/profiles.json",
+    )
+    p_watch.add_argument(
+        "--debug-web-trace", action="store_true",
+        help="Record web page navigation events to data/.web_traces/ (JSONL per source)",
+    )
+    p_watch.add_argument(
+        "--debug-web-screenshots", action="store_true",
+        help="Capture per-step PNG screenshots + feed GIFs alongside the JSONL trace (implies --debug-web-trace)",
+    )
+    p_watch.add_argument(
+        "--debug-otel", action="store_true",
+        help="Enable OpenTelemetry console span exporter (prints spans to stderr)",
     )
     _add_root_flags(p_watch)
 
@@ -305,6 +329,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument(
         "--profile", metavar="NAME",
         help="Apply a named profile from data/profiles.json on launch",
+    )
+    p_serve.add_argument(
+        "--debug-web-trace", action="store_true",
+        help="Record web page navigation events to data/.web_traces/ (JSONL per source)",
+    )
+    p_serve.add_argument(
+        "--debug-web-screenshots", action="store_true",
+        help="Capture per-step PNG screenshots + feed GIFs alongside the JSONL trace (implies --debug-web-trace)",
+    )
+    p_serve.add_argument(
+        "--debug-otel", action="store_true",
+        help="Enable OpenTelemetry console span exporter (prints spans to stderr)",
     )
     _add_root_flags(p_serve)
 

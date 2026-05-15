@@ -13,7 +13,9 @@ is rendered directly (used when events are already extracted out-of-band).
 """
 
 import asyncio
+import json
 import logging
+from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
 import flet as ft
@@ -31,6 +33,7 @@ _PIPELINE_STAGES: list[tuple[str, str]] = [
     ("filter", "Filter read/sent"),
     ("extract", "Extract events (LLM)"),
     ("match", "Match fingerprints"),
+    ("quality_check", "Quality check"),
     ("done", "Done"),
 ]
 
@@ -143,8 +146,13 @@ class _UILogHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
+            from event_harvester.logging_tags import task_tag
             color = ft.Colors.RED if record.levelno >= logging.ERROR else None
-            self.reporter.log(self.format(record), color=color)
+            line = self.format(record)
+            tag = task_tag.get()
+            if tag:
+                line = f"[{tag}] {line}"
+            self.reporter.log(line, color=color)
         except Exception:
             self.handleError(record)
 
@@ -500,6 +508,200 @@ class EventsApp:
         if not panels:
             return None
         return ft.ExpansionPanelList(panels, elevation=1)
+
+    def _build_traces_panel(self) -> "ft.Control | None":
+        """Scan data/.web_traces/, render one collapsible panel per source with
+        the most recent run's trace entries inline. Returns None when no traces
+        exist or screenshots are disabled."""
+        if not getattr(self.cfg.web, "debug_screenshots", False):
+            return None
+
+        traces_root = Path("data/.web_traces")
+        if not traces_root.is_dir():
+            return None
+
+        source_dirs = sorted(p for p in traces_root.iterdir() if p.is_dir())
+        if not source_dirs:
+            return None
+
+        tiles: list[ft.Control] = []
+        for source_dir in source_dirs:
+            runs = sorted(source_dir.glob("*.jsonl"), reverse=True)
+            if not runs:
+                continue
+            latest = runs[0]
+            run_id = latest.stem
+
+            records: list[dict] = []
+            try:
+                with latest.open("r", encoding="utf-8") as fh:
+                    for lineno, raw in enumerate(fh, start=1):
+                        line = raw.strip()
+                        if not line:
+                            continue
+                        try:
+                            records.append(json.loads(line))
+                        except json.JSONDecodeError as ex:
+                            logger.warning(
+                                "Malformed trace line %s:%d (%s)",
+                                latest, lineno, ex,
+                            )
+            except OSError as ex:
+                logger.warning("Could not read trace %s: %s", latest, ex)
+                continue
+
+            if not records:
+                continue
+
+            # Look for a quality.json sidecar written by NavQualityScorer.
+            quality_path = source_dir / run_id / "quality.json"
+            quality_data: Optional[dict] = None
+            if quality_path.exists():
+                try:
+                    quality_data = json.loads(
+                        quality_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, json.JSONDecodeError) as ex:
+                    logger.warning(
+                        "Malformed quality.json at %s: %s",
+                        quality_path, ex,
+                    )
+                    quality_data = None
+
+            row_controls: list[ft.Control] = []
+            if quality_data is not None:
+                classification = quality_data.get("classification", "unknown")
+                nav_score = quality_data.get("nav_score", 0)
+                vlm_explanation = quality_data.get("vlm_explanation", "") or ""
+                if classification == "content":
+                    badge_color = ft.Colors.GREEN
+                elif classification in {"empty", "cookie_banner", "unknown"}:
+                    badge_color = ft.Colors.AMBER
+                else:
+                    badge_color = ft.Colors.RED
+                row_controls.append(
+                    ft.Container(
+                        content=ft.Column(
+                            [
+                                ft.Row(
+                                    [
+                                        ft.Icon(
+                                            ft.Icons.CIRCLE,
+                                            color=badge_color,
+                                            size=14,
+                                        ),
+                                        ft.Text(
+                                            f"{classification}",
+                                            weight=ft.FontWeight.W_500,
+                                        ),
+                                        ft.Text(
+                                            f"score {nav_score}",
+                                            size=12,
+                                            color=ft.Colors.OUTLINE,
+                                        ),
+                                    ],
+                                    spacing=8,
+                                ),
+                                ft.Text(
+                                    vlm_explanation,
+                                    size=12,
+                                    color=ft.Colors.OUTLINE,
+                                    selectable=True,
+                                ),
+                            ],
+                            spacing=4,
+                        ),
+                        padding=8,
+                    )
+                )
+            for rec in records:
+                step = rec.get("step", "?")
+                kind = rec.get("kind", "?")
+                url = rec.get("url", "")
+                row_controls.append(
+                    ft.Row([
+                        ft.Text(
+                            f"{step:>3} | {kind:>14} | {url}",
+                            size=12,
+                            font_family="monospace",
+                            selectable=True,
+                        ),
+                    ])
+                )
+                image_value = rec.get("image")
+                if image_value:
+                    abs_path = (traces_root / image_value).resolve()
+                    if abs_path.exists():
+                        row_controls.append(
+                            ft.Image(
+                                src=str(abs_path),
+                                width=400,
+                                fit=ft.ImageFit.CONTAIN,
+                                error_content=ft.Text("(missing image)"),
+                            )
+                        )
+
+            # Build the tile title: with a quality badge if available,
+            # otherwise the plain step-count title (Phase 2 behavior).
+            if quality_data is not None:
+                classification = quality_data.get("classification", "unknown")
+                nav_score = quality_data.get("nav_score", 0)
+                if classification == "content":
+                    emoji = "\U0001F7E2"  # green circle
+                elif classification in {"empty", "cookie_banner", "unknown"}:
+                    emoji = "\U0001F7E1"  # yellow circle
+                else:
+                    emoji = "\U0001F534"  # red circle
+                title_control: ft.Control = ft.Row(
+                    [
+                        ft.Text(emoji, size=18),
+                        ft.Text(
+                            f"{source_dir.name} - {classification}",
+                            weight=ft.FontWeight.W_500,
+                        ),
+                        ft.Text(
+                            f"score {nav_score}",
+                            size=12,
+                            color=ft.Colors.OUTLINE,
+                        ),
+                        ft.Text(
+                            f"({len(records)} steps)",
+                            size=12,
+                            color=ft.Colors.OUTLINE,
+                        ),
+                    ],
+                    spacing=8,
+                )
+            else:
+                title_control = ft.Text(
+                    f"{source_dir.name} ({len(records)} steps)"
+                )
+
+            tiles.append(
+                ft.ExpansionTile(
+                    title=title_control,
+                    maintain_state=False,
+                    controls=[
+                        ft.Container(
+                            content=ft.ListView(
+                                controls=row_controls,
+                                spacing=6,
+                                padding=10,
+                            ),
+                            height=360,
+                        ),
+                    ],
+                )
+            )
+
+        if not tiles:
+            return None
+
+        return ft.Container(
+            content=ft.Column(tiles, scroll=ft.ScrollMode.AUTO),
+            padding=10,
+            expand=False,
+        )
 
     # ── Progress view helpers ───────────────────────────────────────────
 
@@ -955,6 +1157,10 @@ class EventsApp:
         if reject_panels:
             pipeline_section.controls.append(reject_panels)
 
+        traces = self._build_traces_panel()
+        if traces is not None:
+            pipeline_section.controls.append(traces)
+
         # Keep the live log accessible via an expander
         if self._log_column is not None and self._log_column.controls:
             log_panel = ft.ExpansionTile(
@@ -1204,10 +1410,13 @@ class EventsApp:
 
         if self.pipeline_runner is not None and not self._pipeline_done:
             self._render_progress_view()
-            # Auto-start on first load. The user can Stop/Pause/Restart from
-            # the action bar after that.
-            self._state = "running"
-            self._pipeline_task = page.run_task(self._run_pipeline)
+            # Only auto-start on the first session. Extra Flet sessions
+            # (e.g. a stale browser tab reconnecting) attach to the in-flight
+            # run as read-only viewers instead of firing a second pipeline,
+            # which would race on shared session files (Telegram SQLite, etc).
+            if self._state == "idle":
+                self._state = "running"
+                self._pipeline_task = page.run_task(self._run_pipeline)
             self._update_action_bar()
         else:
             self._render_events_view()
