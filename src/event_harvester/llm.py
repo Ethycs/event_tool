@@ -6,7 +6,9 @@ directly.  The backend is chosen by ``LLMConfig.backend``.
 
 from __future__ import annotations
 
+import base64
 import logging
+from pathlib import Path
 from typing import Any
 
 from event_harvester.config import LLMConfig
@@ -143,3 +145,70 @@ def _complete_local(
         result["elapsed_s"],
     )
     return result["text"]
+
+
+def _resolve_vision_model(cfg: LLMConfig) -> str:
+    """Pick the vision model: explicit cfg.vision_model wins, else auto-pick
+    from the api_key prefix. ``cfg.vision_model`` may not exist on
+    ``LLMConfig`` yet (added by another agent); ``getattr`` keeps this
+    function robust until then.
+    """
+    explicit = getattr(cfg, "vision_model", "") or ""
+    if explicit:
+        return explicit
+    if cfg.api_key.startswith("sk-ant-"):
+        return "claude-sonnet-4-7"
+    return "gpt-4o-mini"
+
+
+def vision_completion(
+    prompt: str,
+    image_paths: list[Path],
+    cfg: LLMConfig,
+    *,
+    max_tokens: int = 1024,
+) -> str:
+    """Call a vision-capable LLM with one or more PNG images + a text prompt.
+
+    Returns the assistant's text response. Raises on transport/API errors so
+    the caller decides retry policy. Missing image files are logged and
+    skipped (not fatal). Logs a warning if more than 5 images are sent.
+    """
+    global _litellm_init
+    if not _litellm_init:
+        _suppress_litellm_noise()
+        _litellm_init = True
+
+    if len(image_paths) > 5:
+        logger.warning(
+            "vision_completion: sending %d images (>5) — cost may be high",
+            len(image_paths),
+        )
+
+    content: list[dict[str, Any]] = []
+    for path in image_paths:
+        if not path.exists():
+            logger.warning("vision_completion: image %s missing, skipping", path)
+            continue
+        b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{b64}"},
+        })
+    content.append({"type": "text", "text": prompt})
+
+    model = _resolve_vision_model(cfg)
+    logger.info(
+        "vision_completion: model=%s images=%d",
+        model,
+        len(image_paths),
+    )
+
+    import litellm
+
+    resp = litellm.completion(
+        model=model,
+        messages=[{"role": "user", "content": content}],
+        max_tokens=max_tokens,
+    )
+    return resp.choices[0].message.content

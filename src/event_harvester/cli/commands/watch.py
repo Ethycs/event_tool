@@ -15,6 +15,12 @@ async def watch_cmd(args, cfg) -> int:
         if not apply_profile_by_name(cfg, args.profile):
             return 2
 
+    if getattr(args, "debug_web_trace", False):
+        cfg.web.debug_trace = True
+    if getattr(args, "debug_web_screenshots", False):
+        cfg.web.debug_screenshots = True
+        cfg.web.debug_trace = True  # screenshots imply trace
+
     platform_kwargs = resolve_platforms(args.only, args.skip)
     no_telegram = platform_kwargs["no_telegram"]
     no_discord = platform_kwargs["no_discord"]

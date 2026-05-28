@@ -41,6 +41,7 @@ data/.watermarks.json
 data/.event_fingerprints.json
 data/.playwright_state.json
 data/.chrome_profile/
+data/.web_traces/
 data/*
 
 # Trained classifier models

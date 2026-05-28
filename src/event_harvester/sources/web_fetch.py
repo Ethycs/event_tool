@@ -59,9 +59,9 @@ _WEB_SOURCES_FILE = _DATA_DIR / "web_sources.json"
 
 # Fallback defaults (used only if data/web_sources.json is missing).
 _DEFAULT_SOURCES = [
-    {"url": "https://lu.ma/discover", "name": "luma", "mode": "calendar"},
-    {"url": "https://business.sfchamber.com/events/calendar", "name": "sfchamber", "mode": "calendar"},
-    {"url": "https://www.erobay.com/", "name": "erobay", "mode": "calendar", "native_chrome": True, "cooldown_hours": 4},
+    {"url": "https://lu.ma/discover", "name": "luma", "mode": "calendar", "scroll_seconds": 5},
+    {"url": "https://business.sfchamber.com/events/calendar", "name": "sfchamber", "mode": "calendar", "scroll_seconds": 5},
+    {"url": "https://www.erobay.com/", "name": "erobay", "mode": "calendar", "native_chrome": True, "cooldown_hours": 4, "scroll_seconds": 5},
     {"url": "https://www.instagram.com/", "name": "instagram", "mode": "feed", "api_pattern": r"graphql", "scroll_seconds": 25, "api_only": True},
     {"url": "https://www.eventbrite.com/d/ca--san-francisco/events/", "name": "eventbrite", "mode": "feed", "api_pattern": r"api|search|events", "scroll_seconds": 15},
     {"url": "https://www.meetup.com/find/?source=EVENTS&eventType=inPerson&sortField=RELEVANCE", "name": "meetup", "mode": "search", "query": "AI meetup", "scroll_seconds": 10},
@@ -309,6 +309,33 @@ def _parse_calcium_links(html: str) -> list[dict]:
     return links
 
 
+DEFAULT_SCROLL_SECONDS = 5
+
+
+def _scroll_for_seconds(page, seconds: int, step_ms: int = 800) -> None:
+    """Scroll one viewport every ``step_ms`` for ``seconds`` total seconds.
+
+    Time-bounded (wall clock), not iteration-bounded. Every ``_do_*`` mode
+    that exposes a per-source ``scroll_seconds`` knob routes through here so
+    "scroll time" means the same thing across calendar / search / raw modes.
+    Feed mode keeps its own dwell loop because it interleaves API capture
+    and GIF-frame snapshots with each scroll.
+
+    Tolerates ``page.evaluate`` failures (page may close mid-scroll on
+    Cloudflare redirects, etc.) by returning early.
+    """
+    if seconds <= 0:
+        return
+    import time as _time
+    end = _time.time() + seconds
+    while _time.time() < end:
+        try:
+            page.evaluate("window.scrollBy(0, window.innerHeight)")
+        except Exception:
+            return
+        page.wait_for_timeout(step_ms)
+
+
 def _do_calendar(uc, src: dict, timeout_ms: int, max_events: int, page=None, tracer=None, capture=None) -> list[dict]:
     """Calendar mode (OTel-wrapped). Body lives in ``_do_calendar_inner``."""
     name = src.get("name", "web")
@@ -397,10 +424,7 @@ def _do_calendar_inner(uc, src: dict, timeout_ms: int, max_events: int, page=Non
     uc.close_modal(page)
 
     # Scroll to load lazy content before extracting links
-    scroll_secs = src.get("scroll_seconds", 3)
-    for _ in range(scroll_secs):
-        page.evaluate("window.scrollBy(0, window.innerHeight)")
-        page.wait_for_timeout(800)
+    _scroll_for_seconds(page, src.get("scroll_seconds", DEFAULT_SCROLL_SECONDS))
 
     # Extract event links via DOM-graph date↔link association
     event_links = _extract_event_links(page)
@@ -722,7 +746,7 @@ def _do_search_inner(uc, src: dict, timeout_ms: int, max_events: int, page=None,
 
     url = src["url"]
     query = src.get("query")
-    scroll_secs = src.get("scroll_seconds", 10)
+    scroll_secs = src.get("scroll_seconds", DEFAULT_SCROLL_SECONDS)
     name = src.get("name", "web")
 
     logger.info("Search: %s", name)
@@ -788,9 +812,7 @@ def _do_search_inner(uc, src: dict, timeout_ms: int, max_events: int, page=None,
                             name, diff.get("changed", 0), diff.get("added", 0))
 
     # Scroll
-    for _ in range(scroll_secs):
-        page.evaluate("window.scrollBy(0, window.innerHeight)")
-        page.wait_for_timeout(1000)
+    _scroll_for_seconds(page, scroll_secs, step_ms=1000)
 
     # Extract event links, filter already-known ones
     event_links = _filter_known_links(_extract_event_links(page))[:max_events]
@@ -861,6 +883,13 @@ def _do_raw_inner(uc, src: dict, page=None, tracer=None, capture=None) -> list[d
     else:
         html = page.content()
     uc.dismiss_cookies(page)
+    # Scroll so lazy-loaded content lands in the HTML we hand to the extractor.
+    _scroll_for_seconds(page, src.get("scroll_seconds", DEFAULT_SCROLL_SECONDS))
+    if page is not None:
+        try:
+            html = page.content()
+        except Exception:
+            pass
     text = _extract_text(html)
     page.close()
 

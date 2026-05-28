@@ -48,6 +48,12 @@ async def harvest_cmd(args, cfg) -> int:
     if args.group_by_source:
         cfg.caps.group_by_source = True
 
+    if getattr(args, "debug_web_trace", False):
+        cfg.web.debug_trace = True
+    if getattr(args, "debug_web_screenshots", False):
+        cfg.web.debug_screenshots = True
+        cfg.web.debug_trace = True  # screenshots imply trace
+
     # Validate config based on which sources are active
     platform_kwargs = resolve_platforms(args.only, args.skip)
     warnings = validate_config(

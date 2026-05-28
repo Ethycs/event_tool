@@ -1,9 +1,8 @@
 """Tests for LLM analysis - prompt building and response parsing."""
 
-import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-from event_harvester.analysis import extract_events_llm, build_prompt
+from event_harvester.analysis import build_prompt, extract_events_llm
 from event_harvester.config import LLMConfig
 
 
@@ -72,7 +71,16 @@ class TestAnalyseAndExtractTasks:
         assert tasks == []
 
     def test_parses_valid_response(self, sample_messages):
-        llm_response = "[Event.1]\ntitle = Team Standup\ndate = 2026-04-01\ntime = 10:00\nlocation = online\nlink = TBD\nsource = @alice in #123456\ndetails = Daily standup meeting"
+        llm_response = (
+            "[Event.1]\n"
+            "title = Team Standup\n"
+            "date = 2099-04-01\n"
+            "time = 10:00\n"
+            "location = online\n"
+            "link = TBD\n"
+            "source = @alice in #123456\n"
+            "details = Daily standup meeting"
+        )
 
         cfg = LLMConfig(model="openrouter/test-model")
 
@@ -87,7 +95,7 @@ class TestAnalyseAndExtractTasks:
 
         assert len(events) == 1
         assert events[0]["title"] == "Team Standup"
-        assert events[0]["date"] == "2026-04-01"
+        assert events[0]["date"] == "2099-04-01"
 
     def test_handles_no_events(self, sample_messages):
         cfg = LLMConfig(model="openrouter/test-model")

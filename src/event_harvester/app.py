@@ -636,7 +636,7 @@ class EventsApp:
                             ft.Image(
                                 src=str(abs_path),
                                 width=400,
-                                fit=ft.ImageFit.CONTAIN,
+                                fit=ft.BoxFit.CONTAIN,
                                 error_content=ft.Text("(missing image)"),
                             )
                         )

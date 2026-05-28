@@ -228,6 +228,29 @@ class TestParserRouting:
         args = self.parser.parse_args(["serve"])
         assert args.command == "serve"
 
+    def test_mcp_defaults_to_stdio(self):
+        args = self.parser.parse_args(["mcp"])
+        assert args.command == "mcp"
+        assert args.transport == "stdio"
+        assert args.host == "127.0.0.1"
+        assert args.port == 8765
+        assert args.path == "/mcp"
+
+    def test_mcp_streamable_http(self):
+        args = self.parser.parse_args(
+            [
+                "mcp",
+                "--transport", "streamable-http",
+                "--host", "0.0.0.0",
+                "--port", "9000",
+                "--path", "/events",
+            ],
+        )
+        assert args.transport == "streamable-http"
+        assert args.host == "0.0.0.0"
+        assert args.port == 9000
+        assert args.path == "/events"
+
     def test_no_command_required(self):
         # Without normalization, bare invocation must fail
         with pytest.raises(SystemExit):
@@ -319,6 +342,9 @@ class TestNormalizeArgv:
 
     def test_web_subcommand_unchanged(self):
         assert self.normalize(["web", "list"]) == ["web", "list"]
+
+    def test_mcp_subcommand_unchanged(self):
+        assert self.normalize(["mcp"]) == ["mcp"]
 
 
 # ── Backward compat (post-normalization) ─────────────────────────────

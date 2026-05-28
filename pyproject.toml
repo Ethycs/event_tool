@@ -54,6 +54,7 @@ playwright-stealth = ">=2.0.2,<3"
 
 [tool.pixi.pypi-dependencies]
 event-harvester = { path = ".", editable = true }
+universal_controller = { path = "ext/universal_controller", editable = true }
 
 [tool.pixi.environments]
 default = { solve-group = "default" }

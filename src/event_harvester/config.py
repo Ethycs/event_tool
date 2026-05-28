@@ -37,6 +37,17 @@ class LLMConfig:
     tokenizer_path: str = ""  # path to tokenizer directory (HF format)
     device: str = "npu"  # "npu", "gpu", or "cpu"
 
+    # Vision model overrides — used by ``llm.vision_completion`` and
+    # ``nav_quality.NavQualityScorer``. Empty ``vision_model`` means
+    # auto-pick based on the API key prefix (sk-ant- → Claude Sonnet,
+    # otherwise gpt-4o-mini).
+    vision_model: str = ""
+    # Hard ceiling on how many images a single pipeline run is allowed
+    # to send to the VLM. Acts as a cost guard for the nav-quality
+    # scorer; once exceeded, subsequent ``score_source`` calls
+    # short-circuit to classification="unknown".
+    vision_max_images_per_run: int = 10
+
     @property
     def is_configured(self) -> bool:
         if self.backend == "local":
@@ -124,6 +135,16 @@ class WebConfig:
     # sources (native_chrome=True) stay serial regardless. 1 = single
     # browser (old behavior).
     parallel: int = 3
+    # When True, record every web page session (navigation, popups, XHR
+    # for feed mode) to data/.web_traces/<source>/<run-id>.jsonl via
+    # NavigationTracer. Set via --debug-web-trace CLI flag or
+    # WEB_DEBUG_TRACE=1 env var.
+    debug_trace: bool = False
+    # When True, capture per-step PNG screenshots alongside the JSONL
+    # trace (and assemble a scroll-sequence GIF for feed sources). Set
+    # via --debug-web-screenshots CLI flag or WEB_DEBUG_SCREENSHOTS=1
+    # env var. Implies debug_trace=True — see load_config().
+    debug_screenshots: bool = False
 
 
 @dataclass
@@ -222,7 +243,27 @@ def load_config() -> AppConfig:
     except ValueError:
         days_back = 7
 
-    return AppConfig(
+    # API key resolution: prefer OPENAI_API_KEY for backward compat, but
+    # fall back to ANTHROPIC_API_KEY so Anthropic-only users get the
+    # sk-ant- auto-detection inside vision_completion. Either env var is
+    # also accepted by litellm directly when called.
+    llm_api_key = os.getenv("OPENAI_API_KEY", "") or os.getenv("ANTHROPIC_API_KEY", "")
+
+    vlm_max_raw = os.getenv("VLM_MAX_IMAGES_PER_RUN", "").strip()
+    if vlm_max_raw:
+        try:
+            vlm_max_images = int(vlm_max_raw)
+        except ValueError:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "VLM_MAX_IMAGES_PER_RUN=%r is not an int; keeping default 10",
+                vlm_max_raw,
+            )
+            vlm_max_images = 10
+    else:
+        vlm_max_images = 10
+
+    cfg = AppConfig(
         telegram=TelegramConfig(
             api_id=api_id,
             api_hash=os.getenv("TELEGRAM_API_HASH", ""),
@@ -241,11 +282,13 @@ def load_config() -> AppConfig:
         ),
         llm=LLMConfig(
             model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
-            api_key=os.getenv("OPENAI_API_KEY", ""),
+            api_key=llm_api_key,
             backend=os.getenv("LLM_BACKEND", "litellm"),
             model_path=os.getenv("LLM_MODEL_PATH", ""),
             tokenizer_path=os.getenv("LLM_TOKENIZER_PATH", ""),
             device=os.getenv("LLM_DEVICE", "npu"),
+            vision_model=os.getenv("VLM_MODEL", ""),
+            vision_max_images_per_run=vlm_max_images,
         ),
         ticktick=TickTickConfig(
             client_id=os.getenv("TICKTICK_CLIENT_ID", ""),
@@ -262,6 +305,8 @@ def load_config() -> AppConfig:
             no_cooldown=os.getenv("WEB_NO_COOLDOWN", "").lower() in ("1", "true", "yes"),
             selected_names=_parse_csv_env("WEB_SOURCE_NAMES"),
             parallel=max(1, int(os.getenv("WEB_PARALLEL", "3"))),
+            debug_trace=os.getenv("WEB_DEBUG_TRACE", "").lower() in ("1", "true", "yes"),
+            debug_screenshots=os.getenv("WEB_DEBUG_SCREENSHOTS", "").lower() in ("1", "true", "yes"),
         ),
         caps=CapConfig(
             discord=int(os.getenv("CAP_DISCORD", "50")),
@@ -287,6 +332,11 @@ def load_config() -> AppConfig:
         telegram_channels=_parse_csv_env("TELEGRAM_CHANNELS"),
         telegram_exclude=_parse_csv_env("TELEGRAM_EXCLUDE"),
     )
+    # Screenshots imply trace — the JSONL is where the image refs live,
+    # so capturing PNGs without recording the trace would lose them.
+    if cfg.web.debug_screenshots:
+        cfg.web.debug_trace = True
+    return cfg
 
 
 def validate_config(
