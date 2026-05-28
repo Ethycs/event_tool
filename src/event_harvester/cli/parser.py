@@ -348,6 +348,15 @@ def build_parser() -> argparse.ArgumentParser:
         default="/mcp",
         help="HTTP path for streamable-http transport (default: /mcp)",
     )
+    p_mcp.add_argument(
+        "--allow-any-host",
+        action="store_true",
+        help=(
+            "Disable FastMCP's DNS-rebinding host-header check. Required when "
+            "running behind a reverse proxy or tunnel (ngrok, Cloudflare, etc.) "
+            "so requests with non-loopback Host headers aren't rejected with 421."
+        ),
+    )
     _add_root_flags(p_mcp)
 
     return parser

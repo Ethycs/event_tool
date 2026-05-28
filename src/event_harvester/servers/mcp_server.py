@@ -299,15 +299,30 @@ def build_server(
     port: int = 8765,
     streamable_http_path: str = "/mcp",
     log_level: str = "INFO",
+    allow_any_host: bool = False,
 ):
-    """Build and return the FastMCP server instance."""
+    """Build and return the FastMCP server instance.
+
+    ``allow_any_host`` disables FastMCP's DNS-rebinding protection. Set this
+    when running behind a reverse proxy or tunnel (ngrok, Cloudflare, etc.)
+    where the inbound ``Host`` header doesn't match the bound interface.
+    Loopback binds default to host-validated mode otherwise.
+    """
     try:
         from mcp.server.fastmcp import FastMCP
+        from mcp.server.transport_security import TransportSecuritySettings
     except ImportError as exc:  # pragma: no cover - depends on optional runtime install
         raise RuntimeError(
             "The MCP SDK is not installed. Install the project dependencies again "
             "or run: pip install 'mcp[cli]>=1,<2'"
         ) from exc
+
+    transport_security = None
+    if allow_any_host:
+        # Explicit opt-out of the FastMCP loopback host check.
+        transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=False,
+        )
 
     server = FastMCP(
         "event-harvester",
@@ -321,6 +336,7 @@ def build_server(
         json_response=True,
         stateless_http=True,
         log_level=log_level,
+        transport_security=transport_security,
     )
 
     @server.resource(
@@ -513,6 +529,7 @@ async def run_server_async(
     port: int = 8765,
     path: str = "/mcp",
     log_level: str = "INFO",
+    allow_any_host: bool = False,
 ) -> None:
     """Run the MCP server inside an existing asyncio loop."""
     server = build_server(
@@ -520,6 +537,7 @@ async def run_server_async(
         port=port,
         streamable_http_path=path,
         log_level=log_level,
+        allow_any_host=allow_any_host,
     )
     if transport == "stdio":
         await server.run_stdio_async()

@@ -17,5 +17,6 @@ async def mcp_cmd(args, cfg) -> int:
         port=args.port,
         path=args.path,
         log_level=log_level,
+        allow_any_host=getattr(args, "allow_any_host", False),
     )
     return 0

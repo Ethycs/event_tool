@@ -113,6 +113,9 @@ def main() -> int:
         f"[serve_mcp_remote] starting MCP server "
         f"http://{MCP_HOST}:{args.port}{MCP_PATH}"
     )
+    # --allow-any-host disables FastMCP's loopback host-header check so
+    # requests forwarded by ngrok (with Host: <subdomain>.ngrok-free.dev)
+    # don't get 421-ed.
     mcp_proc = subprocess.Popen(
         [
             sys.executable,
@@ -127,6 +130,7 @@ def main() -> int:
             str(args.port),
             "--path",
             MCP_PATH,
+            "--allow-any-host",
         ],
         env=env,
     )
