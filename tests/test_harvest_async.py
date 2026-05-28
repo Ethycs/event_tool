@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 import pytest
 
-from event_harvester import harvest as harvest_mod
+from event_harvester.pipeline import harvest as harvest_mod
 from event_harvester.config import AppConfig
 
 

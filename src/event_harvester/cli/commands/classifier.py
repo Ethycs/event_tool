@@ -23,7 +23,7 @@ async def classifier_cmd(args, cfg) -> int:
 
 async def _classifier_train(args, cfg) -> int:
     """Label messages (or load existing labels) and train the classifier."""
-    from event_harvester.classifier import train as train_classifier
+    from event_harvester.pipeline.classifier import train as train_classifier
 
     if args.days is not None:
         cfg.days_back = args.days
@@ -37,8 +37,8 @@ async def _classifier_train(args, cfg) -> int:
             logger.error("Failed to load labels: %s", e)
             return 1
     else:
-        from event_harvester.harvest import harvest_messages
-        from event_harvester.label import label_messages
+        from event_harvester.pipeline.harvest import harvest_messages
+        from event_harvester.training.label import label_messages
 
         platform_kwargs = resolve_platforms(args.only, args.skip)
         all_messages = await harvest_messages(cfg, **platform_kwargs)
@@ -71,7 +71,7 @@ async def _classifier_train(args, cfg) -> int:
 
 def _classifier_eval(args, cfg) -> int:
     """Evaluate classifier accuracy against labeled ground truth."""
-    from event_harvester.eval_classifier import run_eval
+    from event_harvester.training.eval_classifier import run_eval
 
     run_eval(args.labels, save_eval=args.out_samples)
     return 0

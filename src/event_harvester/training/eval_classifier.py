@@ -5,17 +5,17 @@ import logging
 import random
 from pathlib import Path
 
-from event_harvester.analysis import prioritize
-from event_harvester.classifier import (
+from event_harvester.pipeline.analysis import prioritize
+from event_harvester.pipeline.classifier import (
     filter_actionable as classifier_filter,
 )
-from event_harvester.classifier import (
+from event_harvester.pipeline.classifier import (
     has_trained_models,
     predict,
 )
-from event_harvester.display import DIM, RED, RESET
+from event_harvester.ui.display import DIM, RED, RESET
 from event_harvester.sources import filter_read_sent as gmail_filter
-from event_harvester.weights import extract_events, prefilter_events
+from event_harvester.pipeline.weights import extract_events, prefilter_events
 
 logger = logging.getLogger("event_harvester")
 

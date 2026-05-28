@@ -7,7 +7,7 @@ semantically event-like AND have upcoming dates.
 
 import logging
 
-logger = logging.getLogger("event_harvester.reranker")
+logger = logging.getLogger("event_harvester.pipeline.reranker")
 
 _EVENT_QUERY = (
     "upcoming event, meetup, hackathon, workshop, conference, party, "
@@ -53,7 +53,7 @@ def _resolve_message_dates(content, timestamp, today):
     """
     from datetime import datetime
 
-    from event_harvester.weights import (
+    from event_harvester.pipeline.weights import (
         GATE_DATE_RE,
         _EVENT_LINK_DOMAINS,
         _event_proximity_score,
@@ -107,7 +107,7 @@ def rerank_messages(
     from datetime import date
     import re
 
-    from event_harvester.weights import TIME_RE
+    from event_harvester.pipeline.weights import TIME_RE
 
     today = date.today()
     url_re = re.compile(r"https?://\S+")

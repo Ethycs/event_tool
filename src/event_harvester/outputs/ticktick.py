@@ -6,12 +6,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-from event_harvester.analysis import PRIORITY_LABEL
+from event_harvester.pipeline.analysis import PRIORITY_LABEL
 from event_harvester.config import TickTickConfig
-from event_harvester.display import BOLD, DIM, GREEN, RED, RESET
-from event_harvester.event_match import save_fingerprint
+from event_harvester.ui.display import BOLD, DIM, GREEN, RED, RESET
+from event_harvester.pipeline.event_match import save_fingerprint
 
-logger = logging.getLogger("event_harvester.ticktick")
+logger = logging.getLogger("event_harvester.outputs.ticktick")
 
 
 def get_ticktick_client(cfg: TickTickConfig):
@@ -130,7 +130,7 @@ def create_ticktick_tasks(
 
     # Run dedup if we have existing tasks
     if existing_tasks:
-        from event_harvester.dedup import dedup_events_against_ticktick
+        from event_harvester.pipeline.dedup import dedup_events_against_ticktick
         to_create, to_update, to_skip = dedup_events_against_ticktick(events, existing_tasks)
     else:
         to_create, to_update, to_skip = events, [], []

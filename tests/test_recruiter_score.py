@@ -1,6 +1,6 @@
 """Tests for recruiter email grading."""
 
-from event_harvester.recruiter_score import (
+from event_harvester.training.recruiter_score import (
     _action_for_score,
     _extract_domain,
     _score_body,

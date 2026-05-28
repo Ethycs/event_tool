@@ -4,8 +4,8 @@ import tempfile
 from datetime import date
 from pathlib import Path
 
-from event_harvester.obsidian import write_events_report, write_recruiter_report
-from event_harvester.recruiter_score import RecruiterGrade
+from event_harvester.outputs.obsidian import write_events_report, write_recruiter_report
+from event_harvester.training.recruiter_score import RecruiterGrade
 
 
 def _sample_events():

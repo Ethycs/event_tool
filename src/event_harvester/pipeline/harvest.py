@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from event_harvester.config import AppConfig
-from event_harvester.display import DIM, RESET
+from event_harvester.ui.display import DIM, RESET
 from event_harvester.logging_tags import tag_task
 from event_harvester.sources import (
     fetch_gmail_messages,
@@ -16,10 +16,10 @@ from event_harvester.sources import (
     read_signal_messages,
     read_telegram_messages,
 )
-from event_harvester.tracing import get_tracer
+from event_harvester.observability.tracing import get_tracer
 
 logger = logging.getLogger("event_harvester")
-tracer = get_tracer("event_harvester.harvest")
+tracer = get_tracer("event_harvester.pipeline.harvest")
 
 _DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 CACHE_FILE = _DATA_DIR / ".message_cache.json"

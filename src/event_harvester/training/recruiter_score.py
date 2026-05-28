@@ -8,7 +8,7 @@ from typing import Optional
 
 from event_harvester.config import LLMConfig
 
-logger = logging.getLogger("event_harvester.recruiter_score")
+logger = logging.getLogger("event_harvester.training.recruiter_score")
 
 
 @dataclass

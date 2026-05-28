@@ -11,7 +11,7 @@ from pathlib import Path
 
 from event_harvester.utils import load_json, save_json
 
-logger = logging.getLogger("event_harvester.event_match")
+logger = logging.getLogger("event_harvester.pipeline.event_match")
 
 FINGERPRINT_FILE = Path("data/.event_fingerprints.json")
 

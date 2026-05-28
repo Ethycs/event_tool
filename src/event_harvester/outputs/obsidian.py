@@ -7,10 +7,10 @@ import webbrowser
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from event_harvester.recruiter_score import RecruiterGrade
-from event_harvester.report import ticktick_deep_link
+from event_harvester.training.recruiter_score import RecruiterGrade
+from event_harvester.outputs.report import ticktick_deep_link
 
-logger = logging.getLogger("event_harvester.obsidian")
+logger = logging.getLogger("event_harvester.outputs.obsidian")
 
 GMAIL_URL = "https://mail.google.com/mail/u/0/#all/{msg_id}"
 

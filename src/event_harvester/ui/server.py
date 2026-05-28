@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
-logger = logging.getLogger("event_harvester.server")
+logger = logging.getLogger("event_harvester.ui.server")
 
 _PORT = 8111
 _DATA_DIR = Path("data")
@@ -142,7 +142,7 @@ class _Handler(SimpleHTTPRequestHandler):
         if action == "approve":
             ev["_status"] = "approved"
             try:
-                from event_harvester.ticktick import create_ticktick_tasks
+                from event_harvester.outputs.ticktick import create_ticktick_tasks
                 result = create_ticktick_tasks([ev])
                 msg = f"Approved: {title}\n\nTickTick: {result}"
                 logger.info("Approved [%d] %s → %s", idx, title, result)
@@ -153,7 +153,7 @@ class _Handler(SimpleHTTPRequestHandler):
         elif action == "decline":
             ev["_status"] = "declined"
             try:
-                from event_harvester.event_match import save_fingerprint
+                from event_harvester.pipeline.event_match import save_fingerprint
                 save_fingerprint(ev)
                 msg = f"Declined: {title}\n\nFingerprint saved — will be skipped on future runs."
                 logger.info("Declined [%d] %s", idx, title)

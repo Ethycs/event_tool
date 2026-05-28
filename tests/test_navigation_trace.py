@@ -1,4 +1,4 @@
-"""Tests for ``event_harvester.navigation_trace``."""
+"""Tests for ``event_harvester.observability.navigation_trace``."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from event_harvester.navigation_trace import NavigationTracer, attach
+from event_harvester.observability.navigation_trace import NavigationTracer, attach
 
 
 def _read_lines(path: Path) -> list[dict]:
@@ -307,7 +307,7 @@ def test_record_emits_span_event_when_span_active(tmp_path: Path) -> None:
 
     # Ensure our tracing module has a provider installed. It uses the
     # global trace.get_tracer_provider(); init_tracing() makes that real.
-    from event_harvester import tracing as tracing_mod
+    from event_harvester.observability import tracing as tracing_mod
     tracing_mod.init_tracing(debug=False)
 
     from opentelemetry import trace

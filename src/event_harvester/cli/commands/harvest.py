@@ -1,21 +1,16 @@
 """Harvest command — the main pipeline.
 
-Fetches messages from configured sources, extracts events with the LLM,
-optionally writes reports, and syncs to TickTick.
-
-Reuses the existing pipeline functions verbatim — this file just
-glues argparse args to the functions in harvest.py / analysis.py /
-ticktick.py / etc.
+Wires argparse args to the shared ``Pipeline`` class. Everything specific
+to the CLI lives here: terminal printing, TickTick sync, Markdown /
+Obsidian reports.
 """
 
 import logging
 from collections import defaultdict
 
-from event_harvester.analysis import extract_events_llm
 from event_harvester.cli.parse_helpers import apply_caps_to_config, resolve_platforms
-from event_harvester.config import validate_config
 from event_harvester.profiles import apply_profile_by_name as _apply_profile_by_name
-from event_harvester.display import (
+from event_harvester.ui.display import (
     BOLD,
     DIM,
     GREEN,
@@ -23,10 +18,9 @@ from event_harvester.display import (
     print_links,
     print_message,
 )
-from event_harvester.report import generate_report
-from event_harvester.sources import filter_read_sent
-from event_harvester.ticktick import create_ticktick_tasks, get_ticktick_client
-from event_harvester.weights import extract_links
+from event_harvester.pipeline import Pipeline
+from event_harvester.outputs.report import generate_report
+from event_harvester.outputs.ticktick import create_ticktick_tasks, get_ticktick_client
 
 logger = logging.getLogger("event_harvester")
 
@@ -54,91 +48,22 @@ async def harvest_cmd(args, cfg) -> int:
         cfg.web.debug_screenshots = True
         cfg.web.debug_trace = True  # screenshots imply trace
 
-    # Validate config based on which sources are active
+    # ``no_analyze`` is a per-run override, not a permanent config field;
+    # mirror it onto cfg.skip_analyze so Pipeline sees it consistently.
+    if args.no_analyze:
+        cfg.skip_analyze = True
+
     platform_kwargs = resolve_platforms(args.only, args.skip)
-    warnings = validate_config(
-        cfg,
-        need_telegram=not platform_kwargs["no_telegram"],
-        need_discord=not platform_kwargs["no_discord"],
-        need_gmail=not platform_kwargs["no_gmail"],
-        need_analysis=not args.no_analyze,
+    pipeline = Pipeline(cfg)
+    warnings = pipeline.validate(
+        no_kwargs=platform_kwargs,
         need_ticktick=not args.no_sync and not args.dry_run,
     )
     for w in warnings:
         logger.warning(w)
 
-    # ── Fetch messages ──────────────────────────────────────────────────
-    from event_harvester.harvest import harvest_messages, save_messages
-
     print(f"\n{'=' * W}")
     print(f"  Event Harvester - last {cfg.days_back} day(s)")
-    print(f"{'=' * W}\n")
-
-    all_messages = await harvest_messages(
-        cfg,
-        load_path=args.load,
-        skip_cache=bool(args.save),
-        web_source=getattr(args, "web_source", None),
-        no_cooldown=getattr(args, "no_cooldown", False),
-        **platform_kwargs,
-    )
-
-    if not all_messages:
-        print("No messages found. Check credentials / cache and try again.")
-        return 0
-
-    # Print messages
-    for msg in sorted(all_messages, key=lambda m: m["timestamp"]):
-        print_message(msg)
-
-    n_d = sum(1 for m in all_messages if m["platform"] == "discord")
-    n_t = sum(1 for m in all_messages if m["platform"] == "telegram")
-    n_g = sum(1 for m in all_messages if m["platform"] == "gmail")
-    n_s = sum(1 for m in all_messages if m["platform"] == "signal")
-    n_w = sum(1 for m in all_messages if m["platform"] == "web")
-    counts = f"Discord: {n_d}, Telegram: {n_t}, Gmail: {n_g}, Signal: {n_s}"
-    if n_w:
-        counts += f", Web: {n_w}"
-    print(f"{DIM}Total: {len(all_messages)}  ({counts}){RESET}\n")
-
-    if args.save:
-        save_messages(all_messages, args.save)
-
-    # ── Filter out already-read/sent Gmail messages ─────────────────────
-    actionable = filter_read_sent(all_messages)
-    n_filtered = len(all_messages) - len(actionable)
-    if n_filtered:
-        print(
-            f"{DIM}Filtered {n_filtered} read/sent messages, "
-            f"{len(actionable)} remain for analysis.{RESET}\n"
-        )
-
-    # ── Extract links ───────────────────────────────────────────────────
-    links = extract_links(actionable)
-    print_links(links)
-
-    source_counts = {
-        "discord": n_d, "telegram": n_t, "gmail": n_g, "signal": n_s, "web": n_w,
-    }
-
-    # ── Recruiter grading (convenience integration) ─────────────────────
-    grades = []
-    if args.grade_recruiters:
-        from event_harvester.cli.commands.recruiters import _run_recruiter_grading
-        grades = _run_recruiter_grading(all_messages, cfg, args)
-
-    if args.obsidian and cfg.obsidian_recruiters_dir and grades:
-        from event_harvester.obsidian import write_recruiter_report
-
-        path = write_recruiter_report(grades, cfg.obsidian_recruiters_dir)
-        print(f"Obsidian recruiters -> {path}\n")
-
-    # ── LLM event extraction ────────────────────────────────────────────
-    if args.no_analyze:
-        return 0
-
-    print(f"{'=' * W}")
-    print("[ LLM - extracting events ]")
     print(f"{'=' * W}\n")
 
     # When --only is used, the user has explicitly scoped to specific
@@ -146,54 +71,96 @@ async def harvest_cmd(args, cfg) -> int:
     # events. Caps exist to prevent noisy sources from crowding out
     # quiet ones in the default mixed-source pipeline; that concern
     # doesn't apply when --only is set.
-    caps_for_llm = None if args.only is not None else cfg.caps
     if args.only is not None:
         logger.info("--only set; ignoring per-source caps")
 
-    summary, events = extract_events_llm(
-        actionable, cfg.days_back, cfg.llm, caps=caps_for_llm,
+    result = await pipeline.run(
+        no_kwargs=platform_kwargs,
+        load_path=args.load,
+        save_path=args.save,
+        web_source=getattr(args, "web_source", None),
+        no_cooldown=getattr(args, "no_cooldown", False),
+        unlimited_caps=args.only is not None,
     )
 
-    if getattr(args, "show_rejects", False):
-        from event_harvester.analysis import _extract_events_cloud
-        rejects = getattr(extract_events_llm, "_last_rejects", {})
-        rejects["llm_past"] = getattr(
-            _extract_events_cloud, "_last_llm_dropped", [],
-        )
-        rejects["llm_no_events"] = getattr(
-            _extract_events_cloud, "_last_llm_no_events", [],
-        )
-        _print_rejects(rejects)
+    if result.no_messages:
+        print("No messages found. Check credentials / cache and try again.")
+        return 0
 
-    if not events:
+    # ── Print harvested messages + per-platform counts ──────────────────
+    for msg in sorted(result.all_messages, key=lambda m: m["timestamp"]):
+        print_message(msg)
+
+    sc = result.source_counts
+    counts = (
+        f"Discord: {sc['discord']}, Telegram: {sc['telegram']}, "
+        f"Gmail: {sc['gmail']}, Signal: {sc['signal']}"
+    )
+    if sc["web"]:
+        counts += f", Web: {sc['web']}"
+    print(f"{DIM}Total: {len(result.all_messages)}  ({counts}){RESET}\n")
+
+    n_filtered = len(result.all_messages) - len(result.actionable)
+    if n_filtered:
+        print(
+            f"{DIM}Filtered {n_filtered} read/sent messages, "
+            f"{len(result.actionable)} remain for analysis.{RESET}\n"
+        )
+
+    print_links(result.links)
+
+    # ── Recruiter grading (convenience integration) ─────────────────────
+    grades = []
+    if args.grade_recruiters:
+        from event_harvester.cli.commands.recruiters import _run_recruiter_grading
+        grades = _run_recruiter_grading(result.all_messages, cfg, args)
+
+    if args.obsidian and cfg.obsidian_recruiters_dir and grades:
+        from event_harvester.outputs.obsidian import write_recruiter_report
+
+        path = write_recruiter_report(grades, cfg.obsidian_recruiters_dir)
+        print(f"Obsidian recruiters -> {path}\n")
+
+    # ── LLM event extraction ────────────────────────────────────────────
+    if result.skipped_analysis:
+        return 0
+
+    print(f"{'=' * W}")
+    print("[ LLM - extracting events ]")
+    print(f"{'=' * W}\n")
+
+    if getattr(args, "show_rejects", False):
+        _print_rejects(result.rejects)
+
+    if not result.events:
         print("No events extracted.")
         return 0
 
-    _print_events(events, cfg)
+    _print_events(result.events, cfg)
 
     # ── Reports ─────────────────────────────────────────────────────────
-    validated_events = _events_for_report(events)
+    validated_events = _events_for_report(result.events)
 
     if args.report:
         report_path = generate_report(
             validated_events=validated_events,
             raw_events=[],
-            links=links,
-            source_counts=source_counts,
-            total_messages=len(all_messages),
+            links=result.links,
+            source_counts=result.source_counts,
+            total_messages=len(result.all_messages),
             output_path=args.report,
         )
         print(f"\nReport saved -> {report_path}\n")
 
     if args.obsidian and cfg.obsidian_events_dir:
-        from event_harvester.obsidian import write_events_report
+        from event_harvester.outputs.obsidian import write_events_report
 
         path = write_events_report(
             validated_events=validated_events,
             raw_events=[],
-            links=links,
-            source_counts=source_counts,
-            total_messages=len(all_messages),
+            links=result.links,
+            source_counts=result.source_counts,
+            total_messages=len(result.all_messages),
             output_dir=cfg.obsidian_events_dir,
         )
         print(f"Obsidian events -> {path}\n")
@@ -211,13 +178,13 @@ async def harvest_cmd(args, cfg) -> int:
     if tt is None:
         return 1
 
-    result = create_ticktick_tasks(
-        tt, events, project_name=cfg.ticktick.project, dry_run=args.dry_run,
+    sync_result = create_ticktick_tasks(
+        tt, result.events, project_name=cfg.ticktick.project, dry_run=args.dry_run,
     )
 
-    n_created = len(result["created"])
-    n_updated = len(result["updated"])
-    n_skipped = len(result["skipped"])
+    n_created = len(sync_result["created"])
+    n_updated = len(sync_result["updated"])
+    n_skipped = len(sync_result["skipped"])
     print(
         f"\n{BOLD}Summary:{RESET} "
         f"{GREEN}{n_created} created{RESET}, "
@@ -250,7 +217,7 @@ def _print_events(events: list[dict], cfg) -> None:
     Events without parseable dates are listed under a TBD section
     at the bottom of each source group.
     """
-    from event_harvester.event_match import _normalize_date, find_acted_fingerprint
+    from event_harvester.pipeline.event_match import _normalize_date, find_acted_fingerprint
 
     def _print_event(idx: int, t: dict) -> None:
         title = t.get("title") or "Untitled"

@@ -6,10 +6,10 @@ import re
 
 from event_harvester.config import LLMConfig
 from event_harvester.llm import chat_completion
-from event_harvester.tracing import get_tracer
+from event_harvester.observability.tracing import get_tracer
 
-logger = logging.getLogger("event_harvester.analysis")
-tracer = get_tracer("event_harvester.analysis")
+logger = logging.getLogger("event_harvester.pipeline.analysis")
+tracer = get_tracer("event_harvester.pipeline.analysis")
 
 
 from event_harvester.utils import parse_llm_ini
@@ -28,7 +28,7 @@ def build_prompt(messages: list[dict], days_back: int) -> str:
     so the LLM doesn't have to re-parse relative dates.
     """
     from datetime import date, datetime
-    from event_harvester.weights import DATE_RE, TIME_RE, _resolve_date
+    from event_harvester.pipeline.weights import DATE_RE, TIME_RE, _resolve_date
 
     today = date.today()
 
@@ -124,7 +124,7 @@ def score_message(m: dict) -> int:
     Higher = more likely to contain an event mention. Used by prioritize()
     and prioritize_with_caps() to sort before capping.
     """
-    from event_harvester.weights import URL_RE, has_date_or_event_signal
+    from event_harvester.pipeline.weights import URL_RE, has_date_or_event_signal
 
     content = m.get("content", "")
     s = 0
@@ -258,7 +258,7 @@ _ACTIONABLE_SIGNALS = [
 # Merge in shared scheduling keywords to avoid maintaining two lists.
 # Import is deferred to avoid circular import at module load.
 def _get_actionable_signals() -> list[str]:
-    from event_harvester.weights import SCHEDULING_KEYWORDS
+    from event_harvester.pipeline.weights import SCHEDULING_KEYWORDS
     return _ACTIONABLE_SIGNALS + SCHEDULING_KEYWORDS
 
 
@@ -284,7 +284,7 @@ def extract_events_llm(
         logger.warning("LLM not configured - skipping analysis.")
         return "", []
 
-    from event_harvester.classifier import filter_actionable as classifier_filter, has_trained_models
+    from event_harvester.pipeline.classifier import filter_actionable as classifier_filter, has_trained_models
 
     total = len(messages)
     if caps and (getattr(caps, "no_cap", False) or caps.total < 0):
@@ -312,7 +312,7 @@ def extract_events_llm(
         rejects["caps"] = [m for m in after_clf if id(m) not in caps_ids]
 
         try:
-            from event_harvester.reranker import rerank_messages
+            from event_harvester.pipeline.reranker import rerank_messages
             filtered = rerank_messages(after_caps, top_k=cap_total)
         except ImportError:
             logger.warning("sentence-transformers not installed, falling back to regex priority.")
@@ -426,7 +426,7 @@ def _extract_events_cloud(
     _extract_events_cloud._last_llm_no_events = llm_no_events
 
     # Deduplicate (fingerprint match pass)
-    from event_harvester.event_match import dedup_events
+    from event_harvester.pipeline.event_match import dedup_events
     with tracer.start_as_current_span("match.fingerprints") as span:
         unique = dedup_events(all_tasks)
         # match.count = how many duplicates were collapsed
@@ -483,7 +483,7 @@ def _extract_events_local(
             all_tasks.extend(batch_tasks)
 
     # Deduplicate (fingerprint match pass)
-    from event_harvester.event_match import dedup_events
+    from event_harvester.pipeline.event_match import dedup_events
     with tracer.start_as_current_span("match.fingerprints") as span:
         unique = dedup_events(all_tasks)
         span.set_attribute("match.count", max(0, len(all_tasks) - len(unique)))

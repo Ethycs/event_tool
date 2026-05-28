@@ -2,7 +2,7 @@
 
 from unittest.mock import MagicMock, patch
 
-from event_harvester.ticktick import create_ticktick_tasks
+from event_harvester.outputs.ticktick import create_ticktick_tasks
 
 
 class TestCreateTickTickTasks:
@@ -12,7 +12,7 @@ class TestCreateTickTickTasks:
             {"title": "Test task", "notes": "test", "priority": 1, "due_in_days": 2}
         ]
 
-        with patch("event_harvester.ticktick.sync_tasks", return_value=[]):
+        with patch("event_harvester.outputs.ticktick.sync_tasks", return_value=[]):
             result = create_ticktick_tasks(tt, tasks, dry_run=True)
 
         assert len(result["created"]) == 1

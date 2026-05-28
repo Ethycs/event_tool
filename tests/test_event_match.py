@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
-from event_harvester.event_match import (
+from event_harvester.pipeline.event_match import (
     _normalize_title,
     _titles_overlap,
     dedup_events,
@@ -94,7 +94,7 @@ class TestFingerprintStore:
     def _use_tmp_fingerprint_file(self, tmp_path, monkeypatch):
         """Use a temporary file for fingerprints during tests."""
         tmp_file = tmp_path / ".event_fingerprints.json"
-        monkeypatch.setattr("event_harvester.event_match.FINGERPRINT_FILE", tmp_file)
+        monkeypatch.setattr("event_harvester.pipeline.event_match.FINGERPRINT_FILE", tmp_file)
 
     def test_save_and_find(self):
         event = {
@@ -117,7 +117,7 @@ class TestFingerprintStore:
 
     def test_auto_prune_past_dates(self, monkeypatch):
         """Fingerprints with past dates are pruned on load."""
-        from event_harvester import event_match
+        from event_harvester.pipeline import event_match
 
         fp_file = event_match.FINGERPRINT_FILE
         yesterday = (date.today() - timedelta(days=1)).isoformat()
@@ -136,7 +136,7 @@ class TestFingerprintStore:
 
     def test_auto_prune_old_no_date(self, monkeypatch):
         """Fingerprints with no date and created_at > 30 days ago are pruned."""
-        from event_harvester import event_match
+        from event_harvester.pipeline import event_match
 
         fp_file = event_match.FINGERPRINT_FILE
         old_date = (date.today() - timedelta(days=31)).isoformat()

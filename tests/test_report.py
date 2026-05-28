@@ -3,7 +3,7 @@
 import os
 import tempfile
 
-from event_harvester.report import ticktick_deep_link, generate_report
+from event_harvester.outputs.report import ticktick_deep_link, generate_report
 
 
 class TestTickTickDeepLink:

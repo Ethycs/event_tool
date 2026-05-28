@@ -101,7 +101,7 @@ async def main() -> int:
     # spans get exported.
     try:
         import os
-        from event_harvester.tracing import init_tracing
+        from event_harvester.observability.tracing import init_tracing
         init_tracing(
             debug=getattr(args, "debug_otel", False),
             otlp_endpoint=os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT"),

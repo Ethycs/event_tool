@@ -11,9 +11,9 @@ import logging
 import re
 from pathlib import Path
 
-from event_harvester.weights import SCHEDULING_KEYWORDS
+from event_harvester.pipeline.weights import SCHEDULING_KEYWORDS
 
-logger = logging.getLogger("event_harvester.classifier")
+logger = logging.getLogger("event_harvester.pipeline.classifier")
 
 _CLASSIFIERS_DIR = Path(__file__).resolve().parent.parent.parent / "classifiers"
 EMAIL_MODEL_PATH = _CLASSIFIERS_DIR / "classifier_email.pkl"

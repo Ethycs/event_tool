@@ -446,7 +446,7 @@ class NavQualityScorer:
 
 
 # Lazy import target: ``vision_completion`` is rebound at call time so
-# tests can patch ``event_harvester.nav_quality.vision_completion``
+# tests can patch ``event_harvester.observability.nav_quality.vision_completion``
 # without paying the litellm import cost on module load.
 def vision_completion(*args, **kwargs):  # pragma: no cover - thin shim
     from event_harvester.llm import vision_completion as _vc

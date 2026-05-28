@@ -2,7 +2,7 @@
 
 from unittest.mock import patch
 
-from event_harvester.analysis import build_prompt, extract_events_llm
+from event_harvester.pipeline.analysis import build_prompt, extract_events_llm
 from event_harvester.config import LLMConfig
 
 
@@ -84,9 +84,9 @@ class TestAnalyseAndExtractTasks:
 
         cfg = LLMConfig(model="openrouter/test-model")
 
-        with patch("event_harvester.classifier.has_trained_models", return_value=False):
+        with patch("event_harvester.pipeline.classifier.has_trained_models", return_value=False):
             with patch(
-                "event_harvester.analysis.chat_completion",
+                "event_harvester.pipeline.analysis.chat_completion",
                 return_value=llm_response,
             ):
                 summary, events = extract_events_llm(
@@ -100,9 +100,9 @@ class TestAnalyseAndExtractTasks:
     def test_handles_no_events(self, sample_messages):
         cfg = LLMConfig(model="openrouter/test-model")
 
-        with patch("event_harvester.classifier.has_trained_models", return_value=False):
+        with patch("event_harvester.pipeline.classifier.has_trained_models", return_value=False):
             with patch(
-                "event_harvester.analysis.chat_completion",
+                "event_harvester.pipeline.analysis.chat_completion",
                 return_value="No events found in the messages.",
             ):
                 summary, events = extract_events_llm(

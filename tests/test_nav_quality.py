@@ -1,4 +1,4 @@
-"""Tests for ``event_harvester.nav_quality``."""
+"""Tests for ``event_harvester.observability.nav_quality``."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import pytest
 
-from event_harvester.nav_quality import (
+from event_harvester.observability.nav_quality import (
     CLASSIFICATIONS,
     NavQualityScorer,
     SourceQuality,
@@ -279,7 +279,7 @@ def test_pick_key_frames_malformed_lines_skipped(
         + "\n",
         encoding="utf-8",
     )
-    with caplog.at_level(logging.WARNING, logger="event_harvester.nav_quality"):
+    with caplog.at_level(logging.WARNING, logger="event_harvester.observability.nav_quality"):
         frames = pick_key_frames(trace_path)
 
     assert len(frames) == 1
@@ -430,7 +430,7 @@ def test_score_source_writes_quality_json(tmp_path: Path) -> None:
     traces_root = _setup_run(tmp_path, "luma", "rA")
 
     with patch(
-        "event_harvester.nav_quality.vision_completion",
+        "event_harvester.observability.nav_quality.vision_completion",
         return_value="content\nGreat events visible.",
     ) as mock_vc:
         scorer = NavQualityScorer()
@@ -460,7 +460,7 @@ def test_score_source_handles_llm_error(tmp_path: Path) -> None:
     traces_root = _setup_run(tmp_path, "luma", "rErr")
 
     with patch(
-        "event_harvester.nav_quality.vision_completion",
+        "event_harvester.observability.nav_quality.vision_completion",
         side_effect=RuntimeError("API down"),
     ):
         scorer = NavQualityScorer()
@@ -487,7 +487,7 @@ def test_score_source_respects_image_budget(tmp_path: Path) -> None:
     cfg = _FakeAppCfg(llm=_FakeLLMCfg(vision_max_images_per_run=1))
 
     with patch(
-        "event_harvester.nav_quality.vision_completion",
+        "event_harvester.observability.nav_quality.vision_completion",
         return_value="content\nok",
     ) as mock_vc:
         scorer = NavQualityScorer()
@@ -505,7 +505,7 @@ def test_score_source_includes_duration_ms(tmp_path: Path) -> None:
     traces_root = _setup_run(tmp_path, "luma", "rDur")
 
     with patch(
-        "event_harvester.nav_quality.vision_completion",
+        "event_harvester.observability.nav_quality.vision_completion",
         return_value="content\nfine",
     ):
         scorer = NavQualityScorer()
@@ -522,7 +522,7 @@ def test_score_source_for_each_classification(tmp_path: Path, label: str) -> Non
     traces_root = _setup_run(tmp_path, "luma", f"rC_{label}")
 
     with patch(
-        "event_harvester.nav_quality.vision_completion",
+        "event_harvester.observability.nav_quality.vision_completion",
         return_value=f"{label}\nExplanation.",
     ):
         scorer = NavQualityScorer()
@@ -541,7 +541,7 @@ def test_reset_counter_clears_budget(tmp_path: Path) -> None:
     cfg = _FakeAppCfg(llm=_FakeLLMCfg(vision_max_images_per_run=1))
 
     with patch(
-        "event_harvester.nav_quality.vision_completion",
+        "event_harvester.observability.nav_quality.vision_completion",
         return_value="content\nok",
     ) as mock_vc:
         scorer = NavQualityScorer()

@@ -6,9 +6,9 @@ Uses event_match for structured comparison by title, date, location, and link.
 
 import logging
 
-from event_harvester.event_match import events_match, find_acted_fingerprint
+from event_harvester.pipeline.event_match import events_match, find_acted_fingerprint
 
-logger = logging.getLogger("event_harvester.dedup")
+logger = logging.getLogger("event_harvester.pipeline.dedup")
 
 
 def _merge_action(new_event: dict, existing_task: dict) -> str:

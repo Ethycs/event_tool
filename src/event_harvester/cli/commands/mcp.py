@@ -7,7 +7,7 @@ logger = logging.getLogger("event_harvester")
 
 async def mcp_cmd(args, cfg) -> int:
     """Run the MCP server until the client disconnects or the process stops."""
-    from event_harvester.mcp_server import run_server_async
+    from event_harvester.servers.mcp_server import run_server_async
 
     log_level = "DEBUG" if args.verbose else "WARNING" if args.quiet else "INFO"
     logger.info("Starting MCP server with %s transport", args.transport)

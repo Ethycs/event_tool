@@ -3,7 +3,7 @@
 import pytest
 
 from event_harvester.config import AppConfig
-from event_harvester.mcp_server import (
+from event_harvester.servers.mcp_server import (
     _load_latest_events,
     _mark_cached_event,
     _parse_source_filter,
@@ -51,7 +51,7 @@ def test_source_kwargs_rejects_only_and_skip_together():
 
 def test_latest_event_cache_round_trip(tmp_path, monkeypatch):
     cache_file = tmp_path / ".mcp_events.json"
-    monkeypatch.setattr("event_harvester.mcp_server.LATEST_EVENTS_FILE", cache_file)
+    monkeypatch.setattr("event_harvester.servers.mcp_server.LATEST_EVENTS_FILE", cache_file)
     events = [{"title": "AI Meetup", "date": "2026-06-01"}]
 
     _save_latest_events(

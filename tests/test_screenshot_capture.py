@@ -1,4 +1,4 @@
-"""Tests for ``event_harvester.screenshot_capture``."""
+"""Tests for ``event_harvester.observability.screenshot_capture``."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from event_harvester.screenshot_capture import ScreenshotCapture
+from event_harvester.observability.screenshot_capture import ScreenshotCapture
 
 
 def _write_png(path: Path, color: tuple[int, int, int] = (255, 0, 0)) -> None:
@@ -62,7 +62,7 @@ def test_snap_handles_screenshot_failure(
 ) -> None:
     cap = ScreenshotCapture(tmp_path)
     page = FakePage(fail=True)
-    with caplog.at_level(logging.WARNING, logger="event_harvester.screenshot_capture"):
+    with caplog.at_level(logging.WARNING, logger="event_harvester.observability.screenshot_capture"):
         result = cap.snap(page, step=7)
     assert result is None
     assert any("step=7" in rec.message for rec in caplog.records)
@@ -82,7 +82,7 @@ def test_snap_falls_back_to_sleep_when_no_settle(
     page = FakePage(with_wait=False)
     sleeps: list[float] = []
     monkeypatch.setattr(
-        "event_harvester.screenshot_capture.time.sleep",
+        "event_harvester.observability.screenshot_capture.time.sleep",
         lambda s: sleeps.append(s),
     )
     result = cap.snap(page, step=2, settle_ms=250)
@@ -137,7 +137,7 @@ def test_snap_max_cap_skips_further_captures(
     page = FakePage()
     assert cap.snap(page, step=1) is not None
     assert cap.snap(page, step=2) is not None
-    with caplog.at_level(logging.INFO, logger="event_harvester.screenshot_capture"):
+    with caplog.at_level(logging.INFO, logger="event_harvester.observability.screenshot_capture"):
         assert cap.snap(page, step=3) is None
     assert cap.snap(page, step=4) is None
     # Page.screenshot was only called for the first two, not the skipped ones.
@@ -150,7 +150,7 @@ def test_snap_disables_after_consecutive_failures(
 ) -> None:
     cap = ScreenshotCapture(tmp_path)
     page = FakePage(fail=True)
-    with caplog.at_level(logging.WARNING, logger="event_harvester.screenshot_capture"):
+    with caplog.at_level(logging.WARNING, logger="event_harvester.observability.screenshot_capture"):
         for i in range(1, ScreenshotCapture.CONSECUTIVE_FAILURE_LIMIT + 1):
             assert cap.snap(page, step=i) is None
         # After the limit, further calls short-circuit without invoking page.screenshot.

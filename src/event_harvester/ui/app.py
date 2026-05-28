@@ -20,10 +20,11 @@ from typing import Awaitable, Callable, Optional
 
 import flet as ft
 
-from event_harvester.event_match import find_acted_fingerprint, save_fingerprint
+from event_harvester.pipeline.event_match import find_acted_fingerprint, save_fingerprint
+from event_harvester.pipeline.state import PipelineState, PipelineStateMachine
 from event_harvester.profiles import apply_profile, find_profile, load_profiles
 
-logger = logging.getLogger("event_harvester.app")
+logger = logging.getLogger("event_harvester.ui.app")
 
 _SEED_COLOR = "#6750A4"
 _LOG_LINE_LIMIT = 250
@@ -179,8 +180,8 @@ class EventsApp:
         self._page: Optional[ft.Page] = None
         self._pipeline_done = False
 
-        # Pipeline lifecycle: idle | running | paused | done
-        self._state: str = "idle"
+        # Pipeline lifecycle — formalized in pipeline_state.PipelineStateMachine
+        self._sm: PipelineStateMachine = PipelineStateMachine()
         self._pipeline_task: Optional[asyncio.Task] = None
         # Set means "go"; cleared means "wait at next checkpoint".
         self._pause_event: Optional[asyncio.Event] = None
@@ -235,7 +236,7 @@ class EventsApp:
 
     def _get_tt(self):
         if self._tt is None:
-            from event_harvester.ticktick import get_ticktick_client
+            from event_harvester.outputs.ticktick import get_ticktick_client
             self._tt = get_ticktick_client(self.cfg.ticktick)
         return self._tt
 
@@ -245,7 +246,7 @@ class EventsApp:
                 if not self.cfg.dry_run:
                     tt = self._get_tt()
                     if tt:
-                        from event_harvester.ticktick import create_ticktick_tasks
+                        from event_harvester.outputs.ticktick import create_ticktick_tasks
                         create_ticktick_tasks(
                             tt, [event_dict],
                             project_name=self.cfg.ticktick.project,
@@ -275,7 +276,7 @@ class EventsApp:
             if ev.get("_status") == "new":
                 try:
                     if tt:
-                        from event_harvester.ticktick import create_ticktick_tasks
+                        from event_harvester.outputs.ticktick import create_ticktick_tasks
                         create_ticktick_tasks(
                             tt, [ev], project_name=self.cfg.ticktick.project,
                         )
@@ -310,7 +311,7 @@ class EventsApp:
         Toggling OFF: restore the snapshot if we have one.
         """
         no_cap = bool(self._no_cap_checkbox.value) if self._no_cap_checkbox else False
-        running = self._state in ("running", "paused")
+        running = self._sm.is_active
 
         if no_cap:
             if self._cap_field_cache is None:
@@ -1303,7 +1304,7 @@ class EventsApp:
                 self.cfg.dry_run = bool(cb.value)
 
     def _start_clicked(self, e) -> None:
-        if self._state in ("running", "paused"):
+        if self._sm.is_active:
             return
         if self._pipeline_task is not None and not self._pipeline_task.done():
             return
@@ -1316,7 +1317,7 @@ class EventsApp:
         # Reset progress view so a re-run gets a fresh log + checklist.
         self._pipeline_done = False
         self._render_progress_view()
-        self._state = "running"
+        self._sm.transition(PipelineState.RUNNING)
         self._pipeline_task = self._page.run_task(self._run_pipeline)
         self._update_action_bar()
 
@@ -1331,31 +1332,34 @@ class EventsApp:
         # If currently paused, also wake the waiter so cancellation propagates.
         if self._pause_event is not None and not self._pause_event.is_set():
             self._pause_event.set()
-        self._state = "idle"
+        # Stop is a hard reset — legal from RUNNING/PAUSED, no-op from IDLE,
+        # and reachable from DONE too if the user races a re-run. Use reset()
+        # rather than transition() so the DONE → IDLE case doesn't raise.
+        self._sm.reset()
         self._set_stage_label("Stopped")
         self._mark_all_stages_idle()
         self._update_action_bar()
         self._refresh_page()
 
     def _pause_clicked(self, e) -> None:
-        if self._state != "running":
+        if not self._sm.is_running:
             return
         if self._pause_event is None:
             return
         self._pause_event.clear()
-        self._state = "paused"
+        self._sm.transition(PipelineState.PAUSED)
         # Stage label flips to "Paused" the next time the runner hits a
         # checkpoint, but we update the buttons immediately.
         self._update_action_bar()
         self._refresh_page()
 
     def _resume_clicked(self, e) -> None:
-        if self._state != "paused":
+        if not self._sm.is_paused:
             return
         if self._pause_event is None:
             return
         self._pause_event.set()
-        self._state = "running"
+        self._sm.transition(PipelineState.RUNNING)
         self._update_action_bar()
         self._refresh_page()
 
@@ -1366,19 +1370,17 @@ class EventsApp:
     def _update_action_bar(self) -> None:
         if self._action_bar is None:
             return
-        running = self._state == "running"
-        paused = self._state == "paused"
-        idle_or_done = self._state in ("idle", "done")
+        sm = self._sm
 
         # Buttons live in self._action_bar.controls in this order:
         # [Start, Pause, Resume, Stop]
         start_btn, pause_btn, resume_btn, stop_btn = self._action_bar.controls
-        start_btn.disabled = not idle_or_done
-        pause_btn.disabled = not running
-        resume_btn.disabled = not paused
-        stop_btn.disabled = not (running or paused)
+        start_btn.disabled = not sm.is_startable
+        pause_btn.disabled = not sm.is_running
+        resume_btn.disabled = not sm.is_paused
+        stop_btn.disabled = not sm.is_active
         # Config controls are editable only when not actively running.
-        frozen = running or paused
+        frozen = sm.is_active
         no_cap_on = bool(self._no_cap_checkbox.value) if self._no_cap_checkbox else False
         # Cap text fields stay disabled when no_cap is on (even while idle)
         # so the user can see they're inert.
@@ -1414,8 +1416,8 @@ class EventsApp:
             # (e.g. a stale browser tab reconnecting) attach to the in-flight
             # run as read-only viewers instead of firing a second pipeline,
             # which would race on shared session files (Telegram SQLite, etc).
-            if self._state == "idle":
-                self._state = "running"
+            if self._sm.is_idle:
+                self._sm.transition(PipelineState.RUNNING)
                 self._pipeline_task = page.run_task(self._run_pipeline)
             self._update_action_bar()
         else:
@@ -1436,16 +1438,19 @@ class EventsApp:
             if not self._pipeline_done:
                 reporter.update_stage("done", "Pipeline finished — no events to review")
                 reporter.log("No events were extracted.")
-            if self._state != "idle":
-                self._state = "done"
+            # If the user clicked Stop, we've already been reset to IDLE
+            # and a self-loop to DONE from IDLE is illegal. Only promote
+            # to DONE if we're still in a live state.
+            if self._sm.is_running or self._sm.is_paused:
+                self._sm.transition(PipelineState.DONE)
         except asyncio.CancelledError:
             reporter.log("Pipeline cancelled by user.", color=ft.Colors.OUTLINE)
-            self._state = "idle"
+            self._sm.reset()
             raise
         except Exception as ex:
             logger.exception("Pipeline failed")
             reporter.error(f"{type(ex).__name__}: {ex}")
-            self._state = "idle"
+            self._sm.reset()
         finally:
             root.removeHandler(handler)
             self._update_action_bar()

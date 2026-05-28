@@ -140,7 +140,7 @@ class NavigationTracer:
         # still appear in JSONL even with OTel off.
         if wrote:
             try:
-                from event_harvester.tracing import current_span_event
+                from event_harvester.observability.tracing import current_span_event
                 current_span_event(
                     kind,
                     {

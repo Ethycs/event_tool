@@ -5,7 +5,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from event_harvester.config import AppConfig
-from event_harvester.display import BOLD, DIM, RESET, print_message
+from event_harvester.ui.display import BOLD, DIM, RESET, print_message
 from event_harvester.sources import (
     create_persistent_client,
     find_discord_cache,

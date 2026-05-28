@@ -9,7 +9,7 @@ import logging
 from event_harvester.config import LLMConfig
 from event_harvester.llm import chat_completion
 
-logger = logging.getLogger("event_harvester.label")
+logger = logging.getLogger("event_harvester.training.label")
 
 _LABEL_SYSTEM_PROMPT = """\
 You are classifying messages as EVENT or NOISE.

@@ -12,7 +12,7 @@ import importlib
 
 import pytest
 
-from event_harvester import tracing as tracing_mod
+from event_harvester.observability import tracing as tracing_mod
 
 
 @pytest.fixture(autouse=True)

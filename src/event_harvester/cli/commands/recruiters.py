@@ -3,7 +3,7 @@
 import logging
 
 from event_harvester.config import validate_config
-from event_harvester.display import DIM, RED, RESET, print_recruiter_grades
+from event_harvester.ui.display import DIM, RED, RESET, print_recruiter_grades
 
 logger = logging.getLogger("event_harvester")
 
@@ -35,7 +35,7 @@ async def _recruiters_grade(args, cfg) -> int:
         logger.warning(w)
 
     # Fetch only Gmail by disabling all other sources
-    from event_harvester.harvest import harvest_messages
+    from event_harvester.pipeline.harvest import harvest_messages
 
     all_messages = await harvest_messages(
         cfg,
@@ -54,7 +54,7 @@ async def _recruiters_grade(args, cfg) -> int:
 
     # Optional Obsidian recruiter report
     if args.obsidian and cfg.obsidian_recruiters_dir and grades:
-        from event_harvester.obsidian import write_recruiter_report
+        from event_harvester.outputs.obsidian import write_recruiter_report
 
         path = write_recruiter_report(grades, cfg.obsidian_recruiters_dir)
         print(f"Obsidian recruiters -> {path}\n")
@@ -64,7 +64,7 @@ async def _recruiters_grade(args, cfg) -> int:
 
 def _recruiters_reparse(args, cfg) -> int:
     """Interactively act on a saved recruiter report."""
-    from event_harvester.obsidian import reparse_recruiter_report
+    from event_harvester.outputs.obsidian import reparse_recruiter_report
 
     reparse_recruiter_report(args.file, cfg.gmail)
     return 0
@@ -81,7 +81,7 @@ def _run_recruiter_grading(all_messages, cfg, args) -> list:
         cfg: AppConfig
         args: argparse Namespace; expected attributes: no_analyze, auto_trash
     """
-    from event_harvester.recruiter_score import grade_emails_batch
+    from event_harvester.training.recruiter_score import grade_emails_batch
     from event_harvester.sources import fetch_full_bodies
     from event_harvester.sources import gmail_trash as trash
 

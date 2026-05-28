@@ -25,13 +25,16 @@ from event_harvester.cli.parse_helpers import (
 )
 
 
-def _add_harvest_args(p: argparse.ArgumentParser) -> None:
-    """Register the full set of options for the harvest subcommand."""
+def _add_days_back(p: argparse.ArgumentParser) -> None:
+    """--days lookback (shared by harvest/serve/recruiters/classifier)."""
     p.add_argument(
         "--days", type=int, default=None,
         help="Days to look back (default: from DAYS_BACK env or 7)",
     )
 
+
+def _add_platforms_filter(p: argparse.ArgumentParser) -> None:
+    """Mutually-exclusive --only/--skip platform filter (shared by harvest/watch/serve/classifier)."""
     src = p.add_mutually_exclusive_group()
     src.add_argument(
         "--only", type=parse_platform_csv, default=None,
@@ -43,6 +46,36 @@ def _add_harvest_args(p: argparse.ArgumentParser) -> None:
         metavar="PLATFORMS",
         help="Comma-separated list of platforms to skip (e.g. web,signal)",
     )
+
+
+def _add_profile_flag(p: argparse.ArgumentParser) -> None:
+    """--profile NAME (shared by harvest/watch/serve)."""
+    p.add_argument(
+        "--profile", metavar="NAME",
+        help="Apply a named profile from data/profiles.json before per-flag overrides",
+    )
+
+
+def _add_debug_flags(p: argparse.ArgumentParser) -> None:
+    """Web-trace + screenshot + OTel debug flags (shared by harvest/watch/serve)."""
+    p.add_argument(
+        "--debug-web-trace", action="store_true",
+        help="Record web page navigation events to data/.web_traces/ (JSONL per source)",
+    )
+    p.add_argument(
+        "--debug-web-screenshots", action="store_true",
+        help="Capture per-step PNG screenshots + feed GIFs alongside the JSONL trace (implies --debug-web-trace)",
+    )
+    p.add_argument(
+        "--debug-otel", action="store_true",
+        help="Enable OpenTelemetry console span exporter (prints spans to stderr)",
+    )
+
+
+def _add_harvest_args(p: argparse.ArgumentParser) -> None:
+    """Register the full set of options for the harvest subcommand."""
+    _add_days_back(p)
+    _add_platforms_filter(p)
 
     p.add_argument(
         "--cap", type=parse_cap_arg, action="append", default=[],
@@ -88,18 +121,7 @@ def _add_harvest_args(p: argparse.ArgumentParser) -> None:
         "--no-cooldown", action="store_true",
         help="Ignore web source cooldowns (force re-fetch)",
     )
-    p.add_argument(
-        "--debug-web-trace", action="store_true",
-        help="Record web page navigation events to data/.web_traces/ (JSONL per source)",
-    )
-    p.add_argument(
-        "--debug-web-screenshots", action="store_true",
-        help="Capture per-step PNG screenshots + feed GIFs alongside the JSONL trace (implies --debug-web-trace)",
-    )
-    p.add_argument(
-        "--profile", metavar="NAME",
-        help="Apply a named profile from data/profiles.json before per-flag overrides",
-    )
+    _add_profile_flag(p)
 
     p.add_argument(
         "--report", nargs="?", const="events_report.md", default=None,
@@ -120,10 +142,7 @@ def _add_harvest_args(p: argparse.ArgumentParser) -> None:
         "--auto-trash", action="store_true",
         help="Auto-trash recruiter emails scoring below 20 (with --grade-recruiters)",
     )
-    p.add_argument(
-        "--debug-otel", action="store_true",
-        help="Enable OpenTelemetry console span exporter (prints spans to stderr)",
-    )
+    _add_debug_flags(p)
 
 
 def _add_root_flags(p: argparse.ArgumentParser) -> None:
@@ -176,25 +195,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--interval", type=int, default=30,
         help="Poll interval in seconds (default: 30)",
     )
-    src_w = p_watch.add_mutually_exclusive_group()
-    src_w.add_argument("--only", type=parse_platform_csv, default=None, metavar="PLATFORMS")
-    src_w.add_argument("--skip", type=parse_platform_csv, default=None, metavar="PLATFORMS")
-    p_watch.add_argument(
-        "--profile", metavar="NAME",
-        help="Apply a named profile from data/profiles.json",
-    )
-    p_watch.add_argument(
-        "--debug-web-trace", action="store_true",
-        help="Record web page navigation events to data/.web_traces/ (JSONL per source)",
-    )
-    p_watch.add_argument(
-        "--debug-web-screenshots", action="store_true",
-        help="Capture per-step PNG screenshots + feed GIFs alongside the JSONL trace (implies --debug-web-trace)",
-    )
-    p_watch.add_argument(
-        "--debug-otel", action="store_true",
-        help="Enable OpenTelemetry console span exporter (prints spans to stderr)",
-    )
+    _add_platforms_filter(p_watch)
+    _add_profile_flag(p_watch)
+    _add_debug_flags(p_watch)
     _add_root_flags(p_watch)
 
     # ── web ──
@@ -245,10 +248,7 @@ def build_parser() -> argparse.ArgumentParser:
         "grade",
         help="Grade Gmail recruiter emails by quality",
     )
-    rec_grade.add_argument(
-        "--days", type=int, default=None,
-        help="Days to look back (default: from DAYS_BACK env or 7)",
-    )
+    _add_days_back(rec_grade)
     rec_grade.add_argument(
         "--auto-trash", action="store_true",
         help="Auto-trash emails scoring below 20",
@@ -291,13 +291,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--out-labels", metavar="FILE", default=None,
         help="Save labels to this file before training (for review)",
     )
-    clf_train.add_argument(
-        "--days", type=int, default=None,
-        help="Days to look back when harvesting messages to label",
-    )
-    src_t = clf_train.add_mutually_exclusive_group()
-    src_t.add_argument("--only", type=parse_platform_csv, default=None, metavar="PLATFORMS")
-    src_t.add_argument("--skip", type=parse_platform_csv, default=None, metavar="PLATFORMS")
+    _add_days_back(clf_train)
+    _add_platforms_filter(clf_train)
     _add_root_flags(clf_train)
 
     clf_eval = clf_sub.add_parser(
@@ -319,29 +314,10 @@ def build_parser() -> argparse.ArgumentParser:
         "serve",
         help="Run a local web server to review and approve events",
     )
-    p_serve.add_argument(
-        "--days", type=int, default=None,
-        help="Days to look back (default: from DAYS_BACK env or 7)",
-    )
-    src_s = p_serve.add_mutually_exclusive_group()
-    src_s.add_argument("--only", type=parse_platform_csv, default=None, metavar="PLATFORMS")
-    src_s.add_argument("--skip", type=parse_platform_csv, default=None, metavar="PLATFORMS")
-    p_serve.add_argument(
-        "--profile", metavar="NAME",
-        help="Apply a named profile from data/profiles.json on launch",
-    )
-    p_serve.add_argument(
-        "--debug-web-trace", action="store_true",
-        help="Record web page navigation events to data/.web_traces/ (JSONL per source)",
-    )
-    p_serve.add_argument(
-        "--debug-web-screenshots", action="store_true",
-        help="Capture per-step PNG screenshots + feed GIFs alongside the JSONL trace (implies --debug-web-trace)",
-    )
-    p_serve.add_argument(
-        "--debug-otel", action="store_true",
-        help="Enable OpenTelemetry console span exporter (prints spans to stderr)",
-    )
+    _add_days_back(p_serve)
+    _add_platforms_filter(p_serve)
+    _add_profile_flag(p_serve)
+    _add_debug_flags(p_serve)
     _add_root_flags(p_serve)
 
     # ── MCP ──

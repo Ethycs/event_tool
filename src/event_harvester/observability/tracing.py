@@ -15,7 +15,7 @@ import contextlib
 import logging
 import os
 
-logger = logging.getLogger("event_harvester.tracing")
+logger = logging.getLogger("event_harvester.observability.tracing")
 
 _OTEL_OK = False
 _PROVIDER_INSTALLED = False

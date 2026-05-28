@@ -2,7 +2,7 @@
 
 import logging
 
-from event_harvester.display import BOLD, DIM, GREEN, RED, RESET
+from event_harvester.ui.display import BOLD, DIM, GREEN, RED, RESET
 
 logger = logging.getLogger("event_harvester")
 

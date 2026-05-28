@@ -21,12 +21,11 @@ from typing import Any
 
 from event_harvester import __version__
 from event_harvester.cli.parse_helpers import VALID_PLATFORMS, resolve_platforms
-from event_harvester.config import AppConfig, load_config, validate_config
-from event_harvester.event_match import find_acted_fingerprint, save_fingerprint
-from event_harvester.report import generate_report
-from event_harvester.sources import filter_read_sent
+from event_harvester.config import AppConfig, load_config
+from event_harvester.pipeline.event_match import find_acted_fingerprint, save_fingerprint
+from event_harvester.pipeline import Pipeline
+from event_harvester.outputs.report import generate_report
 from event_harvester.utils import load_json, save_json
-from event_harvester.weights import extract_links
 
 logger = logging.getLogger("event_harvester.mcp")
 
@@ -209,10 +208,11 @@ async def run_event_pipeline(
     no_cap: bool = False,
     total_cap: int | None = None,
 ) -> dict[str, Any]:
-    """Run the harvest/filter/extract pipeline and cache the extracted events."""
-    from event_harvester.analysis import _extract_events_cloud, extract_events_llm
-    from event_harvester.harvest import harvest_messages, save_messages
+    """Run the harvest/filter/extract pipeline and cache the extracted events.
 
+    Wraps the shared ``Pipeline`` class with MCP-specific concerns:
+    on-disk caching, the include_known filter, and the public event shape.
+    """
     cfg = load_config()
     if days is not None:
         if days <= 0:
@@ -230,79 +230,66 @@ async def run_event_pipeline(
         cfg.caps.total = total_cap
 
     no_kwargs = _source_kwargs(cfg, only=only, skip=skip)
-    warnings = validate_config(
-        cfg,
-        need_telegram=not no_kwargs["no_telegram"],
-        need_discord=not no_kwargs["no_discord"],
-        need_gmail=not no_kwargs["no_gmail"],
-        need_analysis=not cfg.skip_analyze,
-        need_ticktick=False,
-    )
+    pipeline = Pipeline(cfg)
+    warnings = pipeline.validate(no_kwargs=no_kwargs, need_ticktick=False)
 
-    messages = await harvest_messages(
-        cfg,
+    # When the caller scopes to specific sources via ``only``, bypass
+    # per-source caps so the requested sources aren't silently trimmed.
+    unlimited_caps = _parse_source_filter(only) is not None
+
+    result = await pipeline.run(
+        no_kwargs=no_kwargs,
         load_path=load_path,
-        skip_cache=bool(save_path),
+        save_path=save_path,
         web_source=web_source,
-        no_cooldown=cfg.web.no_cooldown,
-        **no_kwargs,
+        unlimited_caps=unlimited_caps,
     )
-    if save_path:
-        save_messages(messages, save_path)
 
-    source_counts = {
-        source: sum(1 for msg in messages if msg.get("platform") == source)
-        for source in sorted(VALID_PLATFORMS)
-    }
-    actionable = filter_read_sent(messages)
-    links = extract_links(actionable)
+    # MCP exposes a fixed-key per-platform source_counts; the pipeline
+    # only counts the canonical platforms (same set), so this is a
+    # safe pass-through with a sort for deterministic order.
+    source_counts = {p: result.source_counts.get(p, 0) for p in sorted(VALID_PLATFORMS)}
 
-    if cfg.skip_analyze:
+    if result.skipped_analysis or result.no_messages:
         stats = {
-            "total_messages": len(messages),
-            "actionable_messages": len(actionable),
+            "total_messages": len(result.all_messages),
+            "actionable_messages": len(result.actionable),
             "events": 0,
             "new_events": 0,
             "known_events": 0,
             "sources": _enabled_sources(no_kwargs),
-            "analysis_skipped": True,
+            "analysis_skipped": True if result.skipped_analysis else False,
         }
-        _save_latest_events([], stats=stats, source_counts=source_counts, links=links)
+        _save_latest_events(
+            [], stats=stats, source_counts=source_counts, links=result.links,
+        )
         return {"ok": True, "warnings": warnings, "stats": stats, "events": []}
 
-    caps_for_llm = None if _parse_source_filter(only) is not None else cfg.caps
-    summary, events = extract_events_llm(actionable, cfg.days_back, cfg.llm, caps=caps_for_llm)
-    for event in events:
-        event["_status"] = _event_status(event)
-
     if include_known:
-        visible_events = events
+        visible_events = result.events
     else:
-        visible_events = [event for event in events if event.get("_status") == "new"]
-
-    rejects = getattr(extract_events_llm, "_last_rejects", {}) or {}
-    rejects = dict(rejects)
-    rejects["llm_past"] = getattr(_extract_events_cloud, "_last_llm_dropped", []) or []
-    rejects["llm_no_events"] = getattr(_extract_events_cloud, "_last_llm_no_events", []) or []
+        visible_events = [ev for ev in result.events if ev.get("_status") == "new"]
 
     stats = {
-        "total_messages": len(messages),
-        "actionable_messages": len(actionable),
+        "total_messages": len(result.all_messages),
+        "actionable_messages": len(result.actionable),
         "events": len(visible_events),
-        "new_events": sum(1 for event in events if event.get("_status") == "new"),
-        "known_events": sum(1 for event in events if event.get("_status") != "new"),
+        "new_events": sum(1 for ev in result.events if ev.get("_status") == "new"),
+        "known_events": sum(1 for ev in result.events if ev.get("_status") != "new"),
         "sources": _enabled_sources(no_kwargs),
         "analysis_skipped": False,
-        "rejects": {key: len(value) for key, value in rejects.items()},
+        "rejects": {key: len(value) for key, value in result.rejects.items()},
     }
-    _save_latest_events(visible_events, stats=stats, source_counts=source_counts, links=links)
+    _save_latest_events(
+        visible_events, stats=stats, source_counts=source_counts, links=result.links,
+    )
 
     return {
         "ok": True,
         "warnings": warnings,
-        "summary": summary,
+        "summary": result.summary,
         "stats": stats,
-        "events": [_public_event(event, i) for i, event in enumerate(visible_events)],
+        "events": [_public_event(ev, i) for i, ev in enumerate(visible_events)],
     }
 
 
@@ -450,7 +437,7 @@ def build_server(
                 "event": _public_event(event, index),
             }
 
-        from event_harvester.ticktick import create_ticktick_tasks, get_ticktick_client
+        from event_harvester.outputs.ticktick import create_ticktick_tasks, get_ticktick_client
 
         tt = get_ticktick_client(cfg.ticktick)
         if tt is None:
