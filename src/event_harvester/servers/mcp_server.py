@@ -494,6 +494,15 @@ def build_server(
             "decline_event for obvious non-events or duplicates."
         )
 
+    # Site-specific automation tools (Grok). Lazy: doesn't spin up a
+    # browser until the first grok_* tool is called.
+    try:
+        from event_harvester.servers.mcp_grok_tools import register_grok_tools
+
+        register_grok_tools(server)
+    except Exception as e:  # pragma: no cover
+        logger.warning("Skipped Grok MCP tools (import failed): %s", e)
+
     return server
 
 
