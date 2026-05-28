@@ -205,26 +205,35 @@ def test_list_conversations(grok_client, mock_uc):
 
 
 def test_delete_full_flow(grok_client, mock_uc):
-    """delete() runs: open menu → click Delete → confirm → verify gone."""
+    """delete() runs: hover row → click Options → click Delete → verify gone.
+
+    The hover + Options click happen through Playwright locators (mocked),
+    not via page.evaluate. evaluate is called only for: click-Delete-item,
+    best-effort confirm-dialog probe, and the final "row gone?" check.
+    """
     _, page = mock_uc
-    # 4 evaluate() calls in sequence: open-menu, click-delete, confirm, verify
+    # Sidebar locator chain returns a count>=1 so the recipe proceeds.
+    page.locator.return_value.first.count.return_value = 1
+    page.locator.return_value.first.locator.return_value.locator.return_value.count.return_value = 1
+
     page.evaluate.side_effect = [
-        {"ok": True},  # open menu (now returns dict, not bool)
-        True,           # clicked Delete menu item
-        True,           # confirm modal clicked
-        True,           # row is gone
+        True,   # click "Delete" menu item
+        False,  # confirm-dialog probe — no dialog appeared (current Grok)
+        True,   # row is gone after delete
     ]
-    ok = grok_client.delete("https://grok.com/c/del-id")
-    assert ok is True
-    assert page.evaluate.call_count == 4
+    assert grok_client.delete("https://grok.com/c/del-id") is True
+    assert page.evaluate.call_count == 3
+    # The recipe must hover the sidebar row first.
+    page.locator.return_value.first.hover.assert_called()
 
 
-def test_delete_aborts_when_menu_not_found(grok_client, mock_uc):
+def test_delete_aborts_when_row_missing(grok_client, mock_uc):
+    """If the sidebar has no link to the conversation, bail without clicking."""
     _, page = mock_uc
-    page.evaluate.return_value = {"ok": False, "why": "row-not-found"}
+    page.locator.return_value.first.count.return_value = 0  # row not found
     assert grok_client.delete("https://grok.com/c/missing") is False
-    # Only one evaluate — we bail before clicking Delete.
-    assert page.evaluate.call_count == 1
+    # No menu-item click attempted.
+    page.evaluate.assert_not_called()
 
 
 def test_stop_generation(grok_client, mock_uc):

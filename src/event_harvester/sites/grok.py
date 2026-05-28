@@ -372,72 +372,96 @@ class GrokClient:
             except Exception:
                 pass
 
-    def delete(self, conversation_url: str) -> bool:
-        """Delete a conversation. Returns True if the row disappears."""
-        conv_id = _conv_id_from_url(conversation_url) or conversation_url
-        page = self._open(self.GROK_HOME, wait_ms=4000)
+    def _open_row_menu(self, page, conv_id: str) -> bool:
+        """Hover the sidebar row for ``conv_id`` and open its Options menu.
+
+        Grok hides the 3-dot button until the row is hovered (synthetic
+        ``mouseenter`` events aren't enough — Playwright's real ``.hover()``
+        is required). Returns True if the popover opened.
+        """
+        row_loc = page.locator(f'a[href*="/c/{conv_id}"]').first
         try:
-            # Locate sidebar row, hover, click 3-dot button
-            opened = page.evaluate(
-                """(args) => {
-                    const id = args[0];
-                    const moreSel = args[1];
-                    const row = document.querySelector(`a[href*="/c/${id}"]`);
-                    if (!row) return {ok: false, why: 'row-not-found'};
-                    row.scrollIntoView({block: 'center'});
-                    const container = row.closest('li, [role="listitem"], div') || row;
-                    container.dispatchEvent(new MouseEvent('mouseenter', {bubbles: true}));
-                    container.dispatchEvent(new MouseEvent('mouseover', {bubbles: true}));
-                    const btn = container.querySelector(moreSel)
-                                || row.querySelector(moreSel);
-                    if (!btn) return {ok: false, why: 'more-not-found'};
-                    btn.click();
-                    return {ok: true};
-                }""",
-                [conv_id, _SELECTORS["row_more_button"]],
-            )
-            if not opened or not opened.get("ok"):
-                logger.warning("Grok delete: %s", opened)
+            if row_loc.count() == 0:
+                logger.warning("Grok: row not found for %s", conv_id)
                 return False
-            page.wait_for_timeout(400)
-            # Click "Delete" menu item
-            clicked = page.evaluate(
-                """(sel) => {
-                    for (const el of document.querySelectorAll(sel)) {
+            row_loc.scroll_into_view_if_needed()
+            row_loc.hover()
+            page.wait_for_timeout(300)
+            li_loc = row_loc.locator("xpath=ancestor::li[1]")
+            opts_loc = li_loc.locator('button[aria-label="Options" i]')
+            if opts_loc.count() == 0:
+                logger.warning("Grok: Options button not found for %s", conv_id)
+                return False
+            # force=True because the button has width/height before hover
+            # animation settles, even though it's now in the DOM.
+            opts_loc.click(force=True)
+            page.wait_for_timeout(500)
+            return True
+        except Exception as e:
+            logger.warning("Grok: _open_row_menu failed: %s", e)
+            return False
+
+    def _click_menu_item(self, page, target_label: str) -> bool:
+        """Click the ``<div role="menuitem">`` whose text starts with ``target_label``."""
+        return bool(
+            page.evaluate(
+                """(label) => {
+                    const want = label.toLowerCase();
+                    for (const el of document.querySelectorAll('[role="menuitem"]')) {
                         const t = (el.innerText || '').trim().toLowerCase();
-                        if (t === 'delete' || t.startsWith('delete')) {
+                        if (t === want || t.startsWith(want)) {
                             el.click();
                             return true;
                         }
                     }
                     return false;
                 }""",
-                _SELECTORS["menu_item"],
+                target_label,
             )
-            if not clicked:
+        )
+
+    def delete(self, conversation_url: str) -> bool:
+        """Delete a conversation. Returns True if the row disappears.
+
+        Grok's current flow: hover sidebar row → click 3-dot → click "Delete"
+        in the popover. No confirm dialog appears in the standard flow; we
+        still best-effort click any destructive button if one shows up.
+        """
+        conv_id = _conv_id_from_url(conversation_url) or conversation_url
+        page = self._open(self.GROK_HOME, wait_ms=4000)
+        try:
+            if not self._open_row_menu(page, conv_id):
+                return False
+            if not self._click_menu_item(page, "delete"):
                 logger.warning("Grok delete: 'Delete' menu item not found")
                 return False
-            page.wait_for_timeout(500)
-            # Confirm modal — pick the destructive button by text
-            confirmed = page.evaluate(
+            page.wait_for_timeout(800)
+            # Best-effort confirm dialog handling — currently a no-op, but
+            # leaves us covered if Grok adds a confirmation step back.
+            page.evaluate(
                 """() => {
-                    for (const b of document.querySelectorAll('button, [role="button"]')) {
-                        const t = (b.innerText || '').trim().toLowerCase();
-                        if (t === 'delete' || t === 'confirm' || t === 'yes' || t === 'remove') {
-                            b.click();
-                            return true;
+                    const dlgs = document.querySelectorAll(
+                        '[role="alertdialog"], [role="dialog"]'
+                    );
+                    for (const d of dlgs) {
+                        const r = d.getBoundingClientRect();
+                        if (r.width <= 0 || r.height <= 0) continue;
+                        for (const b of d.querySelectorAll('button')) {
+                            const t = (b.innerText || '').trim().toLowerCase();
+                            if (t === 'delete' || t === 'confirm'
+                                || t === 'yes' || t === 'remove') {
+                                b.click();
+                                return true;
+                            }
                         }
                     }
                     return false;
-                }""",
+                }"""
             )
-            if not confirmed:
-                logger.warning("Grok delete: confirm button not found")
-                return False
-            page.wait_for_timeout(1500)
-            # Verify the row is gone from the sidebar
+            page.wait_for_timeout(1200)
+            # Verify the row no longer exists in the sidebar.
             gone = page.evaluate(
-                "(id) => !document.querySelector(`a[href*=\"/c/${id}\"]`)",
+                "(id) => !document.querySelector('a[href*=\"/c/' + id + '\"]')",
                 conv_id,
             )
             return bool(gone)
@@ -464,40 +488,9 @@ class GrokClient:
         conv_id = _conv_id_from_url(conversation_url) or conversation_url
         page = self._open(self.GROK_HOME, wait_ms=4000)
         try:
-            opened = page.evaluate(
-                """(args) => {
-                    const id = args[0];
-                    const moreSel = args[1];
-                    const row = document.querySelector(`a[href*="/c/${id}"]`);
-                    if (!row) return false;
-                    row.scrollIntoView({block: 'center'});
-                    const container = row.closest('li, [role="listitem"], div') || row;
-                    container.dispatchEvent(new MouseEvent('mouseenter', {bubbles: true}));
-                    const btn = container.querySelector(moreSel)
-                                || row.querySelector(moreSel);
-                    if (!btn) return false;
-                    btn.click();
-                    return true;
-                }""",
-                [conv_id, _SELECTORS["row_more_button"]],
-            )
-            if not opened:
+            if not self._open_row_menu(page, conv_id):
                 return False
-            page.wait_for_timeout(400)
-            clicked = page.evaluate(
-                """(sel) => {
-                    for (const el of document.querySelectorAll(sel)) {
-                        const t = (el.innerText || '').trim().toLowerCase();
-                        if (t === 'rename' || t.startsWith('rename')) {
-                            el.click();
-                            return true;
-                        }
-                    }
-                    return false;
-                }""",
-                _SELECTORS["menu_item"],
-            )
-            if not clicked:
+            if not self._click_menu_item(page, "rename"):
                 return False
             page.wait_for_timeout(400)
             # Fill the rename input — Grok may use inline edit or a modal
@@ -529,44 +522,20 @@ class GrokClient:
                 pass
 
     def archive(self, conversation_url: str) -> bool:
-        """Archive a conversation via its sidebar row's menu (best-effort)."""
+        """Archive a conversation via its sidebar row's menu (best-effort).
+
+        Grok's current popover offers Open/Rename/Pin/Delete — no Archive
+        item. This call returns False unless Grok adds it back later, at
+        which point the same hover+menu-item flow will pick it up.
+        """
         conv_id = _conv_id_from_url(conversation_url) or conversation_url
         page = self._open(self.GROK_HOME, wait_ms=4000)
         try:
-            opened = page.evaluate(
-                """(args) => {
-                    const id = args[0];
-                    const moreSel = args[1];
-                    const row = document.querySelector(`a[href*="/c/${id}"]`);
-                    if (!row) return false;
-                    const container = row.closest('li, [role="listitem"], div') || row;
-                    container.dispatchEvent(new MouseEvent('mouseenter', {bubbles: true}));
-                    const btn = container.querySelector(moreSel)
-                                || row.querySelector(moreSel);
-                    if (!btn) return false;
-                    btn.click();
-                    return true;
-                }""",
-                [conv_id, _SELECTORS["row_more_button"]],
-            )
-            if not opened:
+            if not self._open_row_menu(page, conv_id):
                 return False
-            page.wait_for_timeout(400)
-            clicked = page.evaluate(
-                """(sel) => {
-                    for (const el of document.querySelectorAll(sel)) {
-                        const t = (el.innerText || '').trim().toLowerCase();
-                        if (t === 'archive' || t.startsWith('archive')) {
-                            el.click();
-                            return true;
-                        }
-                    }
-                    return false;
-                }""",
-                _SELECTORS["menu_item"],
-            )
+            clicked = self._click_menu_item(page, "archive")
             page.wait_for_timeout(800)
-            return bool(clicked)
+            return clicked
         finally:
             try:
                 page.close()
