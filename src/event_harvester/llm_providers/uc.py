@@ -35,11 +35,11 @@ import asyncio
 import logging
 import threading
 import time
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Iterator, Optional
 
 import litellm
 from litellm import CustomLLM
-from litellm.types.utils import ModelResponse, Usage
+from litellm.types.utils import GenericStreamingChunk, ModelResponse, Usage
 
 from event_harvester.sites.grok import GrokAuthRequired, get_grok_client
 
@@ -194,15 +194,8 @@ class UCBrowserCustomLLM(CustomLLM):
                 llm_provider=PROVIDER,
             )
 
-        if optional_params.get("stream"):
-            raise litellm.exceptions.BadRequestError(
-                message=(
-                    "UCBrowserCustomLLM: streaming is not supported. "
-                    "Pass stream=False (or omit it)."
-                ),
-                model=model,
-                llm_provider=PROVIDER,
-            )
+        # Note: stream=True doesn't reach this method — litellm routes
+        # streaming requests to ``streaming``/``astreaming`` below.
 
         prompt_text = _last_user_message(messages)
         if not prompt_text:
@@ -268,6 +261,90 @@ class UCBrowserCustomLLM(CustomLLM):
             timeout=timeout,
             **kwargs,
         )
+
+    # ── Streaming (fake) ─────────────────────────────────────────────
+    #
+    # GrokClient.send() is anchor-locked / blocking — it doesn't expose
+    # token-level streaming. To stay compatible with clients that require
+    # ``stream=True`` (Cline, Open WebUI, some Cursor flows) we emit the
+    # full response as a single SSE content chunk followed by a final
+    # ``is_finished=True`` chunk. This is the "fake streaming" pattern.
+
+    def _stream_chunks(self, response: ModelResponse) -> Iterator[GenericStreamingChunk]:
+        content = ""
+        try:
+            content = response.choices[0].message.content or ""
+        except Exception:
+            content = ""
+        usage_block = None
+        if getattr(response, "usage", None) is not None:
+            try:
+                usage_block = {
+                    "prompt_tokens": int(response.usage.prompt_tokens or 0),
+                    "completion_tokens": int(response.usage.completion_tokens or 0),
+                    "total_tokens": int(response.usage.total_tokens or 0),
+                }
+            except Exception:
+                usage_block = None
+        yield GenericStreamingChunk(
+            text=content,
+            tool_use=None,
+            is_finished=False,
+            finish_reason="",
+            usage=None,
+            index=0,
+        )
+        yield GenericStreamingChunk(
+            text="",
+            tool_use=None,
+            is_finished=True,
+            finish_reason="stop",
+            usage=usage_block,
+            index=0,
+        )
+
+    def streaming(  # type: ignore[override]
+        self,
+        model: str,
+        messages: list,
+        model_response: ModelResponse,
+        optional_params: dict,
+        litellm_params: dict | None = None,
+        timeout: Any = None,
+        **kwargs: Any,
+    ) -> Iterator[GenericStreamingChunk]:
+        response = self.completion(
+            model=model,
+            messages=messages,
+            model_response=model_response,
+            optional_params=optional_params,
+            litellm_params=litellm_params,
+            timeout=timeout,
+            **kwargs,
+        )
+        yield from self._stream_chunks(response)
+
+    async def astreaming(  # type: ignore[override]
+        self,
+        model: str,
+        messages: list,
+        model_response: ModelResponse,
+        optional_params: dict,
+        litellm_params: dict | None = None,
+        timeout: Any = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[GenericStreamingChunk]:
+        response = await self.acompletion(
+            model=model,
+            messages=messages,
+            model_response=model_response,
+            optional_params=optional_params,
+            litellm_params=litellm_params,
+            timeout=timeout,
+            **kwargs,
+        )
+        for chunk in self._stream_chunks(response):
+            yield chunk
 
 
 # ── Registration ─────────────────────────────────────────────────────

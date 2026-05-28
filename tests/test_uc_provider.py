@@ -168,14 +168,45 @@ def test_completion_unsupported_model_raises_bad_request(handler):
         )
 
 
-def test_completion_stream_true_raises_bad_request(handler):
-    with pytest.raises(litellm.exceptions.BadRequestError):
-        handler.completion(
+def test_streaming_emits_full_text_then_done_chunk(handler, fake_grok):
+    """Streaming clients get the full response in one chunk + a finish chunk.
+
+    Token-level streaming isn't available from a browser-driven backend, so
+    we emit the populated ModelResponse as a single content chunk followed
+    by the OpenAI-style ``is_finished=True`` sentinel.
+    """
+    chunks = list(
+        handler.streaming(
             model="grok",
             messages=[{"role": "user", "content": "hi"}],
             model_response=_fresh_model_response(),
-            optional_params={"stream": True},
+            optional_params={},
         )
+    )
+    assert len(chunks) == 2
+    assert chunks[0]["text"] == "hello back"
+    assert chunks[0]["is_finished"] is False
+    assert chunks[1]["text"] == ""
+    assert chunks[1]["is_finished"] is True
+    assert chunks[1]["finish_reason"] == "stop"
+
+
+def test_astreaming_emits_full_text_then_done_chunk(handler, fake_grok):
+    async def _collect():
+        out = []
+        async for c in handler.astreaming(
+            model="grok",
+            messages=[{"role": "user", "content": "hi"}],
+            model_response=_fresh_model_response(),
+            optional_params={},
+        ):
+            out.append(c)
+        return out
+
+    chunks = asyncio.run(_collect())
+    assert len(chunks) == 2
+    assert chunks[0]["text"] == "hello back"
+    assert chunks[1]["is_finished"] is True
 
 
 def test_completion_empty_messages_raises_bad_request(handler):
