@@ -1,16 +1,22 @@
 """MCP tool registrations for Grok control.
 
-Exposes 11 tools that delegate to a process-singleton GrokClient.
+Exposes 12 tools that delegate to a process-singleton GrokClient.
 The client is created lazily on first call and reused thereafter; an
 ``atexit`` hook closes the underlying browser on shutdown.
 
 Tools:
-    Core:      grok_send_message, grok_read_conversation,
-               grok_list_conversations, grok_delete_conversation
-    Lifecycle: grok_new_chat, grok_rename_conversation,
-               grok_archive_conversation, grok_regenerate,
-               grok_stop_generation
-    Models:    grok_get_models, grok_switch_model
+    Conversation: chat (POC: conversational handle keyed by session_id)
+    Core:         grok_send_message, grok_read_conversation,
+                  grok_list_conversations, grok_delete_conversation
+    Lifecycle:    grok_new_chat, grok_rename_conversation,
+                  grok_archive_conversation, grok_regenerate,
+                  grok_stop_generation
+    Models:       grok_get_models, grok_switch_model
+
+The ``chat`` tool shares its session store with the litellm provider
+(:data:`event_harvester.llm_providers.uc.uc_handler`) so the same
+``session_id`` continues the same conversation whether the caller hits
+the proxy or the MCP server.
 """
 
 from __future__ import annotations
@@ -18,6 +24,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
+from event_harvester.llm_providers.uc import uc_handler
 from event_harvester.sites.grok import GrokAuthRequired, get_grok_client
 
 logger = logging.getLogger("event_harvester.servers.mcp_grok_tools")
@@ -46,6 +53,68 @@ def _wrap_auth(fn):
 
 def register_grok_tools(server) -> None:
     """Attach all Grok MCP tools to the given FastMCP ``server``."""
+
+    @server.prompt(
+        name="talk_to_grok",
+        title="Talk to this chat tool if necessary",
+        description=(
+            "Invites the calling LLM to use the `chat` tool for back-and-forth "
+            "conversation with a browser-driven Grok session."
+        ),
+    )
+    def talk_to_grok_prompt(session_id: str = "default") -> str:
+        """Prompt template the client can fetch and feed to its LLM."""
+        return (
+            "Talk to this chat tool if necessary.\n\n"
+            "You can have a multi-turn conversation with Grok by calling the\n"
+            "`chat` tool. The tool takes a `message` (your prompt) and a\n"
+            f"`session_id` (use `{session_id}` to keep this conversation\n"
+            "going across calls, or pick a different one to start a fresh\n"
+            "thread). The reply is returned synchronously. Pass\n"
+            "`wait_for_response=False` if you just want to fire a prompt\n"
+            "without waiting for the answer.\n\n"
+            "When you need information Grok can give you, or when the user\n"
+            "wants to talk to Grok, route the request through `chat`."
+        )
+
+    @server.tool()
+    @_wrap_auth
+    def chat(
+        message: str,
+        session_id: str = "default",
+        wait_for_response: bool = True,
+        timeout_s: int = 60,
+    ) -> dict[str, Any]:
+        """Have a conversation with this tool.
+
+        This is a conversational handle on Grok. Send a message, get a
+        reply. Pass the same ``session_id`` across calls to continue the
+        same chat; use a fresh ``session_id`` to start a new one. The
+        first call for a given ``session_id`` opens a new Grok chat; every
+        subsequent call posts into the same one and the assistant has
+        full context of what's been said.
+
+        Set ``wait_for_response=False`` for fire-and-forget mode: the call
+        returns as soon as the message is submitted (~1.6 s) and
+        ``response`` will be empty. Useful for batching many prompts when
+        you don't need to read each reply.
+
+        Returns:
+            ``{ok, response, url, conversation_id, session_id}``.
+            ``response`` is the assistant's reply text (Grok's "Thought
+            for Ns" reasoning prefix is stripped). ``url`` is the canonical
+            grok.com/c/<uuid> URL; ``conversation_id`` is the bare uuid.
+        """
+        existing_url = uc_handler.get_session_url(session_id)
+        result = get_grok_client().send(
+            message,
+            conversation_url=existing_url,
+            timeout_s=timeout_s,
+            wait_for_response=wait_for_response,
+        )
+        if result.get("url"):
+            uc_handler.set_session_url(session_id, result["url"])
+        return {"ok": True, "session_id": session_id, **result}
 
     @server.tool()
     @_wrap_auth
@@ -164,3 +233,31 @@ def register_grok_tools(server) -> None:
         """Open the model picker and select ``model_name``. Returns ``{ok, switched}``."""
         switched = get_grok_client().switch_model(model_name)
         return {"ok": True, "switched": switched}
+
+    @server.tool()
+    @_wrap_auth
+    def list_chat_sessions() -> dict[str, Any]:
+        """List session_ids currently mapped to a Grok conversation.
+
+        Useful when you've called ``chat`` several times and need to see
+        which session_ids are still "alive" in the in-memory store.
+        Returns ``{ok, sessions: {session_id: url, ...}}``.
+        """
+        with uc_handler._sessions_lock:
+            snapshot = dict(uc_handler._sessions)
+        return {"ok": True, "sessions": snapshot, "count": len(snapshot)}
+
+    @server.tool()
+    @_wrap_auth
+    def forget_chat_session(session_id: str) -> dict[str, Any]:
+        """Drop a session_id from the chat session store.
+
+        The next ``chat`` call with this session_id will start a fresh
+        Grok conversation. The Grok-side chat itself is NOT deleted —
+        use ``grok_delete_conversation`` for that.
+
+        Returns ``{ok, forgotten}``.
+        """
+        before = uc_handler.get_session_url(session_id)
+        uc_handler.forget_session(session_id)
+        return {"ok": True, "forgotten": before is not None, "previous_url": before}
