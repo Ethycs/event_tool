@@ -32,10 +32,17 @@ from uc_browser import BrowserMode, UCBrowser
 
 logger = logging.getLogger("event_harvester.sites.grok")
 
-_RECIPE_VERSION = 1  # bump when DOM recipes change
+_RECIPE_VERSION = 2  # bump when DOM recipes change
 
-# Heuristic selectors. Updated as Grok's DOM shifts.
+# Anchor selectors verified against the live DOM. The chat-input/message
+# anchors are stable test-ids; the menu/picker selectors are fuzzy and
+# may need tuning when Grok's DOM drifts.
 _SELECTORS: dict[str, str] = {
+    # ── Core chat surface (DOM-anchored, verified) ───────────────────
+    "chat_input": "div.ProseMirror",
+    "user_message": 'div[data-testid="user-message"]',
+    "assistant_message": 'div[data-testid="assistant-message"]',
+    # ── Sidebar ──────────────────────────────────────────────────────
     "conversation_link": 'a[href*="/c/"]',
     # 3-dot / "more options" button on a conversation row in the sidebar
     "row_more_button": (
@@ -87,18 +94,33 @@ class GrokAuthRequired(GrokError):
 # ── Helpers ──────────────────────────────────────────────────────────
 
 
-_UUID_RE = re.compile(
-    r"/c/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
+_UUID_PATTERN = (
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
 )
+_PATH_UUID_RE = re.compile(rf"/c/{_UUID_PATTERN}")
+_QUERY_UUID_RE = re.compile(rf"[?&]chat={_UUID_PATTERN}")
+# Strip Grok's "Thought for Ns" reasoning header from streamed responses.
+_THOUGHT_PREFIX_RE = re.compile(r"^Thought for [0-9]+\s*s\s*\n+", flags=re.IGNORECASE)
 
 
 def _conv_id_from_url(url: str) -> Optional[str]:
-    """Extract the conversation UUID from a grok.com /c/<uuid> URL."""
+    """Extract the conversation UUID from any of Grok's URL shapes.
+
+    Recognised forms:
+        ``/c/<uuid>``                      — classic chat URL
+        ``/project/<uuid>?chat=<uuid>``    — chat lives inside a "project" workspace
+        ``...?chat=<uuid>``                — short link form
+    """
     if not url:
         return None
-    match = _UUID_RE.search(url)
+    match = _PATH_UUID_RE.search(url) or _QUERY_UUID_RE.search(url)
     return match.group(1) if match else None
+
+
+def _strip_thought_prefix(text: str) -> str:
+    """Drop Grok's ``Thought for Ns`` reasoning prefix if present."""
+    return _THOUGHT_PREFIX_RE.sub("", text or "", count=1)
 
 
 def _normalize_url(url_or_id: str) -> str:
@@ -186,17 +208,75 @@ class GrokClient:
     ) -> dict:
         """Send a message; return ``{response, url, conversation_id}``.
 
+        Grok-specific recipe (bypasses the generic UCBrowser.chat heuristic
+        which mis-scores grok's input wrapper). Types into the ProseMirror
+        editor and submits via Enter, then waits for a new assistant block
+        ``div[data-testid="assistant-message"]`` to appear and stabilise.
+
         If ``conversation_url`` is None, posts to the Grok root (which
         creates a new conversation and redirects to ``/c/<uuid>``).
         """
         url = _normalize_url(conversation_url) if conversation_url else self.GROK_HOME
         page = self._open(url, wait_ms=4000)
-        uc = self._ensure_uc()
         try:
-            response = uc.chat(page, message, timeout_s=timeout_s)
+            input_sel = _SELECTORS["chat_input"]
+            assistant_sel = _SELECTORS["assistant_message"]
+            page.wait_for_selector(input_sel, timeout=15000)
+
+            # Snapshot the count of assistant blocks so we can detect a new one.
+            prev_count = page.evaluate(
+                "(sel) => document.querySelectorAll(sel).length",
+                assistant_sel,
+            )
+
+            # Type via the extension's framework-aware setText (ProseMirror).
+            typed = page.evaluate(
+                """(args) => {
+                    if (!window.__UC_setText) return {success: false, error: 'no __UC_setText'};
+                    return window.__UC_setText(args[0], args[1]);
+                }""",
+                [input_sel, message],
+            ) or {}
+            if not typed.get("success"):
+                logger.warning("Grok: __UC_setText failed (%s); using keyboard.type fallback", typed.get("error"))
+                page.focus(input_sel)
+                page.keyboard.type(message, delay=10)
+
+            # Submit on Enter — Grok has no aria-labelled send button.
+            page.focus(input_sel)
+            page.keyboard.press("Enter")
+
+            # Poll for a new assistant block to appear and its text to settle.
+            deadline = time.monotonic() + timeout_s
+            last_text = ""
+            stable = 0
+            while time.monotonic() < deadline:
+                page.wait_for_timeout(700)
+                state = page.evaluate(
+                    """(args) => {
+                        const sel = args[0];
+                        const prev = args[1];
+                        const els = document.querySelectorAll(sel);
+                        if (els.length <= prev) return {ready: false, text: ''};
+                        const el = els[els.length - 1];
+                        return {ready: true, text: (el.innerText || '').trim()};
+                    }""",
+                    [assistant_sel, prev_count],
+                ) or {}
+                if not state.get("ready"):
+                    continue
+                cur = state.get("text") or ""
+                if cur and cur == last_text:
+                    stable += 1
+                    if stable >= 3:  # ~2.1s of unchanged text → settled
+                        break
+                else:
+                    stable = 0
+                    last_text = cur
+
             result_url = page.url
             return {
-                "response": response,
+                "response": _strip_thought_prefix(last_text),
                 "url": result_url,
                 "conversation_id": _conv_id_from_url(result_url),
             }
@@ -209,42 +289,43 @@ class GrokClient:
     def read(self, conversation_url: str) -> dict:
         """Return the full transcript: ``{url, conversation_id, messages}``.
 
-        Messages are role-tagged when the DOM exposes it (Grok uses
-        ``data-message-author-role`` like ChatGPT); otherwise role is
-        ``"unknown"`` and text is the raw block.
+        Walks ``div[data-testid="user-message"]`` and
+        ``div[data-testid="assistant-message"]`` blocks in document order.
+        Assistant messages have any ``Thought for Ns`` reasoning prefix
+        stripped.
         """
         url = _normalize_url(conversation_url)
         page = self._open(url, wait_ms=3500)
         try:
             messages = page.evaluate(
-                """() => {
-                    const out = [];
-                    // Prefer explicit role markers if Grok exposes them
-                    const tagged = document.querySelectorAll('[data-message-author-role]');
-                    if (tagged.length) {
-                        for (const el of tagged) {
-                            out.push({
-                                role: el.getAttribute('data-message-author-role') || 'unknown',
-                                text: (el.innerText || '').trim(),
-                            });
-                        }
-                        return out;
-                    }
-                    // Fallback: role=article descendants in main/section
-                    const arts = document.querySelectorAll(
-                        'main article, [role="article"], [class*="message" i]'
+                """(args) => {
+                    const userSel = args[0];
+                    const asstSel = args[1];
+                    const all = document.querySelectorAll(
+                        `${userSel}, ${asstSel}`
                     );
-                    for (const el of arts) {
-                        const t = (el.innerText || '').trim();
-                        if (t.length > 1) out.push({role: 'unknown', text: t});
+                    const out = [];
+                    for (const el of all) {
+                        const tid = el.getAttribute('data-testid');
+                        out.push({
+                            role: tid === 'user-message' ? 'user' : 'assistant',
+                            text: (el.innerText || '').trim(),
+                        });
                     }
                     return out;
                 }""",
-            )
+                [_SELECTORS["user_message"], _SELECTORS["assistant_message"]],
+            ) or []
+            # Strip Grok's reasoning prefix from assistant blocks.
+            cleaned = [
+                {**m, "text": _strip_thought_prefix(m["text"])} if m.get("role") == "assistant"
+                else m
+                for m in messages
+            ]
             return {
                 "url": page.url,
                 "conversation_id": _conv_id_from_url(page.url),
-                "messages": messages or [],
+                "messages": cleaned,
             }
         finally:
             try:

@@ -19,6 +19,7 @@ from event_harvester.sites.grok import (
     GrokClient,
     _conv_id_from_url,
     _normalize_url,
+    _strip_thought_prefix,
 )
 
 
@@ -36,6 +37,17 @@ from event_harvester.sites.grok import (
             "https://grok.com/c/9a321760-da6c-4ece-84cd-2e138e9a56b8?rid=26e027de",
             "9a321760-da6c-4ece-84cd-2e138e9a56b8",
         ),
+        # Project-workspace shape: the chat id lives in the `chat` query param.
+        (
+            "https://grok.com/project/eb4fb4c3-2c98-4c9e-b3f0-9de16f244137"
+            "?chat=9a321760-da6c-4ece-84cd-2e138e9a56b8&rid=26e027de",
+            "9a321760-da6c-4ece-84cd-2e138e9a56b8",
+        ),
+        # Bare ?chat= form.
+        (
+            "https://grok.com/anything?chat=9a321760-da6c-4ece-84cd-2e138e9a56b8",
+            "9a321760-da6c-4ece-84cd-2e138e9a56b8",
+        ),
         ("https://grok.com/", None),
         ("", None),
         ("nope", None),
@@ -43,6 +55,22 @@ from event_harvester.sites.grok import (
 )
 def test_conv_id_from_url(url, expected):
     assert _conv_id_from_url(url) == expected
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("Thought for 1s\n\npineapple", "pineapple"),
+        ("Thought for 12 s\n\nbody text", "body text"),
+        # No prefix → unchanged.
+        ("pineapple", "pineapple"),
+        # Prefix in the middle should not be touched.
+        ("hello\nThought for 1s\n\nx", "hello\nThought for 1s\n\nx"),
+        ("", ""),
+    ],
+)
+def test_strip_thought_prefix(raw, expected):
+    assert _strip_thought_prefix(raw) == expected
 
 
 def test_normalize_url_full_url_passthrough():
@@ -62,18 +90,24 @@ def test_normalize_url_empty_returns_home():
 
 @pytest.fixture
 def mock_uc():
-    """Yield a fake UCBrowser with chat()/open()/dismiss/close stubs."""
+    """Yield a fake UCBrowser with open()/dismiss/close stubs.
+
+    ``page.evaluate`` is left bare — each test populates a ``side_effect``
+    matching the recipe under exercise. ``page.keyboard.press`` /
+    ``page.focus`` / ``page.wait_for_selector`` are auto-mocked.
+    """
     uc = MagicMock()
     page = MagicMock()
     page.url = "https://grok.com/c/abc12345-1234-1234-1234-1234567890ab"
     page.evaluate = MagicMock(return_value=None)
     page.wait_for_timeout = MagicMock()
+    page.wait_for_selector = MagicMock()
+    page.focus = MagicMock()
     page.close = MagicMock()
     uc.open = MagicMock(return_value=page)
     uc.dismiss_cookies = MagicMock(return_value=True)
     uc.close_modal = MagicMock(return_value=False)
     uc.has_login_wall = MagicMock(return_value=False)
-    uc.chat = MagicMock(return_value="hello back")
     uc._wait_ready = MagicMock(return_value=True)
     uc.start = MagicMock()
     uc.close = MagicMock()
@@ -93,12 +127,46 @@ def grok_client(mock_uc):
 
 def test_send_basic(grok_client, mock_uc):
     uc, page = mock_uc
+    # send() evaluate sequence:
+    #   1. prev_count (assistant blocks before sending) → 0
+    #   2. __UC_setText result                          → {"success": True, ...}
+    #   3-N. assistant poll: {"ready": True, "text": ...}
+    # Stabilises at 3 unchanged polls (after the first "different" poll), so
+    # we feed 4 identical ready-True states.
+    page.evaluate.side_effect = [
+        0,
+        {"success": True, "method": "execCommand"},
+        {"ready": True, "text": "Thought for 1s\n\nhello back"},
+        {"ready": True, "text": "Thought for 1s\n\nhello back"},
+        {"ready": True, "text": "Thought for 1s\n\nhello back"},
+        {"ready": True, "text": "Thought for 1s\n\nhello back"},
+    ]
     out = grok_client.send("hello")
+    # "Thought for Ns" prefix stripped from the response.
     assert out["response"] == "hello back"
     assert out["url"] == page.url
     assert out["conversation_id"] == "abc12345-1234-1234-1234-1234567890ab"
-    uc.chat.assert_called_once()
-    assert uc.chat.call_args.args[1] == "hello"
+    # We submitted via Enter, not via uc.chat()
+    page.keyboard.press.assert_called_with("Enter")
+    # And typed via __UC_setText (the second evaluate call), passing our message
+    setText_call = page.evaluate.call_args_list[1]
+    assert setText_call.args[1] == ["div.ProseMirror", "hello"]
+
+
+def test_send_uses_keyboard_type_when_setText_fails(grok_client, mock_uc):
+    """If __UC_setText returns success=False we fall back to keyboard.type."""
+    _uc, page = mock_uc
+    page.evaluate.side_effect = [
+        0,
+        {"success": False, "error": "no __UC_setText"},
+        {"ready": True, "text": "ok"},
+        {"ready": True, "text": "ok"},
+        {"ready": True, "text": "ok"},
+        {"ready": True, "text": "ok"},
+    ]
+    out = grok_client.send("fallback path")
+    page.keyboard.type.assert_called_once_with("fallback path", delay=10)
+    assert out["response"] == "ok"
 
 
 def test_send_login_wall_raises(grok_client, mock_uc):
@@ -112,13 +180,17 @@ def test_read_returns_messages(grok_client, mock_uc):
     _, page = mock_uc
     page.evaluate.return_value = [
         {"role": "user", "text": "hi"},
-        {"role": "assistant", "text": "hello"},
+        {"role": "assistant", "text": "Thought for 1s\n\nhello"},
     ]
     page.url = "https://grok.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
     out = grok_client.read("https://grok.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
     assert out["conversation_id"] == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
     assert len(out["messages"]) == 2
     assert out["messages"][1]["role"] == "assistant"
+    # Reasoning prefix scrubbed from assistant text.
+    assert out["messages"][1]["text"] == "hello"
+    # User text left untouched.
+    assert out["messages"][0]["text"] == "hi"
 
 
 def test_list_conversations(grok_client, mock_uc):
