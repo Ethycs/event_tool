@@ -274,6 +274,32 @@ def test_no_session_no_store(handler, fake_grok):
     assert handler._sessions == {}
 
 
+def test_flattened_extras_from_proxy_are_honored(handler, fake_grok):
+    """The litellm proxy flattens extra_body into optional_params top-level.
+
+    Our resolvers must read both shapes so the same handler works for
+    direct litellm.completion() calls and proxy-mediated calls.
+    """
+    handler.completion(
+        model="grok",
+        messages=[{"role": "user", "content": "hi"}],
+        model_response=_fresh_model_response(),
+        optional_params={
+            "stream": False,
+            # Flat, NOT nested under extra_body — this is what the proxy delivers.
+            "session_id": "proxy-flat",
+            "conversation_url": "https://grok.com/c/flat",
+            "wait_for_response": False,
+        },
+    )
+    # session_id was honored — session_url got persisted.
+    assert handler.get_session_url("proxy-flat") is not None
+    # conversation_url short-circuited the lookup.
+    assert fake_grok.send.call_args.kwargs["conversation_url"] == "https://grok.com/c/flat"
+    # wait_for_response=False propagated to GrokClient.send().
+    assert fake_grok.send.call_args.kwargs["wait_for_response"] is False
+
+
 # ── Async path ───────────────────────────────────────────────────────
 
 

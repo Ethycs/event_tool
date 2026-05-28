@@ -153,6 +153,10 @@ class GrokClient:
         self.mode = mode
         self.timeout_ms = timeout_ms
         self._uc: UCBrowser | None = None
+        # Single long-lived page shared across send/read/delete/...
+        # The first call pays the page-open cost (~30s incl. extension boot
+        # + sidebar hydration). Every subsequent call just navigates.
+        self._page = None
 
     # ── Lifecycle ────────────────────────────────────────────────────
 
@@ -171,6 +175,12 @@ class GrokClient:
         return self._uc
 
     def close(self) -> None:
+        if self._page is not None:
+            try:
+                self._page.close()
+            except Exception:
+                pass
+            self._page = None
         if self._uc is not None:
             try:
                 self._uc.close()
@@ -180,22 +190,47 @@ class GrokClient:
 
     # ── Internal: prepare a page ─────────────────────────────────────
 
-    def _open(self, url: str, *, wait_ms: int = 4000):
-        """Open URL, dismiss obstacles, raise if login wall detected."""
+    def _ensure_page(self):
+        """Return the long-lived Grok page, opening it on first use."""
         uc = self._ensure_uc()
-        page = uc.open(url, wait_ms=wait_ms)
-        # Best-effort obstacle clear; quiet on failure.
-        uc.dismiss_cookies(page)
-        uc.close_modal(page)
-        if uc.has_login_wall(page):
-            current = page.url
-            page.close()
-            raise GrokAuthRequired(
-                f"Grok shows a login wall at {current}. "
-                "Run `pixi run event-harvester web-login --urls https://grok.com` "
-                "to log in, then retry."
-            )
+        if self._page is None or self._page.is_closed():
+            logger.info("Opening Grok page (cold start).")
+            page = uc.open(self.GROK_HOME, wait_ms=2000)
+            uc.dismiss_cookies(page)
+            uc.close_modal(page)
+            if uc.has_login_wall(page):
+                current = page.url
+                try:
+                    page.close()
+                except Exception:
+                    pass
+                raise GrokAuthRequired(
+                    f"Grok shows a login wall at {current}. "
+                    "Run `pixi run event-harvester web-login --urls https://grok.com` "
+                    "to log in, then retry."
+                )
+            self._page = page
+        return self._page
+
+    @staticmethod
+    def _same_path(a: str, b: str) -> bool:
+        """True when two grok URLs point at the same place (ignoring ?rid=)."""
+        return a.split("?", 1)[0].rstrip("/") == b.split("?", 1)[0].rstrip("/")
+
+    def _navigate(self, url: str, *, wait_ms: int = 1200):
+        """Navigate the persistent page to ``url`` if we aren't already there."""
+        page = self._ensure_page()
+        if not self._same_path(page.url, url):
+            page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+        if wait_ms:
+            page.wait_for_timeout(wait_ms)
         return page
+
+    # Backwards compat: existing recipes that called self._open used to receive
+    # a fresh page. _open now returns the long-lived page after navigating.
+    # Kept private so external callers shouldn't depend on it.
+    def _open(self, url: str, *, wait_ms: int = 1200):
+        return self._navigate(url, wait_ms=wait_ms)
 
     # ── Core ─────────────────────────────────────────────────────────
 
@@ -205,29 +240,42 @@ class GrokClient:
         *,
         conversation_url: Optional[str] = None,
         timeout_s: int = 60,
+        wait_for_response: bool = True,
     ) -> dict:
         """Send a message; return ``{response, url, conversation_id}``.
 
         Grok-specific recipe (bypasses the generic UCBrowser.chat heuristic
         which mis-scores grok's input wrapper). Types into the ProseMirror
-        editor and submits via Enter, then waits for a new assistant block
-        ``div[data-testid="assistant-message"]`` to appear and stabilise.
+        editor and submits via Enter.
+
+        With ``wait_for_response=True`` (default) we wait for a new
+        ``div[data-testid="assistant-message"]`` to appear and its text to
+        stabilise, then return the response.
+
+        With ``wait_for_response=False`` (blind / fire-and-forget) we
+        return as soon as the URL settles to ``/c/<uuid>``. ``response``
+        is an empty string in that case. Saves the ~5-30 s Grok takes to
+        actually generate a reply — useful for batching many prompts when
+        the caller doesn't need to parse each one.
 
         If ``conversation_url`` is None, posts to the Grok root (which
         creates a new conversation and redirects to ``/c/<uuid>``).
         """
         url = _normalize_url(conversation_url) if conversation_url else self.GROK_HOME
-        page = self._open(url, wait_ms=4000)
+        page = self._open(url, wait_ms=1200)
         try:
             input_sel = _SELECTORS["chat_input"]
             assistant_sel = _SELECTORS["assistant_message"]
             page.wait_for_selector(input_sel, timeout=15000)
 
             # Snapshot the count of assistant blocks so we can detect a new one.
-            prev_count = page.evaluate(
-                "(sel) => document.querySelectorAll(sel).length",
-                assistant_sel,
-            )
+            # (Only matters when we're going to wait for it.)
+            prev_count = 0
+            if wait_for_response:
+                prev_count = page.evaluate(
+                    "(sel) => document.querySelectorAll(sel).length",
+                    assistant_sel,
+                )
 
             # Type via the extension's framework-aware setText (ProseMirror).
             typed = page.evaluate(
@@ -245,6 +293,20 @@ class GrokClient:
             # Submit on Enter — Grok has no aria-labelled send button.
             page.focus(input_sel)
             page.keyboard.press("Enter")
+
+            # Fire-and-forget: wait only long enough for the URL to settle.
+            if not wait_for_response:
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    page.wait_for_timeout(200)
+                    if "/c/" in page.url or "?chat=" in page.url:
+                        break
+                result_url = page.url
+                return {
+                    "response": "",
+                    "url": result_url,
+                    "conversation_id": _conv_id_from_url(result_url),
+                }
 
             # Poll for a new assistant block to appear and its text to settle.
             deadline = time.monotonic() + timeout_s
@@ -281,10 +343,7 @@ class GrokClient:
                 "conversation_id": _conv_id_from_url(result_url),
             }
         finally:
-            try:
-                page.close()
-            except Exception:
-                pass
+            pass  # page is persistent; close happens in GrokClient.close()
 
     def read(self, conversation_url: str) -> dict:
         """Return the full transcript: ``{url, conversation_id, messages}``.
@@ -328,10 +387,7 @@ class GrokClient:
                 "messages": cleaned,
             }
         finally:
-            try:
-                page.close()
-            except Exception:
-                pass
+            pass  # page is persistent; close happens in GrokClient.close()
 
     def list_conversations(self) -> list[dict]:
         """Scrape the sidebar for ``[{id, title, url}, ...]``."""
@@ -367,10 +423,7 @@ class GrokClient:
             )
             return items or []
         finally:
-            try:
-                page.close()
-            except Exception:
-                pass
+            pass  # page is persistent; close happens in GrokClient.close()
 
     def _open_row_menu(self, page, conv_id: str) -> bool:
         """Hover the sidebar row for ``conv_id`` and open its Options menu.
@@ -466,10 +519,7 @@ class GrokClient:
             )
             return bool(gone)
         finally:
-            try:
-                page.close()
-            except Exception:
-                pass
+            pass  # page is persistent; close happens in GrokClient.close()
 
     # ── Lifecycle helpers ────────────────────────────────────────────
 
@@ -516,10 +566,7 @@ class GrokClient:
             page.wait_for_timeout(800)
             return True
         finally:
-            try:
-                page.close()
-            except Exception:
-                pass
+            pass  # page is persistent; close happens in GrokClient.close()
 
     def archive(self, conversation_url: str) -> bool:
         """Archive a conversation via its sidebar row's menu (best-effort).
@@ -537,10 +584,7 @@ class GrokClient:
             page.wait_for_timeout(800)
             return clicked
         finally:
-            try:
-                page.close()
-            except Exception:
-                pass
+            pass  # page is persistent; close happens in GrokClient.close()
 
     def regenerate(self, conversation_url: str, *, timeout_s: int = 60) -> dict:
         """Click "Regenerate" on the last assistant message and capture the new response."""
@@ -597,10 +641,7 @@ class GrokClient:
                         last = cur
             return {"ok": bool(last), "response": last, "reason": "timeout"}
         finally:
-            try:
-                page.close()
-            except Exception:
-                pass
+            pass  # page is persistent; close happens in GrokClient.close()
 
     def stop(self, conversation_url: str) -> bool:
         """Click the stop button if the assistant is currently generating."""
@@ -618,10 +659,7 @@ class GrokClient:
             )
             return bool(clicked)
         finally:
-            try:
-                page.close()
-            except Exception:
-                pass
+            pass  # page is persistent; close happens in GrokClient.close()
 
     # ── Models ───────────────────────────────────────────────────────
 
@@ -654,10 +692,7 @@ class GrokClient:
             )
             return list(dict.fromkeys(names or []))  # de-dupe preserving order
         finally:
-            try:
-                page.close()
-            except Exception:
-                pass
+            pass  # page is persistent; close happens in GrokClient.close()
 
     def switch_model(self, model_name: str) -> bool:
         """Open the picker and click the option matching ``model_name``."""
@@ -691,10 +726,7 @@ class GrokClient:
             )
             return bool(chose)
         finally:
-            try:
-                page.close()
-            except Exception:
-                pass
+            pass  # page is persistent; close happens in GrokClient.close()
 
 
 # ── Process-level singleton ──────────────────────────────────────────

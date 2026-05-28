@@ -13,6 +13,15 @@ Session key resolution priority (first hit wins):
 
 If none of those are passed, every call creates a new conversation.
 
+Blind / fire-and-forget mode:
+
+Pass ``extra_body={"wait_for_response": False}`` to submit the message
+without waiting for Grok to generate a reply. The completion returns as
+soon as the URL settles to ``/c/<uuid>``. ``message.content`` will be
+empty; the conversation_url is still surfaced on ``_hidden_params`` so
+callers can read it later with a separate call. Useful for batching
+many prompts when the caller doesn't need to parse each one.
+
 Limitations:
 
 * No streaming — ``stream=True`` raises ``BadRequestError``.
@@ -62,26 +71,44 @@ def _last_user_message(messages: list[dict]) -> str:
     return ""
 
 
-def _extra_body(optional_params: dict) -> dict:
-    eb = (optional_params or {}).get("extra_body") or {}
-    return eb if isinstance(eb, dict) else {}
+def _from_extras(optional_params: dict, key: str):
+    """Pull ``key`` from ``optional_params`` regardless of nesting.
+
+    Direct ``litellm.completion(extra_body={...})`` preserves the dict
+    nested under ``optional_params["extra_body"]``. The litellm proxy
+    flattens ``extra_body`` entries into top-level ``optional_params``
+    keys. Check both shapes so the same handler covers both callers.
+    """
+    op = optional_params or {}
+    eb = op.get("extra_body") or {}
+    if isinstance(eb, dict) and key in eb:
+        return eb[key]
+    if key in op:
+        return op[key]
+    return None
 
 
 def _resolve_session_key(
     litellm_params: dict | None,
     optional_params: dict,
 ) -> Optional[str]:
-    eb = _extra_body(optional_params)
-    if eb.get("session_id"):
-        return str(eb["session_id"])
+    sid = _from_extras(optional_params, "session_id")
+    if sid:
+        return str(sid)
     sid = (litellm_params or {}).get("litellm_session_id")
     return str(sid) if sid else None
 
 
 def _resolve_conversation_url(optional_params: dict) -> Optional[str]:
-    eb = _extra_body(optional_params)
-    url = eb.get("conversation_url")
+    url = _from_extras(optional_params, "conversation_url")
     return str(url) if url else None
+
+
+def _resolve_wait_for_response(optional_params: dict) -> bool:
+    v = _from_extras(optional_params, "wait_for_response")
+    if v is None:
+        return True
+    return bool(v)
 
 
 def _populate_response(
@@ -188,6 +215,7 @@ class UCBrowserCustomLLM(CustomLLM):
         timeout_s = int(timeout) if isinstance(timeout, (int, float)) else 60
         session_key = _resolve_session_key(litellm_params, optional_params)
         explicit_url = _resolve_conversation_url(optional_params)
+        wait_for_response = _resolve_wait_for_response(optional_params)
 
         conversation_url = explicit_url
         if conversation_url is None and session_key is not None:
@@ -198,6 +226,7 @@ class UCBrowserCustomLLM(CustomLLM):
                 prompt_text,
                 conversation_url=conversation_url,
                 timeout_s=timeout_s,
+                wait_for_response=wait_for_response,
             )
         except GrokAuthRequired as exc:
             raise litellm.exceptions.AuthenticationError(
@@ -244,30 +273,37 @@ class UCBrowserCustomLLM(CustomLLM):
 # ── Registration ─────────────────────────────────────────────────────
 
 
+# Module-level singleton — eagerly instantiated so the litellm proxy can
+# import it by dotted path (``event_harvester.llm_providers.uc.uc_handler``)
+# in its ``custom_provider_map`` config. Construction has no side effects;
+# the underlying browser doesn't open until the first completion call.
+uc_handler: "UCBrowserCustomLLM" = UCBrowserCustomLLM()
+
 _registered_handler: UCBrowserCustomLLM | None = None
 _register_lock = threading.Lock()
 
 
 def register_uc_provider() -> UCBrowserCustomLLM:
-    """Attach :class:`UCBrowserCustomLLM` to ``litellm.custom_provider_map``.
+    """Attach :data:`uc_handler` to ``litellm.custom_provider_map``.
 
-    Idempotent — re-calling returns the already-registered handler so
-    its session store is preserved across module imports.
+    Idempotent — re-calling is a no-op. Direct-Python callers use this
+    to enable ``litellm.completion(model="uc/grok", ...)``. The litellm
+    proxy wires the same handler via its config file's
+    ``custom_provider_map`` and doesn't need this call.
     """
     global _registered_handler
     with _register_lock:
         if _registered_handler is not None:
             return _registered_handler
-        handler = UCBrowserCustomLLM()
         existing = list(litellm.custom_provider_map or [])
         # Drop any prior entry for the same provider key — keeps the
         # map well-formed if some other code wired its own handler.
         existing = [e for e in existing if e.get("provider") != PROVIDER]
-        existing.append({"provider": PROVIDER, "custom_handler": handler})
+        existing.append({"provider": PROVIDER, "custom_handler": uc_handler})
         litellm.custom_provider_map = existing
-        _registered_handler = handler
+        _registered_handler = uc_handler
         logger.info("Registered UCBrowserCustomLLM under provider %r.", PROVIDER)
-        return handler
+        return uc_handler
 
 
 def get_uc_handler() -> UCBrowserCustomLLM | None:
@@ -276,8 +312,9 @@ def get_uc_handler() -> UCBrowserCustomLLM | None:
 
 
 def _reset_for_tests() -> None:
-    """Drop the registered handler so the next ``register_uc_provider``
-    call constructs a fresh one. Test-only."""
+    """Clear the registration + drop cached sessions on the shared
+    ``uc_handler``. Test-only — needed because the handler is a
+    module-level singleton."""
     global _registered_handler
     with _register_lock:
         _registered_handler = None
@@ -285,3 +322,4 @@ def _reset_for_tests() -> None:
             e for e in (litellm.custom_provider_map or [])
             if e.get("provider") != PROVIDER
         ]
+    uc_handler.clear_sessions()
