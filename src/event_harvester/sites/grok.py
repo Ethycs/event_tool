@@ -294,13 +294,19 @@ class GrokClient:
             page.focus(input_sel)
             page.keyboard.press("Enter")
 
-            # Fire-and-forget: wait only long enough for the URL to settle.
+            # Fire-and-forget: only wait long enough to capture the URL.
             if not wait_for_response:
-                deadline = time.monotonic() + 5.0
-                while time.monotonic() < deadline:
-                    page.wait_for_timeout(200)
-                    if "/c/" in page.url or "?chat=" in page.url:
-                        break
+                # Optimisation (#2): if we were already on a /c/<uuid> page,
+                # Enter doesn't change the URL — return immediately and skip
+                # the up-to-5s settle loop entirely. Drops blind same-chat
+                # sends from ~1.6s to <0.4s.
+                already_on_chat = "/c/" in page.url or "?chat=" in page.url
+                if not (conversation_url and already_on_chat):
+                    deadline = time.monotonic() + 5.0
+                    while time.monotonic() < deadline:
+                        page.wait_for_timeout(200)
+                        if "/c/" in page.url or "?chat=" in page.url:
+                            break
                 result_url = page.url
                 return {
                     "response": "",
@@ -308,29 +314,55 @@ class GrokClient:
                     "conversation_id": _conv_id_from_url(result_url),
                 }
 
-            # Poll for a new assistant block to appear and its text to settle.
+            # Optimisation (#1): instead of waiting for text to "stabilise"
+            # (which paid a 2.1s tax per send) we watch Grok's own
+            # generating signal: ``button[aria-label*="stop"]`` is present
+            # while streaming and disappears when the response is complete.
+            # Fall back to text-stability detection if the stop button never
+            # appears at all (e.g. cached responses that complete instantly).
+            stop_sel = _SELECTORS["stop_button"]
             deadline = time.monotonic() + timeout_s
             last_text = ""
             stable = 0
+            seen_generating = False
             while time.monotonic() < deadline:
-                page.wait_for_timeout(700)
+                page.wait_for_timeout(250)
                 state = page.evaluate(
                     """(args) => {
-                        const sel = args[0];
-                        const prev = args[1];
-                        const els = document.querySelectorAll(sel);
-                        if (els.length <= prev) return {ready: false, text: ''};
-                        const el = els[els.length - 1];
-                        return {ready: true, text: (el.innerText || '').trim()};
+                        const asstSel = args[0];
+                        const stopSel = args[1];
+                        const prev = args[2];
+                        const els = document.querySelectorAll(asstSel);
+                        const stopBtn = document.querySelector(stopSel);
+                        const text = els.length > prev
+                            ? (els[els.length - 1].innerText || '').trim()
+                            : '';
+                        return {
+                            ready: els.length > prev,
+                            text: text,
+                            generating: !!stopBtn,
+                        };
                     }""",
-                    [assistant_sel, prev_count],
+                    [assistant_sel, stop_sel, prev_count],
                 ) or {}
                 if not state.get("ready"):
                     continue
                 cur = state.get("text") or ""
+                if state.get("generating"):
+                    # Streaming in progress — capture text, keep waiting.
+                    seen_generating = True
+                    last_text = cur
+                    stable = 0
+                    continue
+                if seen_generating:
+                    # Stop button vanished after we saw it — done.
+                    last_text = cur
+                    break
+                # Stop button never appeared (instant/cached response).
+                # Fall back to short stability check: 2 polls × 250ms = 500ms.
                 if cur and cur == last_text:
                     stable += 1
-                    if stable >= 3:  # ~2.1s of unchanged text → settled
+                    if stable >= 2:
                         break
                 else:
                     stable = 0
