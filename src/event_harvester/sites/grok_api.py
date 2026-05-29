@@ -107,29 +107,36 @@ def _iter_json_lines(text: str):
 def _extract_assistant_text(body: str) -> str:
     """Pull the final assistant text out of Grok's streaming JSON-lines body.
 
-    Each line is shaped like ``{"result": {...}}``. Different lines carry
-    different facets of the response (conversation metadata, the user
-    echo, model deltas, the final assembled message). We accumulate any
-    ``response.modelResponse.message`` we see; the last non-empty one is
-    the final reply.
+    Two response shapes seen in the wild:
+        * NEW chat (``POST /conversations/new``)::
+              {"result": {"response": {"modelResponse": {"message": "..."}}}}
+        * CONTINUE (``POST /conversations/<uuid>/responses``)::
+              {"result": {"token": "..."}}          ← per-token deltas
+              {"result": {"modelResponse": {"message": "..."}}}  ← final
+
+    We walk every line, accumulate any token deltas, and replace ``final``
+    with any ``modelResponse.message`` we see. The last non-empty
+    ``message`` wins.
     """
     final = ""
+    delta_buf = ""
     for obj in _iter_json_lines(body):
         result = obj.get("result") or {}
+        # NEW-chat shape: result.response.{modelResponse|token}
         resp = result.get("response") or {}
-        # Final shape: response.modelResponse.message
-        model_resp = resp.get("modelResponse") or {}
-        msg = model_resp.get("message")
-        if msg:
-            final = msg
-            continue
-        # Streaming-delta shape (if present): response.token
-        # (We don't know Grok's exact streaming-delta key until we see one
-        # — _iter_json_lines is forgiving, so this is a safe noop today.)
-        token = resp.get("token")
+        # Final assembled message — try both shapes.
+        for container in (resp, result):
+            mr = container.get("modelResponse") or {}
+            msg = mr.get("message")
+            if msg:
+                final = msg
+                break
+        # Per-token delta — also try both shapes.
+        token = resp.get("token") or result.get("token")
         if token:
-            final += token
-    return _strip_thought_prefix(final)
+            delta_buf += token
+    out = final or delta_buf
+    return _strip_thought_prefix(out)
 
 
 def _extract_conversation_id(body: str) -> Optional[str]:

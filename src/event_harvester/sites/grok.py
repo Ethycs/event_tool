@@ -232,7 +232,11 @@ class GrokClient:
             return page
         uc = self._ensure_uc()
         logger.info("Opening Grok page for session %r (cold start).", session_key)
-        page = uc.open(self.GROK_HOME, wait_ms=2000)
+        # No fixed sleep: open the page and immediately wait on the
+        # ProseMirror chat input. As soon as the input is attached we
+        # know the bundle has booted enough to interact. Warm callers
+        # return effectively instantly.
+        page = uc.open(self.GROK_HOME, wait_ms=0)
         uc.dismiss_cookies(page)
         uc.close_modal(page)
         if uc.has_login_wall(page):
@@ -246,6 +250,15 @@ class GrokClient:
                 "Run `pixi run event-harvester web-login --urls https://grok.com` "
                 "to log in, then retry."
             )
+        try:
+            page.wait_for_selector(
+                _SELECTORS["chat_input"], state="attached", timeout=15000,
+            )
+        except Exception:
+            # Some entry pages (e.g. the project workspace landing) may
+            # not have the standard input. Fall through; downstream
+            # recipes will surface a clearer error if interaction fails.
+            pass
         self._pages[session_key] = page
         # Track the key even though all keys share the same underlying
         # RLock — useful for introspection.
