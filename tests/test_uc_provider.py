@@ -305,6 +305,35 @@ def test_no_session_no_store(handler, fake_grok):
     assert handler._sessions == {}
 
 
+def test_session_id_is_forwarded_as_session_key_to_grok_client(handler, fake_grok):
+    """Distinct session_ids must reach GrokClient.send() as distinct session_keys
+    so each gets its own browser tab (enabling parallel sends)."""
+    handler.completion(
+        model="grok",
+        messages=[{"role": "user", "content": "hi"}],
+        model_response=_fresh_model_response(),
+        optional_params={"extra_body": {"session_id": "user-A"}},
+    )
+    assert fake_grok.send.call_args.kwargs["session_key"] == "user-A"
+
+    handler.completion(
+        model="grok",
+        messages=[{"role": "user", "content": "hi"}],
+        model_response=_fresh_model_response(),
+        optional_params={"extra_body": {"session_id": "user-B"}},
+    )
+    assert fake_grok.send.call_args.kwargs["session_key"] == "user-B"
+
+    # No session_id → None reaches send(), which means the default shared tab.
+    handler.completion(
+        model="grok",
+        messages=[{"role": "user", "content": "hi"}],
+        model_response=_fresh_model_response(),
+        optional_params={},
+    )
+    assert fake_grok.send.call_args.kwargs["session_key"] is None
+
+
 def test_flattened_extras_from_proxy_are_honored(handler, fake_grok):
     """The litellm proxy flattens extra_body into optional_params top-level.
 

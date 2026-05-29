@@ -25,7 +25,8 @@ import logging
 import re
 import threading
 import time
-from typing import Optional
+from contextlib import contextmanager
+from typing import Iterator, Optional
 from urllib.parse import urlparse
 
 from uc_browser import BrowserMode, UCBrowser
@@ -138,11 +139,28 @@ def _normalize_url(url_or_id: str) -> str:
 class GrokClient:
     """Stateful Grok automation client.
 
-    Holds a single UCBrowser instance for the lifetime of the client.
+    Holds a single UCBrowser instance plus a per-session map of long-lived
+    Pages. Each ``session_key`` owns its own tab, so *switching* between
+    conversations is free — no navigation cost when jumping between
+    session A's chat and session B's chat. Callers that don't care about
+    session boundaries transparently share the ``_default`` page;
+    sidebar-level operations (read / list / delete) always use ``_default``.
+
     Construct once (e.g. lazily inside the MCP server), reuse across calls.
+
+    Threadsafety
+    ------------
+    All Playwright access serialises through a single client-wide lock.
+    Playwright's *sync* API binds its greenlet to one thread and crashes
+    if a different thread re-enters; the single lock prevents that. As
+    a consequence, multi-threaded callers do *not* get true parallelism
+    here — only the no-navigation tab-switch win. True parallel session
+    sends require migrating UCBrowser + GrokClient to Playwright's async
+    API.
     """
 
     GROK_HOME = "https://grok.com/"
+    DEFAULT_SESSION = "_default"
 
     def __init__(
         self,
@@ -153,10 +171,18 @@ class GrokClient:
         self.mode = mode
         self.timeout_ms = timeout_ms
         self._uc: UCBrowser | None = None
-        # Single long-lived page shared across send/read/delete/...
-        # The first call pays the page-open cost (~30s incl. extension boot
-        # + sidebar hydration). Every subsequent call just navigates.
-        self._page = None
+        # session_key -> Page. Each session owns its own tab so switching
+        # between conversations costs no navigation.
+        self._pages: dict[str, object] = {}
+        # Single client-wide lock. Serialises ALL Playwright access
+        # (open / navigate / evaluate / etc.) because sync Playwright's
+        # greenlet is thread-bound.
+        self._lock = threading.RLock()
+        # Kept as an attribute solely so existing tests can introspect
+        # which session_keys have ever been touched. Mapped to the same
+        # RLock instance; no per-session granularity is possible without
+        # async Playwright.
+        self._page_locks: dict[str, threading.RLock] = {}
 
     # ── Lifecycle ────────────────────────────────────────────────────
 
@@ -175,62 +201,110 @@ class GrokClient:
         return self._uc
 
     def close(self) -> None:
-        if self._page is not None:
-            try:
-                self._page.close()
-            except Exception:
-                pass
-            self._page = None
-        if self._uc is not None:
-            try:
-                self._uc.close()
-            except Exception as e:  # pragma: no cover
-                logger.debug("UCBrowser close failed: %s", e)
-            self._uc = None
-
-    # ── Internal: prepare a page ─────────────────────────────────────
-
-    def _ensure_page(self):
-        """Return the long-lived Grok page, opening it on first use."""
-        uc = self._ensure_uc()
-        if self._page is None or self._page.is_closed():
-            logger.info("Opening Grok page (cold start).")
-            page = uc.open(self.GROK_HOME, wait_ms=2000)
-            uc.dismiss_cookies(page)
-            uc.close_modal(page)
-            if uc.has_login_wall(page):
-                current = page.url
+        with self._lock:
+            pages = list(self._pages.values())
+            self._pages.clear()
+            self._page_locks.clear()
+            for p in pages:
                 try:
-                    page.close()
+                    p.close()
                 except Exception:
                     pass
-                raise GrokAuthRequired(
-                    f"Grok shows a login wall at {current}. "
-                    "Run `pixi run event-harvester web-login --urls https://grok.com` "
-                    "to log in, then retry."
-                )
-            self._page = page
-        return self._page
+            if self._uc is not None:
+                try:
+                    self._uc.close()
+                except Exception as e:  # pragma: no cover
+                    logger.debug("UCBrowser close failed: %s", e)
+                self._uc = None
+
+    # ── Internal: per-session pages ──────────────────────────────────
+
+    def _get_session_page(self, session_key: str):
+        """Return the long-lived Page for ``session_key``, opening on first use.
+
+        Cold start (open + extension boot + sidebar hydrate) happens once
+        per session_key. Subsequent calls reuse the tab.
+
+        Caller MUST hold ``self._lock`` (Playwright sync is thread-bound).
+        """
+        page = self._pages.get(session_key)
+        if page is not None and not page.is_closed():
+            return page
+        uc = self._ensure_uc()
+        logger.info("Opening Grok page for session %r (cold start).", session_key)
+        page = uc.open(self.GROK_HOME, wait_ms=2000)
+        uc.dismiss_cookies(page)
+        uc.close_modal(page)
+        if uc.has_login_wall(page):
+            current = page.url
+            try:
+                page.close()
+            except Exception:
+                pass
+            raise GrokAuthRequired(
+                f"Grok shows a login wall at {current}. "
+                "Run `pixi run event-harvester web-login --urls https://grok.com` "
+                "to log in, then retry."
+            )
+        self._pages[session_key] = page
+        # Track the key even though all keys share the same underlying
+        # RLock — useful for introspection.
+        self._page_locks.setdefault(session_key, self._lock)
+        return page
+
+    @contextmanager
+    def _session(self, session_key: str) -> Iterator[object]:
+        """Yield this session's Page with exclusive Playwright access.
+
+        All sessions share one client-wide lock — sync Playwright can't be
+        re-entered from a different thread. Distinct sessions still win
+        because their tabs persist, so we never pay navigation cost when
+        we switch between them.
+        """
+        with self._lock:
+            page = self._get_session_page(session_key)
+            yield page
 
     @staticmethod
     def _same_path(a: str, b: str) -> bool:
         """True when two grok URLs point at the same place (ignoring ?rid=)."""
         return a.split("?", 1)[0].rstrip("/") == b.split("?", 1)[0].rstrip("/")
 
-    def _navigate(self, url: str, *, wait_ms: int = 1200):
-        """Navigate the persistent page to ``url`` if we aren't already there."""
-        page = self._ensure_page()
+    def _navigate_in(self, page, url: str, *, wait_ms: int = 1200):
+        """Navigate the given (already-locked) page if it isn't there yet."""
         if not self._same_path(page.url, url):
             page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
         if wait_ms:
             page.wait_for_timeout(wait_ms)
         return page
 
-    # Backwards compat: existing recipes that called self._open used to receive
-    # a fresh page. _open now returns the long-lived page after navigating.
-    # Kept private so external callers shouldn't depend on it.
-    def _open(self, url: str, *, wait_ms: int = 1200):
-        return self._navigate(url, wait_ms=wait_ms)
+    @contextmanager
+    def _open(
+        self,
+        url: str,
+        *,
+        wait_ms: int = 1200,
+        session_key: Optional[str] = None,
+    ) -> Iterator[object]:
+        """Acquire the client lock, navigate the session's page, yield it.
+
+        Replaces the older "return a page; caller does try/finally" pattern.
+        Holding the lock for the recipe's whole duration is required —
+        Playwright sync is thread-bound and re-entry from elsewhere crashes
+        the greenlet. Sidebar recipes default to ``DEFAULT_SESSION``;
+        ``send()`` may pass through any session_key.
+        """
+        sk = session_key or self.DEFAULT_SESSION
+        with self._session(sk) as page:
+            self._navigate_in(page, url, wait_ms=wait_ms)
+            yield page
+
+    # Backwards-compat for any caller still doing ``self._ensure_page()``
+    # without a session_key. Returns the default-session page; you still
+    # need to hold the lock yourself to do any Playwright work on it.
+    def _ensure_page(self):
+        with self._lock:
+            return self._get_session_page(self.DEFAULT_SESSION)
 
     # ── Core ─────────────────────────────────────────────────────────
 
@@ -241,6 +315,7 @@ class GrokClient:
         conversation_url: Optional[str] = None,
         timeout_s: int = 60,
         wait_for_response: bool = True,
+        session_key: Optional[str] = None,
     ) -> dict:
         """Send a message; return ``{response, url, conversation_id}``.
 
@@ -248,22 +323,28 @@ class GrokClient:
         which mis-scores grok's input wrapper). Types into the ProseMirror
         editor and submits via Enter.
 
+        ``session_key`` selects which Page (browser tab) drives this call.
+        Distinct ``session_key`` values get their own tabs and can run in
+        parallel; the same ``session_key`` serialises (one chat at a time).
+        Defaults to ``GrokClient.DEFAULT_SESSION``.
+
         With ``wait_for_response=True`` (default) we wait for a new
-        ``div[data-testid="assistant-message"]`` to appear and its text to
-        stabilise, then return the response.
+        ``div[data-testid="assistant-message"]`` to appear and the
+        ``button[aria-label="Stop ..."]`` to disappear, then return the
+        response.
 
         With ``wait_for_response=False`` (blind / fire-and-forget) we
-        return as soon as the URL settles to ``/c/<uuid>``. ``response``
-        is an empty string in that case. Saves the ~5-30 s Grok takes to
-        actually generate a reply — useful for batching many prompts when
-        the caller doesn't need to parse each one.
+        return as soon as the URL settles to ``/c/<uuid>`` (or immediately
+        if we're already on a chat URL and ``conversation_url`` was given).
+        ``response`` is an empty string in that case.
 
         If ``conversation_url`` is None, posts to the Grok root (which
         creates a new conversation and redirects to ``/c/<uuid>``).
         """
         url = _normalize_url(conversation_url) if conversation_url else self.GROK_HOME
-        page = self._open(url, wait_ms=1200)
-        try:
+        sk = session_key or self.DEFAULT_SESSION
+        with self._session(sk) as page:
+            self._navigate_in(page, url, wait_ms=1200)
             input_sel = _SELECTORS["chat_input"]
             assistant_sel = _SELECTORS["assistant_message"]
             page.wait_for_selector(input_sel, timeout=15000)
@@ -374,8 +455,6 @@ class GrokClient:
                 "url": result_url,
                 "conversation_id": _conv_id_from_url(result_url),
             }
-        finally:
-            pass  # page is persistent; close happens in GrokClient.close()
 
     def read(self, conversation_url: str) -> dict:
         """Return the full transcript: ``{url, conversation_id, messages}``.
@@ -386,8 +465,7 @@ class GrokClient:
         stripped.
         """
         url = _normalize_url(conversation_url)
-        page = self._open(url, wait_ms=3500)
-        try:
+        with self._open(url, wait_ms=3500) as page:
             messages = page.evaluate(
                 """(args) => {
                     const userSel = args[0];
@@ -418,13 +496,10 @@ class GrokClient:
                 "conversation_id": _conv_id_from_url(page.url),
                 "messages": cleaned,
             }
-        finally:
-            pass  # page is persistent; close happens in GrokClient.close()
 
     def list_conversations(self) -> list[dict]:
         """Scrape the sidebar for ``[{id, title, url}, ...]``."""
-        page = self._open(self.GROK_HOME, wait_ms=4500)
-        try:
+        with self._open(self.GROK_HOME, wait_ms=4500) as page:
             items = page.evaluate(
                 """(sel) => {
                     const links = document.querySelectorAll(sel);
@@ -454,8 +529,6 @@ class GrokClient:
                 _SELECTORS["conversation_link"],
             )
             return items or []
-        finally:
-            pass  # page is persistent; close happens in GrokClient.close()
 
     def _open_row_menu(self, page, conv_id: str) -> bool:
         """Hover the sidebar row for ``conv_id`` and open its Options menu.
@@ -513,8 +586,7 @@ class GrokClient:
         still best-effort click any destructive button if one shows up.
         """
         conv_id = _conv_id_from_url(conversation_url) or conversation_url
-        page = self._open(self.GROK_HOME, wait_ms=4000)
-        try:
+        with self._open(self.GROK_HOME, wait_ms=4000) as page:
             if not self._open_row_menu(page, conv_id):
                 return False
             if not self._click_menu_item(page, "delete"):
@@ -550,8 +622,6 @@ class GrokClient:
                 conv_id,
             )
             return bool(gone)
-        finally:
-            pass  # page is persistent; close happens in GrokClient.close()
 
     # ── Lifecycle helpers ────────────────────────────────────────────
 
@@ -568,8 +638,7 @@ class GrokClient:
     def rename(self, conversation_url: str, new_title: str) -> bool:
         """Rename a conversation via its sidebar row's menu."""
         conv_id = _conv_id_from_url(conversation_url) or conversation_url
-        page = self._open(self.GROK_HOME, wait_ms=4000)
-        try:
+        with self._open(self.GROK_HOME, wait_ms=4000) as page:
             if not self._open_row_menu(page, conv_id):
                 return False
             if not self._click_menu_item(page, "rename"):
@@ -597,8 +666,6 @@ class GrokClient:
             page.keyboard.press("Enter")
             page.wait_for_timeout(800)
             return True
-        finally:
-            pass  # page is persistent; close happens in GrokClient.close()
 
     def archive(self, conversation_url: str) -> bool:
         """Archive a conversation via its sidebar row's menu (best-effort).
@@ -608,22 +675,18 @@ class GrokClient:
         which point the same hover+menu-item flow will pick it up.
         """
         conv_id = _conv_id_from_url(conversation_url) or conversation_url
-        page = self._open(self.GROK_HOME, wait_ms=4000)
-        try:
+        with self._open(self.GROK_HOME, wait_ms=4000) as page:
             if not self._open_row_menu(page, conv_id):
                 return False
             clicked = self._click_menu_item(page, "archive")
             page.wait_for_timeout(800)
             return clicked
-        finally:
-            pass  # page is persistent; close happens in GrokClient.close()
 
     def regenerate(self, conversation_url: str, *, timeout_s: int = 60) -> dict:
         """Click "Regenerate" on the last assistant message and capture the new response."""
         url = _normalize_url(conversation_url)
-        page = self._open(url, wait_ms=3500)
         uc = self._ensure_uc()
-        try:
+        with self._open(url, wait_ms=3500) as page:
             # Snapshot the last assistant block's text as the "old"
             old = page.evaluate(
                 """() => {
@@ -672,14 +735,11 @@ class GrokClient:
                         stable = 0
                         last = cur
             return {"ok": bool(last), "response": last, "reason": "timeout"}
-        finally:
-            pass  # page is persistent; close happens in GrokClient.close()
 
     def stop(self, conversation_url: str) -> bool:
         """Click the stop button if the assistant is currently generating."""
         url = _normalize_url(conversation_url)
-        page = self._open(url, wait_ms=2000)
-        try:
+        with self._open(url, wait_ms=2000) as page:
             clicked = page.evaluate(
                 """(sel) => {
                     const btn = document.querySelector(sel);
@@ -690,15 +750,12 @@ class GrokClient:
                 _SELECTORS["stop_button"],
             )
             return bool(clicked)
-        finally:
-            pass  # page is persistent; close happens in GrokClient.close()
 
     # ── Models ───────────────────────────────────────────────────────
 
     def get_models(self) -> list[str]:
         """Open the model picker and return the menu options as labels."""
-        page = self._open(self.GROK_HOME, wait_ms=3500)
-        try:
+        with self._open(self.GROK_HOME, wait_ms=3500) as page:
             names = page.evaluate(
                 """(sel) => {
                     const trigger = document.querySelector(sel);
@@ -723,13 +780,10 @@ class GrokClient:
                 _SELECTORS["model_picker"],
             )
             return list(dict.fromkeys(names or []))  # de-dupe preserving order
-        finally:
-            pass  # page is persistent; close happens in GrokClient.close()
 
     def switch_model(self, model_name: str) -> bool:
         """Open the picker and click the option matching ``model_name``."""
-        page = self._open(self.GROK_HOME, wait_ms=3500)
-        try:
+        with self._open(self.GROK_HOME, wait_ms=3500) as page:
             chose = page.evaluate(
                 """(args) => {
                     const trigger = document.querySelector(args[0]);
@@ -757,8 +811,6 @@ class GrokClient:
                 [_SELECTORS["model_picker"], model_name],
             )
             return bool(chose)
-        finally:
-            pass  # page is persistent; close happens in GrokClient.close()
 
 
 # ── Process-level singleton ──────────────────────────────────────────

@@ -259,6 +259,39 @@ def test_close_is_idempotent(grok_client):
     grok_client.close()  # no error
 
 
+def test_distinct_session_keys_get_distinct_pages(grok_client, mock_uc):
+    """Two different session_keys should each open their own tab.
+
+    The UCBrowser mock's ``open`` is called once per session_key,
+    proving each session has its own Page in the dict.
+    """
+    uc, _page = mock_uc
+    uc.open.reset_mock()
+
+    # Each open() call returns a fresh MagicMock so the test can tell
+    # "alpha's page" and "beta's page" apart by identity.
+    def _new_page(*_a, **_kw):
+        p = MagicMock()
+        p.url = "https://grok.com/"
+        p.is_closed = MagicMock(return_value=False)
+        return p
+    uc.open.side_effect = _new_page
+
+    p1 = grok_client._get_session_page("alpha")
+    p2 = grok_client._get_session_page("beta")
+    p3 = grok_client._get_session_page("alpha")  # same key → cached
+
+    # Two distinct open calls (one per new session_key).
+    assert uc.open.call_count == 2
+    # The cached lookup returns the same Page object as the first alpha open.
+    assert p1 is p3
+    # alpha and beta got separate Pages.
+    assert p1 is not p2
+    # Per-session locks were created for each.
+    assert "alpha" in grok_client._page_locks
+    assert "beta" in grok_client._page_locks
+
+
 # ── Live integration smoke (opt-in via UC_GROK_LIVE=1) ───────────────
 
 

@@ -215,11 +215,15 @@ class UCBrowserCustomLLM(CustomLLM):
             conversation_url = self.get_session_url(session_key)
 
         try:
+            # Reuse session_id as the GrokClient page bucket so distinct
+            # sessions get their own tabs and can run concurrently. Falls
+            # back to the default shared tab when no session_id was given.
             result = get_grok_client().send(
                 prompt_text,
                 conversation_url=conversation_url,
                 timeout_s=timeout_s,
                 wait_for_response=wait_for_response,
+                session_key=session_key,
             )
         except GrokAuthRequired as exc:
             raise litellm.exceptions.AuthenticationError(

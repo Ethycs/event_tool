@@ -111,6 +111,9 @@ def register_grok_tools(server) -> None:
             conversation_url=existing_url,
             timeout_s=timeout_s,
             wait_for_response=wait_for_response,
+            # session_id is also the page bucket: distinct ids get
+            # distinct tabs and can run concurrently.
+            session_key=session_id,
         )
         if result.get("url"):
             uc_handler.set_session_url(session_id, result["url"])
