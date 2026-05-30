@@ -26,6 +26,7 @@ from typing import Any, Optional
 
 from event_harvester.llm_providers.uc import uc_handler
 from event_harvester.sites.grok import GrokAuthRequired, get_grok_client
+from event_harvester.sites.grok_fast import send_with_fallback as _grok_send
 
 logger = logging.getLogger("event_harvester.servers.mcp_grok_tools")
 
@@ -106,7 +107,10 @@ def register_grok_tools(server) -> None:
             grok.com/c/<uuid> URL; ``conversation_id`` is the bare uuid.
         """
         existing_url = uc_handler.get_session_url(session_id)
-        result = get_grok_client().send(
+        # send_with_fallback prefers the React-onSubmit + expect_response
+        # fast path and only drops to DOM if the fast path fails. Blind
+        # mode bypasses fast and goes straight to DOM.
+        result = _grok_send(
             message,
             conversation_url=existing_url,
             timeout_s=timeout_s,

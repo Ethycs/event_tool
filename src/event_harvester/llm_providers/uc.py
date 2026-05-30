@@ -41,7 +41,8 @@ import litellm
 from litellm import CustomLLM
 from litellm.types.utils import GenericStreamingChunk, ModelResponse, Usage
 
-from event_harvester.sites.grok import GrokAuthRequired, get_grok_client
+from event_harvester.sites.grok import GrokAuthRequired
+from event_harvester.sites.grok_fast import send_with_fallback as _grok_send
 
 logger = logging.getLogger("event_harvester.llm_providers.uc")
 
@@ -215,10 +216,14 @@ class UCBrowserCustomLLM(CustomLLM):
             conversation_url = self.get_session_url(session_key)
 
         try:
-            # Reuse session_id as the GrokClient page bucket so distinct
-            # sessions get their own tabs and can run concurrently. Falls
-            # back to the default shared tab when no session_id was given.
-            result = get_grok_client().send(
+            # Tries the React-onSubmit + expect_response fast path first
+            # (~1.8s warm continue, ~6.3s cold) and falls back to the
+            # DOM-driven GrokClient.send on any RuntimeError. Blind-mode
+            # callers (wait_for_response=False) skip the fast path
+            # entirely — the DOM path is already optimal there (~1.3s).
+            # Reuse session_id as the page bucket so distinct sessions
+            # get their own tabs.
+            result = _grok_send(
                 prompt_text,
                 conversation_url=conversation_url,
                 timeout_s=timeout_s,

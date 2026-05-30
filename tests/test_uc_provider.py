@@ -44,7 +44,15 @@ def _clean_registration():
 
 @pytest.fixture
 def fake_grok():
-    """Patch get_grok_client; yield the MagicMock so tests can drive it."""
+    """Patch the send orchestrator the provider imports as ``_grok_send``.
+
+    The handler used to call ``get_grok_client().send(...)`` directly;
+    it now goes through ``send_with_fallback`` (imported as ``_grok_send``)
+    so the fast path is tried first. Tests assert against a MagicMock
+    that stands in for that orchestrator — call args appear on
+    ``fake_grok.send.call_args`` just like before so existing tests
+    don't need to change.
+    """
     client = MagicMock()
     client.send = MagicMock(
         return_value={
@@ -53,7 +61,7 @@ def fake_grok():
             "conversation_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
         }
     )
-    with patch.object(uc_mod, "get_grok_client", return_value=client):
+    with patch.object(uc_mod, "_grok_send", side_effect=client.send):
         yield client
 
 

@@ -1,4 +1,4 @@
-"""Grok fast path: React-onSubmit trigger + fetch-hook response capture.
+"""Grok fast path: React-onSubmit trigger + network-level response capture.
 
 This combines the two halves of Option 3:
 
@@ -265,3 +265,78 @@ class GrokFastClient:
                 "url": final_url,
                 "conversation_id": conv_id,
             }
+
+
+# ── Top-level orchestrator: fast → DOM fallback ───────────────────
+
+
+_fast_client_singleton: Optional[GrokFastClient] = None
+_fast_client_lock = threading.Lock()
+
+
+def _get_fast_client() -> GrokFastClient:
+    """Return the process-wide GrokFastClient singleton (shares GrokClient)."""
+    global _fast_client_singleton
+    with _fast_client_lock:
+        if _fast_client_singleton is None:
+            _fast_client_singleton = GrokFastClient()
+        return _fast_client_singleton
+
+
+def reset_grok_fast_singleton() -> None:
+    """Drop the cached fast client. Tests only."""
+    global _fast_client_singleton
+    with _fast_client_lock:
+        _fast_client_singleton = None
+
+
+def send_with_fallback(
+    message: str,
+    *,
+    conversation_url: Optional[str] = None,
+    session_key: Optional[str] = None,
+    timeout_s: int = 60,
+    wait_for_response: bool = True,
+) -> dict:
+    """Send a message via the fast path, falling back to DOM on any error.
+
+    Production entry point used by the litellm provider and the MCP
+    ``chat`` tool. The fast path (``GrokFastClient``) is tried first for
+    full-wait sends; if it raises ``RuntimeError`` (e.g. corner-case
+    timeout, missing React onSubmit on a non-standard layout) we
+    transparently fall back to ``GrokClient.send`` (DOM-driven) so the
+    caller still gets a response.
+
+    Blind-mode (``wait_for_response=False``) bypasses the fast path
+    entirely — the DOM path already returns in ~1.3 s for that case,
+    and the fast path's ``expect_response`` wait isn't useful when we
+    don't care about the reply.
+    """
+    from event_harvester.sites.grok import get_grok_client
+    if not wait_for_response:
+        return get_grok_client().send(
+            message,
+            conversation_url=conversation_url,
+            timeout_s=timeout_s,
+            wait_for_response=False,
+            session_key=session_key,
+        )
+    try:
+        return _get_fast_client().send(
+            message,
+            conversation_url=conversation_url,
+            session_key=session_key,
+            timeout_s=timeout_s,
+        )
+    except RuntimeError as fast_err:
+        logger.warning(
+            "GrokFastClient.send failed (%s); falling back to GrokClient.send",
+            fast_err,
+        )
+        return get_grok_client().send(
+            message,
+            conversation_url=conversation_url,
+            timeout_s=timeout_s,
+            wait_for_response=True,
+            session_key=session_key,
+        )
