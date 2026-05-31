@@ -511,9 +511,11 @@ def build_server(
         )
 
     # Site-specific automation tools (Grok). Lazy: doesn't spin up a
-    # browser until the first grok_* tool is called.
+    # browser until the first grok_* tool is called. Implementation
+    # lives in the universal_controller submodule so other projects
+    # using uc_browser get the same MCP surface for free.
     try:
-        from event_harvester.servers.mcp_grok_tools import register_grok_tools
+        from uc_browser.mcp.grok_tools import register_grok_tools
 
         register_grok_tools(server)
     except Exception as e:  # pragma: no cover
