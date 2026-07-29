@@ -1,0 +1,213 @@
+[
+  {
+    "url": "https://lu.ma/discover",
+    "name": "luma",
+    "mode": "calendar",
+    "scroll_seconds": 5
+  },
+  {
+    "url": "https://business.sfchamber.com/events/calendar",
+    "name": "sfchamber",
+    "mode": "calendar",
+    "scroll_seconds": 5
+  },
+  {
+    "url": "https://erobay.com/calendar/Calcium40.pl?Op=ShowIt&CalendarName=Community",
+    "name": "erobay",
+    "mode": "calendar",
+    "native_chrome": true,
+    "cooldown_hours": 4,
+    "scroll_seconds": 5
+  },
+  {
+    "url": "https://www.instagram.com/",
+    "name": "instagram",
+    "mode": "feed",
+    "api_pattern": "graphql",
+    "scroll_seconds": 25,
+    "api_only": true
+  },
+  {
+    "url": "https://www.eventbrite.com/d/ca--san-francisco/events/",
+    "name": "eventbrite",
+    "mode": "feed",
+    "api_pattern": "api|search|events",
+    "scroll_seconds": 15
+  },
+  {
+    "url": "https://www.meetup.com/find/?source=EVENTS&eventType=inPerson&sortField=RELEVANCE",
+    "name": "meetup",
+    "mode": "search",
+    "query": "AI meetup",
+    "scroll_seconds": 10
+  },
+  {
+    "url": "https://tockify.com/mothership/agenda",
+    "name": "mothership",
+    "mode": "calendar",
+    "category": "venues",
+    "scroll_seconds": 8
+  },
+  {
+    "url": "webcal://cdn.dnalounge.com/calendar/dnalounge.ics",
+    "name": "dnalounge",
+    "mode": "ics",
+    "category": "venues"
+  },
+  {
+    "url": "https://powerhousebar.com/events/?ical=1",
+    "name": "powerhouse",
+    "mode": "ics",
+    "category": "venues",
+    "cooldown_hours": 6
+  },
+  {
+    "url": "https://studsf.com/calendar",
+    "name": "stud",
+    "mode": "calendar",
+    "category": "venues",
+    "scroll_seconds": 8,
+    "cooldown_hours": 6
+  },
+  {
+    "url": "https://beauxsf.com",
+    "name": "beaux",
+    "mode": "calendar",
+    "category": "venues",
+    "scroll_seconds": 8,
+    "cooldown_hours": 6
+  },
+  {
+    "url": "https://jolenessf.com/events",
+    "name": "jolenes",
+    "mode": "calendar",
+    "category": "venues",
+    "scroll_seconds": 8,
+    "cooldown_hours": 6
+  },
+  {
+    "url": "https://sfoasis.com/events",
+    "name": "oasis",
+    "mode": "calendar",
+    "category": "venues",
+    "scroll_seconds": 8,
+    "cooldown_hours": 6
+  },
+  {
+    "url": "https://www.elriosf.com",
+    "name": "elrio",
+    "mode": "calendar",
+    "category": "venues",
+    "scroll_seconds": 8,
+    "cooldown_hours": 6
+  },
+  {
+    "url": "https://lookoutsf.com",
+    "name": "lookout",
+    "mode": "calendar",
+    "category": "venues",
+    "scroll_seconds": 8,
+    "cooldown_hours": 6
+  },
+  {
+    "url": "https://hitopsbar.com",
+    "name": "hi-tops",
+    "mode": "calendar",
+    "category": "venues",
+    "scroll_seconds": 8,
+    "cooldown_hours": 6
+  },
+  {
+    "url": "https://sf-eagle.com/events",
+    "name": "sf-eagle",
+    "mode": "calendar",
+    "category": "venues",
+    "scroll_seconds": 8,
+    "cooldown_hours": 6
+  },
+  {
+    "url": "https://qcal.app/events/in/san-francisco-ca-us",
+    "name": "qcal-sf",
+    "mode": "calendar",
+    "category": "venues",
+    "scroll_seconds": 8,
+    "cooldown_hours": 6
+  },
+  {
+    "url": "https://www.auntcharlieslounge.com",
+    "name": "aunt-charlies",
+    "mode": "raw",
+    "category": "venues",
+    "cooldown_hours": 6
+  },
+  {
+    "url": "https://sfbadlands.com",
+    "name": "badlands",
+    "mode": "raw",
+    "category": "venues",
+    "cooldown_hours": 6
+  },
+  {
+    "url": "https://www.driftwoodbarsf.com",
+    "name": "driftwood",
+    "mode": "raw",
+    "category": "venues",
+    "cooldown_hours": 6
+  },
+  {
+    "url": "https://midnightsunsf.com",
+    "name": "midnight-sun",
+    "mode": "raw",
+    "category": "venues",
+    "cooldown_hours": 6
+  },
+  {
+    "url": "https://www.mothersf.com",
+    "name": "mother",
+    "mode": "raw",
+    "category": "venues",
+    "cooldown_hours": 6
+  },
+  {
+    "url": "https://qbar-sf.com",
+    "name": "qbar",
+    "mode": "raw",
+    "category": "venues",
+    "cooldown_hours": 6
+  },
+  {
+    "url": "https://www.rikkisbarsf.com",
+    "name": "rikkis",
+    "mode": "raw",
+    "category": "venues",
+    "cooldown_hours": 6
+  },
+  {
+    "url": "https://cafesf.com",
+    "name": "the-cafe",
+    "mode": "raw",
+    "category": "venues",
+    "cooldown_hours": 6
+  },
+  {
+    "url": "https://edgesf.com",
+    "name": "the-edge",
+    "mode": "raw",
+    "category": "venues",
+    "cooldown_hours": 6
+  },
+  {
+    "url": "https://themix.bar",
+    "name": "the-mix",
+    "mode": "raw",
+    "category": "venues",
+    "cooldown_hours": 6
+  },
+  {
+    "url": "https://www.wildsidewest.com",
+    "name": "wild-side-west",
+    "mode": "raw",
+    "category": "venues",
+    "cooldown_hours": 6
+  }
+]

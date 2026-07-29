@@ -49,6 +49,14 @@ classifiers/*.pkl
 
 # Data artifacts
 data/*.json
+# ...but web_sources.json is the exception: it is the list of sites to
+# harvest -- public URLs and scraping options, no message content and no
+# credentials.  The blanket rule above exists for the files that DO hold
+# private data (labels*.json carries ~11k real harvested messages, and the
+# dot-prefixed caches/watermarks/fingerprints).  Sweeping the source list in
+# with them meant the harvest config was untracked, and with no git remote on
+# this repo it existed on exactly one disk.
+!data/web_sources.json
 data/eval_samples/
 data/.message_cache.json
 
