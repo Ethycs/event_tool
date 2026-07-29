@@ -83,9 +83,59 @@ def _web_login(args, cfg) -> int:
 # ── Diagnostics + add helpers (moved from old cli.py) ────────────────
 
 
+def _is_ics_url(url: str) -> bool:
+    """True for iCalendar feeds, which are not browsable pages.
+
+    Mirrors the shortcut in ``web_utils._detect_mode``. Kept in sync by hand;
+    both exist because detection happens on two different paths -- the harvest
+    path and this diagnostic path.
+    """
+    return url.startswith(("webcal://", "webcals://")) or url.rstrip("/").endswith(".ics")
+
+
+def _diagnose_ics(url: str) -> str | None:
+    """Diagnostics for an iCalendar feed -- fetch and parse, no browser.
+
+    ``web test``/``web add`` used to hand every URL straight to Playwright,
+    which cannot navigate ``webcal://`` at all::
+
+        Page.goto: net::ERR_ABORTED at webcal://cdn.dnalounge.com/...
+
+    The harvest path already branched to ICS before opening a page; this
+    path did not, so adding an ICS source failed with a browser error that
+    said nothing about the real reason.
+    """
+    from event_harvester.sources.web_modes.ics import _do_ics_inner
+
+    print(f"  Testing: {url}\n")
+    print(f"  {DIM}Detected iCalendar feed — fetching directly, no browser.{RESET}")
+
+    msgs = _do_ics_inner({"url": url, "name": "ics-test"})
+    if not msgs:
+        # _do_ics_inner logs the underlying reason and returns [] rather than
+        # raising, so there is nothing to catch here -- report and bail.
+        print(f"  {RED}No events parsed{RESET} — see the log line above for why.\n")
+        return None
+
+    print(f"  Parsed {len(msgs)} event(s)\n")
+    for m in msgs[:5]:
+        first_line = (m.get("content") or "").strip().splitlines()[:1]
+        print(f"    {DIM}{m.get('timestamp', '?')[:16]}{RESET}  "
+              f"{(first_line[0] if first_line else '')[:58]}")
+    if len(msgs) > 5:
+        print(f"    {DIM}... and {len(msgs) - 5} more{RESET}")
+
+    print(f"\n  {GREEN}Recommended mode: ics{RESET}\n")
+    return "ics"
+
+
 def _run_url_diagnostics(url: str) -> str | None:
     """Open a URL and run all detection modes. Returns the recommended mode string."""
     import concurrent.futures
+
+    # iCalendar feeds are not pages -- handle before touching a browser.
+    if _is_ics_url(url):
+        return _diagnose_ics(url)
 
     from event_harvester.sources.uc_browser import UCBrowser
     from event_harvester.sources.web_fetch import (
