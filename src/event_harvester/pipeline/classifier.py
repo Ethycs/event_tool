@@ -8,6 +8,7 @@ Each runs locally with zero API calls after training.
 """
 
 import logging
+import os
 import re
 from pathlib import Path
 
@@ -15,7 +16,45 @@ from event_harvester.pipeline.weights import SCHEDULING_KEYWORDS
 
 logger = logging.getLogger("event_harvester.pipeline.classifier")
 
-_CLASSIFIERS_DIR = Path(__file__).resolve().parent.parent.parent / "classifiers"
+def _find_classifiers_dir() -> Path:
+    """Locate the ``classifiers/`` directory holding the trained .pkl models.
+
+    This used to be::
+
+        Path(__file__).resolve().parent.parent.parent / "classifiers"
+
+    which walks pipeline -> event_harvester -> src and lands on
+    ``<repo>/src/classifiers``. The models actually live at
+    ``<repo>/classifiers`` -- one level up. So every model file was missed,
+    ``filter_actionable()`` took its "no models" branch, and EVERY message was
+    returned unfiltered. The noise filter had been silently off.
+
+    It logged a warning, but into a service log nobody reads, and the pipeline
+    kept working -- just without filtering. Wrong-but-plausible behaviour like
+    that survives far longer than a crash would.
+
+    Resolved by searching upward for a real directory instead of counting
+    ``.parent`` calls, so a layout change degrades to the warning rather than
+    silently pointing somewhere wrong. ``EVENT_HARVESTER_CLASSIFIERS_DIR``
+    overrides.
+    """
+    override = os.environ.get("EVENT_HARVESTER_CLASSIFIERS_DIR")
+    if override:
+        return Path(override)
+
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        candidate = parent / "classifiers"
+        if candidate.is_dir():
+            return candidate
+
+    # Nothing found -- return the conventional location (repo root, i.e. up
+    # from pipeline/event_harvester/src) so the paths below are still sane and
+    # the "no models" warning fires with a meaningful path in it.
+    return here.parents[3] / "classifiers"
+
+
+_CLASSIFIERS_DIR = _find_classifiers_dir()
 EMAIL_MODEL_PATH = _CLASSIFIERS_DIR / "classifier_email.pkl"
 CHAT_MODEL_PATH = _CLASSIFIERS_DIR / "classifier_chat.pkl"
 _LEGACY_MODEL_PATH = _CLASSIFIERS_DIR / "classifier.pkl"
@@ -202,7 +241,23 @@ def _train_one(messages, labels, feature_fn, model_path):
 # Threshold for actionable classification. Lower = fewer missed actionable
 # messages (higher recall) at the cost of more noise getting through.
 # 0.5 = default, 0.3 = aggressive recall (prefer false positives over false negatives)
-ACTIONABLE_THRESHOLD = 0.3
+# Favour recall: a missed event is unrecoverable, while extra noise is cheap --
+# the reranker and the LLM both filter downstream.
+#
+# Swept on the held-out 25% of labels_events.json (2347 chat messages, 125 true
+# events) using the deployed chat model:
+#
+#   thr   precision  recall   kept/2347   events missed
+#   0.05    0.161     0.960      747            5
+#   0.10    0.173     0.952      686            6
+#   0.15    0.178     0.928      653            9
+#   0.30    0.240     0.880      458           15   <- previous value
+#   0.50    0.392     0.752      240           31
+#
+# 0.30 -> 0.10 recovers 9 of the 15 missed events for 228 extra messages (~10%
+# of the set). Still discards ~71% of traffic, which is the point of the stage.
+# Going below 0.10 buys ~1pp of recall for another 61 messages -- not worth it.
+ACTIONABLE_THRESHOLD = 0.1
 
 _model_cache: dict[str, dict] = {}
 
