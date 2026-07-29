@@ -6,6 +6,8 @@ semantically event-like AND have upcoming dates.
 """
 
 import logging
+import os
+from pathlib import Path
 
 logger = logging.getLogger("event_harvester.pipeline.reranker")
 
@@ -15,33 +17,90 @@ _EVENT_QUERY = (
     "furmeet, convention with a specific date, time, and location"
 )
 
+# HuggingFace id, used only as a last resort.  Preferred source is a local
+# copy from the model store (lakeFS/MinIO via DVC), which is versioned,
+# survives HF being unreachable, and does not fetch weights at runtime.
+_MODEL_ID = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+# Where `just model-deploy` puts models, per pipelines/models/manifest.toml.
+# System-level paths on purpose: this service runs as LocalSystem, so a copy
+# under a user profile would be scoped to an account that isn't the consumer.
+_LOCAL_MODEL_DIRS = (
+    r"C:\models\ms-marco-MiniLM-L-6-v2",
+    "/data/models/ms-marco-MiniLM-L-6-v2",
+)
+
 _model = None
 
 
+def _resolve_model_source():
+    """Return (source, is_local) for the cross-encoder.
+
+    Prefers a local checkout from the model store so startup does no network
+    I/O.  ``EVENT_HARVESTER_RERANKER_PATH`` overrides, for a host that keeps
+    models somewhere else.
+
+    A directory only counts if it actually contains ``config.json``.  An empty
+    or half-pulled directory would otherwise be picked and then fail deep
+    inside transformers with a much less obvious error.
+    """
+    override = os.environ.get("EVENT_HARVESTER_RERANKER_PATH")
+    candidates = ([override] if override else []) + list(_LOCAL_MODEL_DIRS)
+
+    for candidate in candidates:
+        if candidate and (Path(candidate) / "config.json").is_file():
+            return candidate, True
+
+    if override:
+        # Explicitly configured and not usable -- say so rather than silently
+        # falling back to the network, which is what the operator asked us
+        # not to do by setting it.
+        logger.warning(
+            "EVENT_HARVESTER_RERANKER_PATH=%s has no config.json; "
+            "falling back to HuggingFace (%s)", override, _MODEL_ID,
+        )
+    return _MODEL_ID, False
+
+
 def _get_model():
-    """Lazy-load the cross-encoder (first call downloads ~23MB)."""
+    """Lazy-load the cross-encoder.
+
+    Local copy first; HuggingFace only if no local copy exists.
+    """
     global _model
     if _model is None:
-        import os
-        os.environ.setdefault("HF_HUB_OFFLINE", "1")
-        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+        source, is_local = _resolve_model_source()
 
         from sentence_transformers import CrossEncoder
-        logger.info("Loading reranker model...")
+
+        if is_local:
+            # Nothing to fetch -- pin offline so a stray lookup cannot turn a
+            # local load into a silent network call.
+            os.environ.setdefault("HF_HUB_OFFLINE", "1")
+            os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+            logger.info("Loading reranker from local model store: %s", source)
+            _model = CrossEncoder(source, max_length=512)
+            logger.info("Reranker loaded (local).")
+            return _model
+
+        # No local copy.  Try the HF cache offline first, then the network.
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+        logger.info("No local model store copy; trying HF cache for %s", source)
         try:
-            _model = CrossEncoder(
-                "cross-encoder/ms-marco-MiniLM-L-6-v2",
-                max_length=512,
-            )
+            _model = CrossEncoder(source, max_length=512)
+            logger.info("Reranker loaded (HF cache).")
         except Exception:
-            # First run — need to download, go online
+            # First run -- need to download, go online.
             os.environ.pop("HF_HUB_OFFLINE", None)
             os.environ.pop("TRANSFORMERS_OFFLINE", None)
-            _model = CrossEncoder(
-                "cross-encoder/ms-marco-MiniLM-L-6-v2",
-                max_length=512,
+            logger.warning(
+                "Downloading reranker from HuggingFace. Deploy it to the "
+                "model store instead (just model-deploy <host>) so startup "
+                "does no network I/O: %s", source,
             )
-        logger.info("Reranker loaded.")
+            _model = CrossEncoder(source, max_length=512)
+            logger.info("Reranker loaded (downloaded).")
     return _model
 
 
