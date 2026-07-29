@@ -23,6 +23,7 @@ import logging
 from datetime import timedelta
 
 from event_harvester.sources.web_modes.calendar import _do_calendar
+from event_harvester.sources.web_modes.ics import _do_ics
 from event_harvester.sources.web_modes.chat import _do_chat
 from event_harvester.sources.web_modes.feed import _do_feed
 from event_harvester.sources.web_modes.raw import _do_raw
@@ -185,6 +186,16 @@ def fetch_web_sources(
                         # Chat mode doesn't need page pre-open
                         if mode == "chat":
                             msgs = _do_chat(uc, src, tracer=nav_tracer, capture=capture)
+                            messages.extend(msgs)
+                            if msgs:
+                                _save_cooldown(src["url"])
+                            logger.info("%s: %d messages.", name, len(msgs))
+                            continue
+
+                        # ICS mode: iCalendar feed over HTTP -- no browser
+                        # needed (and would fail to navigate webcal:// URLs).
+                        if mode == "ics":
+                            msgs = _do_ics(uc, src, tracer=nav_tracer, capture=capture)
                             messages.extend(msgs)
                             if msgs:
                                 _save_cooldown(src["url"])
