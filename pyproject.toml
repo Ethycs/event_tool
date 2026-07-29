@@ -17,7 +17,8 @@ dependencies = [
     "scikit-learn>=1.3",
     "joblib>=1.3", "sentence-transformers>=3.0", "pywin32>=306", "signal-export>=2.0", "rookiepy>=0.5", "playwright>=1.40", "cryptg>=0.5.2,<0.6",
     "flet>=0.25", "flet-web>=0.25",
-    "mcp[cli]>=1,<2", "pillow>=12.2.0,<13", "opentelemetry-api>=1.41.1,<2", "opentelemetry-sdk>=1.41.1,<2", "opentelemetry-exporter-otlp-proto-grpc>=1.41.1,<2",
+    "mcp[cli]>=1,<2", "pillow>=12.2.0,<13", "opentelemetry-api>=1.41.1,<2", "opentelemetry-sdk>=1.41.1,<2", "opentelemetry-exporter-otlp-proto-grpc>=1.41.1,<2", "fastmcp>=3.4.2,<4",
+    "icalendar>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -52,15 +53,40 @@ platforms = ["win-64"]
 python = ">=3.12,<3.13"
 playwright-stealth = ">=2.0.2,<3"
 
+# PyTorch CUDA wheels.  torch arrives transitively via sentence-transformers,
+# and the default PyPI wheel on Windows is CPU-only -- so the GTX 1070 in this
+# box sat idle while the reranker ran on the CPU.
+#
+# cu126 specifically: it is the newest CUDA line whose wheels still compile for
+# sm_61 (Pascal).  Verified on the card rather than assumed --
+# torch.cuda.get_arch_list() reports
+#   ['sm_50','sm_60','sm_61','sm_70','sm_75','sm_80','sm_86','sm_90']
+# and the 1070 reports sm_61.  Newer CUDA lines drop Pascal; do not bump this
+# to cu128+ without re-checking the arch list on this card first.
+#
+# Driver is 560.94, which supports CUDA 12.6.
+#
+# Measured on the reranker's real workload (150 query/message pairs, the
+# harvester's total cap): CPU 1404 ms -> CUDA 102 ms, a 13.7x speedup, using
+# 128 MB of the 8 GB card. sentence-transformers picks CUDA up automatically,
+# so no application code changes.
+[tool.pixi.pypi-options]
+extra-index-urls = ["https://download.pytorch.org/whl/cu126"]
+
 [tool.pixi.pypi-dependencies]
 event-harvester = { path = ".", editable = true }
 universal_controller = { path = "ext/universal_controller", editable = true }
+torch = { version = ">=2.13", index = "https://download.pytorch.org/whl/cu126" }
 
 [tool.pixi.environments]
 default = { solve-group = "default" }
 dev = { features = ["dev"], solve-group = "default" }
 
 [tool.pixi.tasks]
+# event-harvester as a persistent MCP service (the gateway's backend)
+eh-service = "event-harvester mcp --transport streamable-http --port 8765"
+# central FastMCP gateway fronting the backend(s) on http://127.0.0.1:9000/mcp
+gateway = "python gateway.py"
 
 [tool.pixi.feature.dev.tasks]
 test = "pytest -v"
