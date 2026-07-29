@@ -154,9 +154,13 @@ def test_filter_known_links_empty_store_passes_through(monkeypatch):
 
 
 def test_filter_known_links_drops_exact_url_match(monkeypatch):
+    """A link the user has DECIDED on is skipped before the detail fetch."""
     monkeypatch.setattr(
         "event_harvester.pipeline.event_match.load_fingerprints",
-        lambda: [{"link": "https://x/1", "title": "anything", "date": "2026-06-01"}],
+        lambda: [{
+            "link": "https://x/1", "title": "anything",
+            "date": "2026-06-01", "status": "approved",
+        }],
     )
     links = [
         {"url": "https://x/1", "text": "Event A", "date_hint": "2026-06-01"},
@@ -165,6 +169,47 @@ def test_filter_known_links_drops_exact_url_match(monkeypatch):
     result = _filter_known_links(links)
     assert len(result) == 1
     assert result[0]["url"] == "https://x/2"
+
+
+def test_filter_known_links_ignores_auto_fingerprints(monkeypatch):
+    """A prior *sighting* must NOT hide an event the user never decided on.
+
+    Regression test. _save_link_fingerprint used to fingerprint every detail
+    page it fetched, and _filter_known_links honoured those entries, so an
+    event seen once was never shown again -- which silently hid 90%+ of the
+    calendar. Only approved/declined count as "known" now; status-less
+    (legacy auto) entries are ignored.
+    """
+    monkeypatch.setattr(
+        "event_harvester.pipeline.event_match.load_fingerprints",
+        lambda: [
+            {"link": "https://x/1", "title": "Event A", "date": "2026-06-01"},
+            {"link": "https://x/2", "title": "Event B",
+             "date": "2026-06-02", "status": "auto"},
+        ],
+    )
+    links = [
+        {"url": "https://x/1", "text": "Event A", "date_hint": "2026-06-01"},
+        {"url": "https://x/2", "text": "Event B", "date_hint": "2026-06-02"},
+    ]
+    assert _filter_known_links(links) == links
+
+
+def test_filter_known_links_drops_declined(monkeypatch):
+    """Declined events stay skipped -- the user said no."""
+    monkeypatch.setattr(
+        "event_harvester.pipeline.event_match.load_fingerprints",
+        lambda: [{
+            "link": "https://x/2", "title": "Event B",
+            "date": "2026-06-02", "status": "declined",
+        }],
+    )
+    links = [
+        {"url": "https://x/1", "text": "Event A", "date_hint": "2026-06-01"},
+        {"url": "https://x/2", "text": "Event B", "date_hint": "2026-06-02"},
+    ]
+    result = _filter_known_links(links)
+    assert [l["url"] for l in result] == ["https://x/1"]
 
 
 # ── _parse_calcium_links (CALENDAR mode core) ────────────────────────

@@ -113,34 +113,31 @@ def _is_junk_link_title(title: str) -> bool:
 
 
 def _save_link_fingerprint(lnk: dict) -> None:
-    """Save a lightweight fingerprint for a processed event link.
+    """No-op kept for backwards compatibility.
 
-    Called after successfully fetching a detail page, so the same link
-    is skipped on the next run. Skips navigation/UI links to avoid
-    polluting the fingerprint store.
+    Used to eagerly fingerprint every successfully-fetched detail page so
+    we'd skip it on the next run. That was wrong by design: dedup should
+    only fire AFTER the user decides on an event (approve/decline), not
+    every time a detail page is fetched. Auto entries leaked into the
+    filter via _filter_known_links and silently hid 90%+ of the calendar.
+    Fingerprinting now happens only in approve_event / decline_event /
+    ticktick push paths. This function stays as a no-op so existing
+    call sites compile without removing imports.
     """
-    title = lnk.get("text", "") or ""
-    if _is_junk_link_title(title):
-        return  # Don't fingerprint navigation widgets
-
-    from event_harvester.pipeline.event_match import save_fingerprint
-
-    save_fingerprint({
-        "title": title,
-        "date": lnk.get("date_hint"),  # save_fingerprint normalizes free-text dates
-        "link": lnk.get("url"),
-    })
+    return
 
 
 def _filter_known_links(event_links: list[dict]) -> list[dict]:
-    """Filter out event links that match existing fingerprints.
+    """Filter out event links the user has already decided on.
 
-    Checks each link's (text, date_hint, url) against the fingerprint store
-    before expensive detail page fetches. Returns only new/unknown links.
+    Pre-fetch optimization: skip detail-page fetches for events whose
+    fingerprint is marked ``approved`` or ``declined``. Auto-status
+    entries (legacy or otherwise) are ignored — a prior sighting alone
+    does NOT count as "known" since the user hasn't acted on it.
     """
     from event_harvester.pipeline.event_match import _normalize_title, _titles_overlap, load_fingerprints
 
-    fps = load_fingerprints()
+    fps = [fp for fp in load_fingerprints() if fp.get("status") in ("approved", "declined")]
     if not fps:
         return event_links
 
@@ -193,6 +190,12 @@ def _filter_known_links(event_links: list[dict]) -> list[dict]:
 
 def _detect_mode(uc, page, src: dict) -> str:
     """Auto-detect the best mode for a page using the same signals as --test-url."""
+    # webcal://* or *.ics URLs are iCalendar feeds -- shortcut before doing
+    # any browser-based signal detection.  Handled by web_modes.ics.
+    raw_url = src.get("url", "")
+    if raw_url.startswith(("webcal://", "webcals://")) or raw_url.rstrip("/").endswith(".ics"):
+        return "ics"
+
     event_links = _extract_event_links(page)
     if len(event_links) >= 3:
         return "calendar"
