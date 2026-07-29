@@ -21,7 +21,24 @@ from event_harvester.observability.tracing import get_tracer
 logger = logging.getLogger("event_harvester")
 tracer = get_tracer("event_harvester.pipeline.harvest")
 
-_DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
+# NOTE: four levels, not three.  pipeline -> event_harvester -> src -> repo.
+# This was `.parent.parent.parent`, which lands on <repo>/src/data -- so the
+# message cache was written to a stray src/data/ directory that nothing else
+# in the codebase knows about, while every other data path (web_utils,
+# web_session, ui.server) correctly resolves <repo>/data.
+#
+# Two consequences, both silent:
+#   * the "Delete data/.message_cache.json to force refresh" hint below
+#     pointed at a file that did not exist, so following it did nothing and
+#     the stale cache kept being served;
+#   * `harvest_events(web_source=...)` for a DIFFERENT source would return the
+#     previous source's cached messages, which reads as a successful harvest.
+#
+# Same off-by-one as the classifier models path (see pipeline/classifier.py).
+# Prefer deriving from a single anchor over counting .parent calls -- the
+# count encodes the layout in a place that does not move when the layout does.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_DATA_DIR = _REPO_ROOT / "data"
 CACHE_FILE = _DATA_DIR / ".message_cache.json"
 CACHE_MAX_AGE = timedelta(hours=4)
 
@@ -84,7 +101,7 @@ async def harvest_messages(
                 age_min = int((datetime.now(timezone.utc) - cached_at).total_seconds() / 60)
                 print(
                     f"{DIM}Using cached messages ({len(messages)} msgs, {age_min}m old). "
-                    f"Delete data/.message_cache.json to force refresh.{RESET}\n"
+                    f"Delete {CACHE_FILE} to force refresh.{RESET}\n"
                 )
                 return messages
             else:
