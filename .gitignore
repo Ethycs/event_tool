@@ -60,3 +60,12 @@ pixi.lock
 # UC extension build artifacts
 ext/uc_extension/node_modules/
 ext/uc_extension/dist/
+
+# local noise (Claude Code + operator scratch)
+.claude/settings.local.json
+.ssh/
+logs/
+reports/
+probe_out.txt
+test.md
+interview.py
