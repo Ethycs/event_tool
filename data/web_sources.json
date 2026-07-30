@@ -38,7 +38,7 @@
     "url": "https://www.meetup.com/find/?source=EVENTS&eventType=inPerson&sortField=RELEVANCE",
     "name": "meetup",
     "mode": "search",
-    "query": "AI meetup",
+    "queries": ["AI", "machine learning", "startup", "tech networking", "queer"],
     "scroll_seconds": 10
   },
   {
