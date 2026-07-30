@@ -2,8 +2,6 @@
 
 import json
 from datetime import date, timedelta
-from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -11,12 +9,10 @@ from event_harvester.pipeline.event_match import (
     _normalize_title,
     _titles_overlap,
     dedup_events,
-    event_signature,
     events_match,
     find_fingerprint,
     load_fingerprints,
     save_fingerprint,
-    FINGERPRINT_FILE,
 )
 
 

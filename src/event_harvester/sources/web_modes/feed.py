@@ -11,13 +11,13 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
+from event_harvester.observability.tracing import get_tracer
 from event_harvester.sources.web_utils import (
     _extract_event_links,
     _fetch_event_details_parallel,
     _filter_known_links,
     _save_link_fingerprint,
 )
-from event_harvester.observability.tracing import get_tracer
 
 logger = logging.getLogger("event_harvester.web_fetch")
 
@@ -129,7 +129,6 @@ def _do_feed_inner(uc, src: dict, max_events: int = 30, page=None, tracer=None, 
                 name, scroll_count, len(captured), len(page_text))
 
     messages = []
-    domain = urlparse(url).netloc
 
     # Try event link extraction from scrolled page (maximizes events)
     # Skip for api_only sources (e.g. Instagram where links aren't event pages)
@@ -158,7 +157,10 @@ def _do_feed_inner(uc, src: dict, max_events: int = 30, page=None, tracer=None, 
     # Page text as a message (if no event links found)
     if not event_links and page_text and len(page_text) > 200:
         messages.append({
-            "platform": name,
+            # "web", not the source name — see _extract_posts_from_api.
+            # Every other mode emits "web"; this was the one that didn't,
+            # which exempted feed sources from the per-source `web` cap.
+            "platform": "web",
             "id": f"feed:page:{hash(url)}",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "author": name,
@@ -216,11 +218,16 @@ def _do_feed_inner(uc, src: dict, max_events: int = 30, page=None, tracer=None, 
 
 # ── Instagram / generic GraphQL post extractor ───────────────────────
 
-def _extract_posts_from_api(data: dict, url: str, platform: str) -> list[dict]:
+def _extract_posts_from_api(data: dict, url: str, source_name: str) -> list[dict]:
     """Extract individual posts from a feed API response.
 
     Handles Instagram GraphQL timeline responses and other common
     feed structures. Returns one message dict per post.
+
+    ``platform`` is always ``"web"`` per EH-STD-MSG-v0 — the *source* name
+    goes in ``channel``. This used to emit ``"platform": "instagram"``, which
+    made `CapConfig.get("instagram")` fall through to its default instead of
+    applying the `web` cap, so feed sources were silently uncapped.
     """
     posts = []
     data_inner = data.get("data", data)
@@ -266,11 +273,11 @@ def _extract_posts_from_api(data: dict, url: str, platform: str) -> list[dict]:
                             pass
 
                     posts.append({
-                        "platform": platform,
+                        "platform": "web",
                         "id": f"ig:{media_id}" if media_id else f"ig:{hash(text[:50])}",
                         "timestamp": ts or datetime.now(timezone.utc).isoformat(),
                         "author": f"@{username}",
-                        "channel": "instagram-feed",
+                        "channel": f"{source_name}-feed",
                         "content": text[:2000],
                     })
 
@@ -290,11 +297,11 @@ def _extract_posts_from_api(data: dict, url: str, platform: str) -> list[dict]:
 
                 if text and len(text) > 10:
                     posts.append({
-                        "platform": platform,
+                        "platform": "web",
                         "id": f"ig:{media_id}" if media_id else f"ig:{hash(text[:50])}",
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                         "author": f"@{username}",
-                        "channel": "instagram-feed",
+                        "channel": f"{source_name}-feed",
                         "content": text[:2000],
                     })
 

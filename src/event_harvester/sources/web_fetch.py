@@ -22,10 +22,11 @@ import concurrent.futures
 import logging
 from datetime import timedelta
 
+from event_harvester.observability.tracing import get_tracer
 from event_harvester.sources.web_modes.calendar import _do_calendar
-from event_harvester.sources.web_modes.ics import _do_ics
 from event_harvester.sources.web_modes.chat import _do_chat
 from event_harvester.sources.web_modes.feed import _do_feed
+from event_harvester.sources.web_modes.ics import _do_ics
 from event_harvester.sources.web_modes.raw import _do_raw
 from event_harvester.sources.web_modes.search import _do_search
 
@@ -38,6 +39,7 @@ from event_harvester.sources.web_utils import (  # noqa: F401
     _DEFAULT_SOURCES,
     _JUNK_LINK_TITLES,
     _WEB_SOURCES_FILE,
+    DEFAULT_SCROLL_SECONDS,
     _decimate_text,
     _detect_mode,
     _extract_event_links,
@@ -55,9 +57,7 @@ from event_harvester.sources.web_utils import (  # noqa: F401
     _save_link_fingerprint,
     _scroll_for_seconds,
     _wait_cloudflare,
-    DEFAULT_SCROLL_SECONDS,
 )
-from event_harvester.observability.tracing import get_tracer
 
 logger = logging.getLogger("event_harvester.web_fetch")
 tracer = get_tracer("event_harvester.web_fetch")
@@ -143,9 +143,10 @@ def fetch_web_sources(
         """
         if not debug_trace:
             return None, None, None
-        from event_harvester.observability.navigation_trace import NavigationTracer
-        import time as _t
         import secrets as _sec
+        import time as _t
+
+        from event_harvester.observability.navigation_trace import NavigationTracer
         run_id = _t.strftime("%Y%m%dT%H%M%S") + "_" + _sec.token_hex(2)
         nav_tracer = None
         try:

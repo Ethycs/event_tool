@@ -9,6 +9,9 @@ import logging
 from collections import defaultdict
 
 from event_harvester.cli.parse_helpers import apply_caps_to_config, resolve_platforms
+from event_harvester.outputs.report import generate_report
+from event_harvester.outputs.ticktick import create_ticktick_tasks, get_ticktick_client
+from event_harvester.pipeline import Pipeline
 from event_harvester.profiles import apply_profile_by_name as _apply_profile_by_name
 from event_harvester.ui.display import (
     BOLD,
@@ -18,9 +21,6 @@ from event_harvester.ui.display import (
     print_links,
     print_message,
 )
-from event_harvester.pipeline import Pipeline
-from event_harvester.outputs.report import generate_report
-from event_harvester.outputs.ticktick import create_ticktick_tasks, get_ticktick_client
 
 logger = logging.getLogger("event_harvester")
 
@@ -295,7 +295,7 @@ def _events_for_report(events: list[dict]) -> list[dict]:
 
 def _print_rejects(rejects: dict[str, list]) -> None:
     """Print reject summary to terminal and write full details to INI file."""
-    from pathlib import Path
+    from event_harvester.utils import data_path
 
     stage_labels = {
         "classifier": "Classifier",
@@ -318,7 +318,7 @@ def _print_rejects(rejects: dict[str, list]) -> None:
             print(f"  {stage_labels[stage]}: {DIM}{len(items)} rejected{RESET}")
 
     # Write INI file
-    out_path = Path("data/rejects.ini")
+    out_path = data_path("rejects.ini")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     lines: list[str] = []
     idx = 0

@@ -5,13 +5,13 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
+from event_harvester.observability.tracing import get_tracer
 from event_harvester.sources.web_utils import (
     DEFAULT_SCROLL_SECONDS,
     _extract_text,
     _scroll_for_seconds,
     _wait_cloudflare,
 )
-from event_harvester.observability.tracing import get_tracer
 
 logger = logging.getLogger("event_harvester.web_fetch")
 

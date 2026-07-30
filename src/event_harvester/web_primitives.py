@@ -26,7 +26,10 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from event_harvester.observability.tracing import set_span_attrs, traced
+
 logger = logging.getLogger(__name__)
+_TRACER = "event_harvester.web_primitives"
 
 
 # Confidence below this triggers the VLM arbiter (when wired); above it,
@@ -99,10 +102,29 @@ def _arbitrate(page, candidates: list[Element], goal: str) -> Element | None:
     ``None`` if the list is empty. When we wire the VLM arbiter, this
     is the single place to do it: take the screenshot, prompt the
     vision LLM with ``goal`` + ``candidates``, return its pick.
+
+    Every ``find_*`` verb funnels through here, so annotating the span once
+    here gives all of them the same shape: how many candidates the detectors
+    surfaced, what was picked, and how confident it was. That trail is the
+    raw material for crystallising a route -- a step whose confidence sits
+    near :data:`CONFIDENCE_THRESHOLD` is the one that will break first when
+    the page changes.
     """
+    set_span_attrs(**{
+        "web.arbitrate.goal": goal,
+        "web.arbitrate.candidates": len(candidates),
+    })
     if not candidates:
+        set_span_attrs(**{"web.found": False})
         return None
     best = max(candidates, key=lambda c: c.confidence)
+    set_span_attrs(**{
+        "web.found": True,
+        "web.element.selector": best.selector,
+        "web.element.label": best.label,
+        "web.element.confidence": round(float(best.confidence), 3),
+        "web.element.low_confidence": best.confidence < CONFIDENCE_THRESHOLD,
+    })
     # TODO(phase-2): if best.confidence < CONFIDENCE_THRESHOLD, call
     # event_harvester.llm.vision_completion with a screenshot + the
     # candidate list and pick from there.
@@ -136,6 +158,7 @@ def _patterns_to_elements(patterns: list[dict] | None, label: str) -> list[Eleme
 # ── Discovery (read-only) ─────────────────────────────────────────
 
 
+@traced("web.verb.find_search_box", tracer_name=_TRACER)
 def find_search_box(uc, page) -> Element | None:
     """Locate the page's primary search input.
 
@@ -158,6 +181,7 @@ def find_search_box(uc, page) -> Element | None:
     return _arbitrate(page, candidates, goal="primary search input")
 
 
+@traced("web.verb.find_event_cards", tracer_name=_TRACER)
 def find_event_cards(page) -> list[Element]:
     """Return event-card-shaped links on the current page.
 
@@ -187,6 +211,7 @@ def find_event_cards(page) -> list[Element]:
     return out
 
 
+@traced("web.verb.find_pagination", tracer_name=_TRACER)
 def find_pagination(page) -> Element | None:
     """Locate a "Next page" control.
 
@@ -229,6 +254,7 @@ def find_pagination(page) -> Element | None:
     return _pattern_to_element(dict(hit, **{"selector": hit["selector"]}), "pagination")
 
 
+@traced("web.verb.find_login_wall", tracer_name=_TRACER)
 def find_login_wall(uc, page) -> Element | None:
     """Return a synthetic :class:`Element` flagging a login wall.
 
@@ -251,6 +277,7 @@ def find_login_wall(uc, page) -> Element | None:
     )
 
 
+@traced("web.verb.find_modal", tracer_name=_TRACER)
 def find_modal(uc, page) -> Element | None:
     """Locate a blocking modal (cookie banner, popup, generic dialog)."""
     candidates: list[Element] = []
@@ -263,6 +290,7 @@ def find_modal(uc, page) -> Element | None:
     return _arbitrate(page, candidates, goal="blocking modal")
 
 
+@traced("web.verb.find_feed_container", tracer_name=_TRACER)
 def find_feed_container(uc, page) -> Element | None:
     """Locate the scrollable feed container UC detected, if any."""
     try:
@@ -274,6 +302,7 @@ def find_feed_container(uc, page) -> Element | None:
                       goal="primary feed container")
 
 
+@traced("web.verb.find_chat_input", tracer_name=_TRACER)
 def find_chat_input(uc, page) -> Element | None:
     """Locate a chat input (Grok/ChatGPT style)."""
     candidates: list[Element] = []
@@ -297,6 +326,7 @@ def find_chat_input(uc, page) -> Element | None:
 # ── Action ────────────────────────────────────────────────────────
 
 
+@traced("web.verb.click", tracer_name=_TRACER)
 def click(page, element: Element) -> bool:
     """Click ``element``. Returns ``True`` on success, ``False`` on any error."""
     if not element.selector:
@@ -310,6 +340,7 @@ def click(page, element: Element) -> bool:
     return True
 
 
+@traced("web.verb.fill_input", tracer_name=_TRACER)
 def fill_input(page, element: Element, text: str, *, submit: bool = False) -> bool:
     """Fill ``element`` with ``text``. Optionally press Enter to submit."""
     if not element.selector:
@@ -324,6 +355,7 @@ def fill_input(page, element: Element, text: str, *, submit: bool = False) -> bo
     return True
 
 
+@traced("web.verb.scroll", tracer_name=_TRACER)
 def scroll(page, element: Element | None, seconds: int, step_ms: int = 800) -> int:
     """Scroll one viewport every ``step_ms`` for ``seconds``.
 
@@ -356,6 +388,7 @@ def scroll(page, element: Element | None, seconds: int, step_ms: int = 800) -> i
     return ticks
 
 
+@traced("web.verb.dismiss_modal", tracer_name=_TRACER)
 def dismiss_modal(uc, page) -> bool:
     """Dismiss any visible cookie banner or modal. Returns ``True`` if anything closed."""
     closed = False
@@ -372,6 +405,7 @@ def dismiss_modal(uc, page) -> bool:
     return closed
 
 
+@traced("web.verb.wait_for_navigation", tracer_name=_TRACER)
 def wait_for_navigation(page, timeout_ms: int = 5000) -> bool:
     """Wait for the page to reach a quiescent state. Returns ``True`` on success."""
     try:
@@ -385,6 +419,7 @@ def wait_for_navigation(page, timeout_ms: int = 5000) -> bool:
 # ── Extraction ────────────────────────────────────────────────────
 
 
+@traced("web.verb.extract_text", tracer_name=_TRACER)
 def extract_text(page, element: Element | None = None) -> str:
     """Read text content from ``element`` (or the whole page body)."""
     try:
@@ -399,6 +434,7 @@ def extract_text(page, element: Element | None = None) -> str:
         return ""
 
 
+@traced("web.verb.extract_event", tracer_name=_TRACER)
 def extract_event(element: Element) -> dict[str, Any]:
     """Pull structured event fields from a card :class:`Element`.
 
@@ -416,6 +452,7 @@ def extract_event(element: Element) -> dict[str, Any]:
     }
 
 
+@traced("web.verb.extract_links", tracer_name=_TRACER)
 def extract_links(page) -> list[dict[str, Any]]:
     """Return raw event link dicts from the page (pre-Element)."""
     from event_harvester.sources.web_fetch import _extract_event_links
@@ -427,6 +464,7 @@ def extract_links(page) -> list[dict[str, Any]]:
         return []
 
 
+@traced("web.verb.screenshot", tracer_name=_TRACER)
 def screenshot(page) -> bytes:
     """Capture the current viewport as PNG bytes. Empty bytes on failure."""
     try:

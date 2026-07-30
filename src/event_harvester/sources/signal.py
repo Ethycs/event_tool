@@ -11,7 +11,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from event_harvester.observability.tracing import set_span_attrs, traced
+
 logger = logging.getLogger("event_harvester.signal")
+_TRACER = "event_harvester.sources.signal"
 
 
 def _find_signal_dir(override_path: Optional[str] = None) -> Optional[Path]:
@@ -20,7 +23,7 @@ def _find_signal_dir(override_path: Optional[str] = None) -> Optional[Path]:
         p = Path(override_path)
         if p.exists():
             return p
-        logger.warning("SIGNAL_DATA_PATH=%s does not exist", override_path)
+        logger.warning("SIGNAL_DB_PATH=%s does not exist", override_path)
         return None
 
     appdata = os.environ.get("APPDATA", "")
@@ -65,6 +68,7 @@ def _connect_db(signal_dir: Path):
     return db
 
 
+@traced("source.signal.read", tracer_name=_TRACER)
 def read_signal_messages(
     cutoff: datetime,
     override_path: Optional[str] = None,
@@ -164,4 +168,5 @@ def read_signal_messages(
         len(messages),
         cutoff.strftime("%Y-%m-%d %H:%M"),
     )
+    set_span_attrs(**{"message.count": len(messages)})
     return messages

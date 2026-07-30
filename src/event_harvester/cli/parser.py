@@ -203,7 +203,7 @@ def build_parser() -> argparse.ArgumentParser:
     # ── web ──
     p_web = sub.add_parser(
         "web",
-        help="Manage web sources (list/add/test/login)",
+        help="Manage web sources (list/add/test/probe/login)",
     )
     web_sub = p_web.add_subparsers(dest="web_command", required=True, metavar="WEB_COMMAND")
 
@@ -217,8 +217,12 @@ def build_parser() -> argparse.ArgumentParser:
     web_add.add_argument("url", help="URL of the web source to add")
     web_add.add_argument(
         "--mode", default=None,
-        choices=["calendar", "feed", "search", "raw"],
-        help="Override the auto-detected mode",
+        choices=["calendar", "feed", "search", "raw", "ics"],
+        help="Override the auto-detected mode (also skips the feed probe)",
+    )
+    web_add.add_argument(
+        "--no-probe", action="store_true",
+        help="Skip the browser-free calendar-feed probe and go straight to Playwright",
     )
     _add_root_flags(web_add)
 
@@ -227,7 +231,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run diagnostics on a URL without saving",
     )
     web_test.add_argument("url", help="URL to test")
+    web_test.add_argument(
+        "--no-probe", action="store_true",
+        help="Skip the browser-free calendar-feed probe and go straight to Playwright",
+    )
     _add_root_flags(web_test)
+
+    web_probe = web_sub.add_parser(
+        "probe",
+        help="Find iCalendar feeds for URLs (or every configured non-ICS source)",
+    )
+    web_probe.add_argument(
+        "urls", nargs="*",
+        help="URLs to probe; omit to probe every configured source not already in ics mode",
+    )
+    web_probe.add_argument(
+        "--apply", action="store_true",
+        help="Rewrite configured sources that have a feed to ics mode (no URL args only)",
+    )
+    web_probe.add_argument(
+        "--timeout", type=int, default=10, metavar="SEC",
+        help="Per-request timeout in seconds (default: 10)",
+    )
+    _add_root_flags(web_probe)
 
     web_login = web_sub.add_parser(
         "login",

@@ -101,6 +101,7 @@ async def main() -> int:
     # spans get exported.
     try:
         import os
+
         from event_harvester.observability.tracing import init_tracing
         init_tracing(
             debug=getattr(args, "debug_otel", False),
@@ -109,21 +110,46 @@ async def main() -> int:
     except Exception as e:
         logger.warning("init_tracing failed: %s", e)
 
-    cfg = load_config()
+    # One root span per invocation. Without it every span the run produces is
+    # its own orphan trace -- `harvest.discord` and the `llm.chat` calls it
+    # caused end up unrelated in the backend, so you cannot ask "what did this
+    # run do" or "how long did the whole thing take", only "what happened".
+    from event_harvester.observability.tracing import get_tracer
 
-    handler = _HANDLERS.get(args.command)
-    if handler is None:
-        logger.error("Unknown command: %s", args.command)
-        return 1
+    tracer = get_tracer("event_harvester.cli")
+    with tracer.start_as_current_span(f"cli.{args.command}") as root:
+        root.set_attribute("cli.command", args.command)
+        for attr in ("web_command", "recruiters_command", "classifier_command"):
+            sub = getattr(args, attr, None)
+            if sub:
+                root.set_attribute(f"cli.{attr}", sub)
+        root.set_attribute("cli.verbose", bool(args.verbose))
+        root.set_attribute("cli.quiet", bool(args.quiet))
 
-    try:
-        return await handler(args, cfg) or 0
-    except KeyboardInterrupt:
-        print("\nStopped.")
-        return 130  # standard SIGINT exit code
-    except Exception as e:
-        logger.exception("Command %s failed: %s", args.command, e)
-        return 2
+        cfg = load_config()
+
+        handler = _HANDLERS.get(args.command)
+        if handler is None:
+            root.set_attribute("error.message", f"unknown command {args.command}")
+            root.set_attribute("cli.exit_code", 1)
+            logger.error("Unknown command: %s", args.command)
+            return 1
+
+        try:
+            code = await handler(args, cfg) or 0
+            root.set_attribute("cli.exit_code", code)
+            return code
+        except KeyboardInterrupt:
+            root.set_attribute("cli.exit_code", 130)
+            root.set_attribute("cli.interrupted", True)
+            print("\nStopped.")
+            return 130  # standard SIGINT exit code
+        except Exception as e:
+            root.set_attribute("cli.exit_code", 2)
+            root.set_attribute("error.message", str(e))
+            root.record_exception(e)
+            logger.exception("Command %s failed: %s", args.command, e)
+            return 2
 
 
 def main_sync() -> None:

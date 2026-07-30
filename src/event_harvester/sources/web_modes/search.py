@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
+from event_harvester.observability.tracing import get_tracer
 from event_harvester.sources.web_utils import (
     DEFAULT_SCROLL_SECONDS,
     _extract_event_links,
@@ -13,7 +14,6 @@ from event_harvester.sources.web_utils import (
     _save_link_fingerprint,
     _scroll_for_seconds,
 )
-from event_harvester.observability.tracing import get_tracer
 
 logger = logging.getLogger("event_harvester.web_fetch")
 
@@ -39,16 +39,41 @@ def _do_search(uc, src: dict, timeout_ms: int, max_events: int, page=None, trace
             raise
 
 
+def _normalize_queries(src: dict) -> list[str]:
+    """Return the search queries for a source, as a list.
+
+    Accepts three spellings so existing configs keep working:
+      * ``"query": "AI meetup"``            -> ``["AI meetup"]``
+      * ``"query": ["ai", "queer party"]``  -> both
+      * ``"queries": [...]``                -> both (preferred for multiples)
+
+    Returns ``[]`` when none is set, which means "don't search, just scroll
+    whatever the URL already shows".
+    """
+    raw = src.get("queries", src.get("query"))
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    out: list[str] = []
+    for q in raw:
+        q = str(q).strip()
+        if q and q not in out:
+            out.append(q)
+    return out
+
+
 def _do_search_inner(uc, src: dict, timeout_ms: int, max_events: int, page=None, tracer=None, capture=None) -> list[dict]:
     """Search mode: detect search bar, query, scroll, extract event links."""
     from urllib.parse import urlparse
 
     url = src["url"]
-    query = src.get("query")
+    queries = _normalize_queries(src)
     scroll_secs = src.get("scroll_seconds", DEFAULT_SCROLL_SECONDS)
     name = src.get("name", "web")
 
-    logger.info("Search: %s", name)
+    logger.info("Search: %s (%d quer%s)", name, len(queries) or 1,
+                "y" if len(queries) == 1 else "ies")
 
     if page is None:
         page = uc.open(url, source_name=name, tracer=tracer, capture=capture)
@@ -61,8 +86,8 @@ def _do_search_inner(uc, src: dict, timeout_ms: int, max_events: int, page=None,
         page.close()
         return []
 
-    # Search if query provided
-    if query:
+    def _run_one_search(query: str) -> bool:
+        """Type `query` into the page's search box and submit. Returns success."""
         uc.first_scan(page)
         searched = uc.search(page, query)
 
@@ -105,16 +130,52 @@ def _do_search_inner(uc, src: dict, timeout_ms: int, max_events: int, page=None,
         if searched:
             page.wait_for_timeout(3000)
             diff = uc.next_scan(page)
-            detected = uc.auto_detect(page)
+            uc.auto_detect(page)
             if diff:
                 logger.info("%s: search → %d changed, %d added",
                             name, diff.get("changed", 0), diff.get("added", 0))
+        return searched
 
-    # Scroll
-    _scroll_for_seconds(page, scroll_secs, step_ms=1000)
+    # One pass per query, accumulating links. A single query is one keyhole
+    # into a large site: `meetup` shipped with `"AI meetup"` and saw nothing
+    # else, because the schema could only hold one string.
+    collected: list[dict] = []
+    seen_urls: set[str] = set()
+
+    def _collect_links() -> None:
+        for lnk in _extract_event_links(page) or []:
+            key = lnk.get("url") or lnk.get("href")
+            if not key or key in seen_urls:
+                continue
+            seen_urls.add(key)
+            collected.append(lnk)
+
+    if queries:
+        for i, query in enumerate(queries):
+            if i > 0:
+                # Return to the base URL between queries: on a results page
+                # the search box may be a different element, and some sites
+                # append rather than replace. Reloading keeps each query
+                # independent, at the cost of one navigation.
+                try:
+                    page.goto(url, timeout=timeout_ms)
+                    page.wait_for_timeout(1500)
+                    uc.dismiss_cookies(page)
+                    uc.close_modal(page)
+                except Exception as e:
+                    logger.warning("%s: could not reload for query %r: %s", name, query, e)
+                    break
+            if not _run_one_search(query):
+                logger.warning("%s: search box not found for query %r", name, query)
+            _scroll_for_seconds(page, scroll_secs, step_ms=1000)
+            _collect_links()
+            logger.info("%s: query %r → %d unique link(s) so far", name, query, len(collected))
+    else:
+        _scroll_for_seconds(page, scroll_secs, step_ms=1000)
+        _collect_links()
 
     # Extract event links, filter already-known ones
-    event_links = _filter_known_links(_extract_event_links(page))[:max_events]
+    event_links = _filter_known_links(collected)[:max_events]
     messages = []
     domain = urlparse(url).netloc
 

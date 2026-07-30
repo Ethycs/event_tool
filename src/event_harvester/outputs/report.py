@@ -3,6 +3,10 @@
 from datetime import datetime, timezone
 from urllib.parse import quote
 
+from event_harvester.observability.tracing import traced
+
+_TRACER = "event_harvester.outputs.report"
+
 
 def ticktick_deep_link(
     title: str,
@@ -30,6 +34,7 @@ def ticktick_deep_link(
     return f"ticktick://x-callback-url/v1/add_task?{query}"
 
 
+@traced("report.generate", tracer_name=_TRACER)
 def generate_report(
     validated_events: list[dict],
     raw_events: list[dict],

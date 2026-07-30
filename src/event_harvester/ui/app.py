@@ -240,26 +240,57 @@ class EventsApp:
             self._tt = get_ticktick_client(self.cfg.ticktick)
         return self._tt
 
+    def _sync_one_to_ticktick(self, event_dict) -> tuple[bool, str]:
+        """Push one event to TickTick. Returns ``(ok, reason)``.
+
+        ``ok=False`` means the event was **not** recorded in TickTick and
+        must stay in the review queue. Note that a dry run, or TickTick not
+        being configured at all, both count as success: there is nothing to
+        sync to, and the user's approve click is still their decision.
+        """
+        if self.cfg.dry_run:
+            logger.info("Dry-run: not creating TickTick task for %r",
+                        event_dict.get("title"))
+            return True, "dry-run"
+
+        tt = self._get_tt()
+        if tt is None:
+            logger.info("TickTick not configured; recording approval locally only.")
+            return True, "ticktick-not-configured"
+
+        from event_harvester.outputs.ticktick import create_ticktick_tasks
+        try:
+            result = create_ticktick_tasks(
+                tt, [event_dict], project_name=self.cfg.ticktick.project,
+            )
+        except Exception as ex:
+            logger.error("Approve failed for %r: %s", event_dict.get("title"), ex)
+            return False, str(ex)
+
+        # create_ticktick_tasks catches per-task errors internally, so a
+        # return value is not evidence of success — check the buckets.
+        if result.get("failed"):
+            return False, "TickTick rejected the task (see log)"
+        return True, "ok"
+
     def _on_approve(self, event_dict):
         def handler(e):
-            try:
-                if not self.cfg.dry_run:
-                    tt = self._get_tt()
-                    if tt:
-                        from event_harvester.outputs.ticktick import create_ticktick_tasks
-                        create_ticktick_tasks(
-                            tt, [event_dict],
-                            project_name=self.cfg.ticktick.project,
-                        )
-                else:
-                    logger.info("Dry-run: not creating TickTick task for %r",
-                                event_dict.get("title"))
+            ok, reason = self._sync_one_to_ticktick(event_dict)
+            if ok:
                 save_fingerprint(event_dict, status="approved")
                 event_dict["_status"] = "approved"
-            except Exception as ex:
-                logger.error("Approve failed: %s", ex)
-                event_dict["_status"] = "approved"
-                save_fingerprint(event_dict, status="approved")
+            else:
+                # Do NOT write an "approved" fingerprint. Doing so used to
+                # permanently hide an event that was never created in
+                # TickTick — the user lost it from both systems at once,
+                # silently. Leaving it "new" keeps it in the queue to retry.
+                event_dict["_status"] = "new"
+                self._append_log(
+                    f"ERROR: approve failed for "
+                    f"{event_dict.get('title', 'event')!r}: {reason}. "
+                    f"Left in the queue — try again.",
+                    color=ft.Colors.RED,
+                )
             self._rebuild_cards()
         return handler
 
@@ -271,22 +302,32 @@ class EventsApp:
         return handler
 
     def _on_approve_all(self, e):
-        tt = None if self.cfg.dry_run else self._get_tt()
+        approved = 0
+        failed: list[str] = []
         for ev in self.events:
-            if ev.get("_status") == "new":
-                try:
-                    if tt:
-                        from event_harvester.outputs.ticktick import create_ticktick_tasks
-                        create_ticktick_tasks(
-                            tt, [ev], project_name=self.cfg.ticktick.project,
-                        )
-                    elif self.cfg.dry_run:
-                        logger.info("Dry-run: skipping TickTick for %r",
-                                    ev.get("title"))
-                except Exception as ex:
-                    logger.error("Approve failed for %s: %s", ev.get("title"), ex)
+            if ev.get("_status") != "new":
+                continue
+            ok, reason = self._sync_one_to_ticktick(ev)
+            if ok:
                 save_fingerprint(ev, status="approved")
                 ev["_status"] = "approved"
+                approved += 1
+            else:
+                # Same rule as _on_approve: a failed sync must not be
+                # remembered as an approval. Previously the `except` only
+                # logged and execution fell through to save_fingerprint,
+                # so a TickTick outage silently swallowed the whole batch.
+                ev["_status"] = "new"
+                failed.append(str(ev.get("title", "event")))
+                logger.error("Approve-all failed for %r: %s", ev.get("title"), reason)
+
+        if failed:
+            self._append_log(
+                f"ERROR: {len(failed)} of {approved + len(failed)} approvals failed "
+                f"and stayed in the queue: {', '.join(failed[:5])}"
+                + (" ..." if len(failed) > 5 else ""),
+                color=ft.Colors.RED,
+            )
         self._rebuild_cards()
 
     def _on_decline_all(self, e):

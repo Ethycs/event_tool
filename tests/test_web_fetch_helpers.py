@@ -38,7 +38,6 @@ from event_harvester.sources.web_utils import (
     _save_cooldown,
 )
 
-
 # ── _is_junk_link_title ──────────────────────────────────────────────
 
 
@@ -297,13 +296,19 @@ def test_extract_posts_from_instagram_edges_shape():
             }
         }
     }
-    posts = _extract_posts_from_api(api_response, "https://instagram.com", "web")
+    posts = _extract_posts_from_api(api_response, "https://instagram.com", "instagram")
     assert len(posts) == 1
     p = posts[0]
     assert p["author"] == "@lumasf"
     assert "AI meetup" in p["content"]
     assert p["id"] == "ig:12345"
     assert p["channel"] == "instagram-feed"
+    # `platform` is the constant "web" per EH-STD-MSG-v0; the source name
+    # rides in `channel`. This test used to pass "web" as the third argument
+    # — the value the *caller* should have been sending — so it asserted the
+    # right shape while production sent the source name and got
+    # `platform: "instagram"`. Passing the real source name here is what makes
+    # the assertion mean anything.
     assert p["platform"] == "web"
 
 
@@ -317,7 +322,7 @@ def test_extract_posts_handles_items_shape():
             }
         ]
     }
-    posts = _extract_posts_from_api(api_response, "https://x.com", "web")
+    posts = _extract_posts_from_api(api_response, "https://x.com", "instagram")
     assert len(posts) == 1
     assert posts[0]["author"] == "@alice"
     assert posts[0]["id"] == "ig:p99"
@@ -325,7 +330,7 @@ def test_extract_posts_handles_items_shape():
 
 def test_extract_posts_skips_missing_caption():
     api_response = {"data": {"edges": [{"node": {"media": {"id": "x"}}}]}}
-    assert _extract_posts_from_api(api_response, "https://x.com", "web") == []
+    assert _extract_posts_from_api(api_response, "https://x.com", "instagram") == []
 
 
 def test_extract_posts_recurses_into_nested_dicts():
@@ -345,7 +350,7 @@ def test_extract_posts_recurses_into_nested_dicts():
             }
         }
     }
-    posts = _extract_posts_from_api(api_response, "https://x.com", "web")
+    posts = _extract_posts_from_api(api_response, "https://x.com", "instagram")
     assert len(posts) == 1
     assert posts[0]["id"] == "ig:deep1"
 
@@ -501,3 +506,39 @@ def test_is_dead_page_only_scans_first_3000_chars():
     prelude = "x " * 1600  # 3200 chars
     html = prelude + "<p>page not found</p>"
     assert _is_dead_page(html) is False
+
+
+# ── search-mode query normalization ──────────────────────────────────
+
+
+class TestNormalizeQueries:
+    """`search` mode accepted exactly one query string.
+
+    That is one keyhole into a large site — `meetup` shipped configured as
+    `"query": "AI meetup"` and saw nothing else, not because the site was
+    hard but because the schema could only hold one string.
+    """
+
+    def _norm(self, src):
+        from event_harvester.sources.web_modes.search import _normalize_queries
+        return _normalize_queries(src)
+
+    def test_single_string_still_works(self):
+        assert self._norm({"query": "AI meetup"}) == ["AI meetup"]
+
+    def test_list_under_query(self):
+        assert self._norm({"query": ["ai", "queer party"]}) == ["ai", "queer party"]
+
+    def test_queries_key_is_preferred(self):
+        src = {"queries": ["a", "b"], "query": "ignored"}
+        assert self._norm(src) == ["a", "b"]
+
+    def test_absent_means_no_search(self):
+        assert self._norm({}) == []
+        assert self._norm({"query": None}) == []
+
+    def test_blanks_and_duplicates_are_dropped(self):
+        assert self._norm({"queries": ["a", "  ", "a", " b "]}) == ["a", "b"]
+
+    def test_non_strings_are_coerced(self):
+        assert self._norm({"queries": [2026, "x"]}) == ["2026", "x"]

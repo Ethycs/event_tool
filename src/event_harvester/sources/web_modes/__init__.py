@@ -2,8 +2,8 @@
 
 Each mode is invoked by ``web_fetch.fetch_web_sources`` based on the
 ``mode`` field in the source dict (or auto-detected via
-``web_utils._detect_mode``). The five OTel-wrapped entry points
-re-exported here are the canonical handles.
+``web_utils._detect_mode``). The OTel-wrapped entry points re-exported
+here are the canonical handles -- ``__all__`` below is the count.
 """
 
 from event_harvester.sources.web_modes.calendar import _do_calendar

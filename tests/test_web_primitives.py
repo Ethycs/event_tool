@@ -26,11 +26,10 @@ from event_harvester.web_primitives import (
     find_modal,
     find_pagination,
     find_search_box,
-    scroll,
     screenshot,
+    scroll,
     wait_for_navigation,
 )
-
 
 # ── Fakes ─────────────────────────────────────────────────────────
 

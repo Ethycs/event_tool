@@ -7,10 +7,12 @@ import webbrowser
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from event_harvester.training.recruiter_score import RecruiterGrade
+from event_harvester.observability.tracing import traced
 from event_harvester.outputs.report import ticktick_deep_link
+from event_harvester.training.recruiter_score import RecruiterGrade
 
 logger = logging.getLogger("event_harvester.outputs.obsidian")
+_TRACER = "event_harvester.outputs.obsidian"
 
 GMAIL_URL = "https://mail.google.com/mail/u/0/#all/{msg_id}"
 
@@ -43,6 +45,7 @@ def _yaml_list(items: list[str]) -> str:
 # ── Events Report ─────────────────────────────────────────────────────
 
 
+@traced("obsidian.write_events", tracer_name=_TRACER)
 def write_events_report(
     validated_events: list[dict],
     raw_events: list[dict],
@@ -184,6 +187,7 @@ def _append_obsidian_event(lines: list[str], index: int, ev: dict) -> None:
 # ── Recruiter Report ──────────────────────────────────────────────────
 
 
+@traced("obsidian.write_recruiters", tracer_name=_TRACER)
 def write_recruiter_report(
     grades: list[RecruiterGrade],
     output_dir: str,
@@ -310,6 +314,7 @@ _ITEM_RE = re.compile(
 )
 
 
+@traced("obsidian.reparse_recruiters", tracer_name=_TRACER)
 def reparse_recruiter_report(filepath: str, gmail_cfg) -> None:
     """Interactive reparser: open, reply, trash recruiter emails from an Obsidian report.
 

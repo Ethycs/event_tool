@@ -119,7 +119,7 @@ def print_raw_events(events: list[dict], max_events: int = 15) -> None:
         if refs:
             print(f"         {BOLD}{' '.join(refs)}{RESET}")
         content = evt["content"][:120]
-        if content != evt["content"][:200]:
+        if content != evt["content"]:
             content += "..."
         print(f"         {DIM}\"{content}\"{RESET}")
         print()

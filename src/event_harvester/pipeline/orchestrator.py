@@ -20,15 +20,20 @@ What this class owns (the duplicated middle):
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import asyncio
+import contextlib
+from dataclasses import dataclass
 from typing import Any, Protocol
 
-from event_harvester.pipeline.analysis import extract_events_llm
 from event_harvester.config import AppConfig, validate_config
+from event_harvester.observability.tracing import get_tracer
+from event_harvester.pipeline.analysis import REJECT_BUCKETS, extract_events_llm
 from event_harvester.pipeline.event_match import find_acted_fingerprint
 from event_harvester.pipeline.harvest import harvest_messages, save_messages
-from event_harvester.sources import filter_read_sent
 from event_harvester.pipeline.weights import extract_links
+from event_harvester.sources import filter_read_sent
+
+tracer = get_tracer("event_harvester.pipeline.orchestrator")
 
 
 class _ReporterProtocol(Protocol):
@@ -65,13 +70,12 @@ _ALL_PLATFORMS: tuple[str, ...] = ("discord", "telegram", "gmail", "signal", "we
 
 
 def _empty_rejects() -> dict[str, list]:
-    return {
-        "classifier": [],
-        "reranker": [],
-        "caps": [],
-        "llm_past": [],
-        "llm_no_events": [],
-    }
+    """The 5-key reject shape, sourced from `analysis.REJECT_BUCKETS`.
+
+    Kept as a thin wrapper rather than a second literal so the bucket list
+    cannot drift between the producer and this consumer.
+    """
+    return {bucket: [] for bucket in REJECT_BUCKETS}
 
 
 class Pipeline:
@@ -132,114 +136,159 @@ class Pipeline:
         ``no_cooldown``: ``None`` means "respect cfg.web.no_cooldown";
         callers that want to override per-run pass an explicit bool.
         """
-        # ── Harvest ─────────────────────────────────────────────────────
-        await self._checkpoint()
-        self._update_stage("harvest")
-        cooldown_flag = (
-            self.cfg.web.no_cooldown if no_cooldown is None else no_cooldown
-        )
-        all_messages = await harvest_messages(
-            self.cfg,
-            load_path=load_path,
-            skip_cache=bool(save_path),
-            web_source=web_source,
-            web_sources=web_sources,
-            no_cooldown=cooldown_flag,
-            **no_kwargs,
-        )
-        if save_path:
-            save_messages(all_messages, save_path)
+        with tracer.start_as_current_span("pipeline.run") as run_span:
+            run_span.set_attribute("pipeline.days_back", self.cfg.days_back)
+            run_span.set_attribute("pipeline.unlimited_caps", unlimited_caps)
+            run_span.set_attribute("pipeline.skip_analyze", bool(self.cfg.skip_analyze))
+            run_span.set_attribute("pipeline.replayed_from_file", bool(load_path))
+            for plat, disabled in no_kwargs.items():
+                run_span.set_attribute(f"pipeline.{plat}", not disabled)
 
-        source_counts = {
-            plat: sum(1 for m in all_messages if m.get("platform") == plat)
-            for plat in _ALL_PLATFORMS
-        }
-
-        if not all_messages:
-            return PipelineResult(
-                all_messages=[],
-                actionable=[],
-                events=[],
-                summary="",
-                rejects=_empty_rejects(),
-                source_counts=source_counts,
-                links=[],
-                no_messages=True,
+            # ── Harvest ─────────────────────────────────────────────────
+            await self._checkpoint()
+            cooldown_flag = (
+                self.cfg.web.no_cooldown if no_cooldown is None else no_cooldown
             )
+            with self._stage("harvest") as span:
+                span.set_attribute("harvest.no_cooldown", bool(cooldown_flag))
+                all_messages = await harvest_messages(
+                    self.cfg,
+                    load_path=load_path,
+                    skip_cache=bool(save_path),
+                    web_source=web_source,
+                    web_sources=web_sources,
+                    no_cooldown=cooldown_flag,
+                    **no_kwargs,
+                )
+                if save_path:
+                    save_messages(all_messages, save_path)
 
-        # ── Filter read/sent (Gmail) ────────────────────────────────────
-        await self._checkpoint()
-        self._update_stage("filter")
-        actionable = filter_read_sent(all_messages)
-        self._log(
-            f"Filtered: {len(all_messages)} → {len(actionable)} actionable."
-        )
+                source_counts = {
+                    plat: sum(1 for m in all_messages if m.get("platform") == plat)
+                    for plat in _ALL_PLATFORMS
+                }
+                span.set_attribute("message.count", len(all_messages))
+                for plat, n in source_counts.items():
+                    span.set_attribute(f"message.count.{plat}", n)
 
-        # ── Extract links (cheap; do it before LLM gate) ────────────────
-        links = extract_links(actionable)
+            if not all_messages:
+                run_span.set_attribute("pipeline.outcome", "no_messages")
+                return PipelineResult(
+                    all_messages=[],
+                    actionable=[],
+                    events=[],
+                    summary="",
+                    rejects=_empty_rejects(),
+                    source_counts=source_counts,
+                    links=[],
+                    no_messages=True,
+                )
 
-        # ── Skip-analyze short-circuit ──────────────────────────────────
-        if self.cfg.skip_analyze:
+            # ── Filter read/sent (Gmail) ────────────────────────────────
+            await self._checkpoint()
+            with self._stage("filter") as span:
+                actionable = filter_read_sent(all_messages)
+                span.set_attribute("message.in", len(all_messages))
+                span.set_attribute("message.actionable", len(actionable))
+                span.set_attribute("message.dropped", len(all_messages) - len(actionable))
+                self._log(
+                    f"Filtered: {len(all_messages)} → {len(actionable)} actionable."
+                )
+
+                # Extract links (cheap; do it before LLM gate)
+                links = extract_links(actionable)
+                span.set_attribute("link.count", len(links))
+
+            # ── Skip-analyze short-circuit ──────────────────────────────
+            if self.cfg.skip_analyze:
+                run_span.set_attribute("pipeline.outcome", "skipped_analysis")
+                return PipelineResult(
+                    all_messages=all_messages,
+                    actionable=actionable,
+                    events=[],
+                    summary="",
+                    rejects=_empty_rejects(),
+                    source_counts=source_counts,
+                    links=links,
+                    skipped_analysis=True,
+                )
+
+            # ── Extract events via LLM ──────────────────────────────────
+            await self._checkpoint()
+            with self._stage("extract") as span:
+                caps = None if unlimited_caps else self.cfg.caps
+                span.set_attribute("extract.capped", caps is not None)
+                span.set_attribute("extract.message.in", len(actionable))
+                # `extract_events_llm` is synchronous and the slowest stage in
+                # the pipeline (classifier + cross-encoder + N batched LLM
+                # calls). Called directly it blocked this coroutine's event
+                # loop for the whole stage, which froze the Flet UI and meant
+                # Pause/Stop could not be delivered until it returned -- the
+                # UI reported "Stopped" while the run was still going.
+                extraction = await asyncio.to_thread(
+                    extract_events_llm,
+                    actionable, self.cfg.days_back, self.cfg.llm, caps=caps,
+                )
+                summary, events = extraction.summary, extraction.events
+                span.set_attribute("event.count", len(events))
+                self._log(f"Extracted {len(events)} event candidate(s).")
+
+            # ── Match fingerprints → tag each event with _status ────────
+            await self._checkpoint()
+            with self._stage("match") as span:
+                for ev in events:
+                    ev["_status"] = self._status_for(ev)
+                n_new = sum(1 for ev in events if ev["_status"] == "new")
+                n_known = len(events) - n_new
+                span.set_attribute("event.new", n_new)
+                span.set_attribute("event.known", n_known)
+                self._log(
+                    f"Matched against fingerprint store: "
+                    f"{n_new} new, {n_known} previously approved/declined."
+                )
+
+            # Rejects come back with the result, from whichever backend
+            # actually ran. They used to be read off module-level function
+            # attributes, which is why a `backend="local"` run reported the
+            # cloud path's leftovers.
+            rejects = dict(extraction.rejects)
+            for bucket in REJECT_BUCKETS:
+                rejects.setdefault(bucket, [])
+            # Reject counts per stage are the pipeline's actual yield curve;
+            # they were only ever visible in the UI's debug panels.
+            for bucket, items in rejects.items():
+                run_span.set_attribute(f"reject.{bucket}", len(items))
+
+            run_span.set_attribute("pipeline.outcome", "ok")
+            run_span.set_attribute("event.count", len(events))
             return PipelineResult(
                 all_messages=all_messages,
                 actionable=actionable,
-                events=[],
-                summary="",
-                rejects=_empty_rejects(),
+                events=events,
+                summary=summary,
+                rejects=rejects,
                 source_counts=source_counts,
                 links=links,
-                skipped_analysis=True,
             )
-
-        # ── Extract events via LLM ──────────────────────────────────────
-        await self._checkpoint()
-        self._update_stage("extract")
-        caps = None if unlimited_caps else self.cfg.caps
-        summary, events = extract_events_llm(
-            actionable, self.cfg.days_back, self.cfg.llm, caps=caps,
-        )
-        self._log(f"Extracted {len(events)} event candidate(s).")
-
-        # ── Match fingerprints → tag each event with _status ────────────
-        await self._checkpoint()
-        self._update_stage("match")
-        for ev in events:
-            ev["_status"] = self._status_for(ev)
-        n_new = sum(1 for ev in events if ev["_status"] == "new")
-        n_known = len(events) - n_new
-        self._log(
-            f"Matched against fingerprint store: "
-            f"{n_new} new, {n_known} previously approved/declined."
-        )
-
-        # ── Collect rejects from analysis module attributes ─────────────
-        from event_harvester.pipeline.analysis import _extract_events_cloud
-        rejects = dict(getattr(extract_events_llm, "_last_rejects", {}) or {})
-        rejects.setdefault("classifier", [])
-        rejects.setdefault("reranker", [])
-        rejects.setdefault("caps", [])
-        rejects["llm_past"] = list(
-            getattr(_extract_events_cloud, "_last_llm_dropped", []) or []
-        )
-        rejects["llm_no_events"] = list(
-            getattr(_extract_events_cloud, "_last_llm_no_events", []) or []
-        )
-
-        return PipelineResult(
-            all_messages=all_messages,
-            actionable=actionable,
-            events=events,
-            summary=summary,
-            rejects=rejects,
-            source_counts=source_counts,
-            links=links,
-        )
 
     # ── Reporter helpers (no-op when reporter is None) ──────────────────
 
     def _update_stage(self, stage_id: str, label: str | None = None) -> None:
         if self.reporter is not None:
             self.reporter.update_stage(stage_id, label)
+
+    @contextlib.contextmanager
+    def _stage(self, stage_id: str, label: str | None = None):
+        """Enter a pipeline stage: tell the reporter and open a span.
+
+        These were already the same event expressed twice -- the UI got
+        ``_update_stage`` and the trace got nothing. Binding them here means a
+        stage cannot be added to one and forgotten in the other.
+        """
+        self._update_stage(stage_id, label)
+        with tracer.start_as_current_span(f"pipeline.{stage_id}") as span:
+            span.set_attribute("pipeline.stage", stage_id)
+            yield span
 
     def _log(self, line: str) -> None:
         if self.reporter is not None:

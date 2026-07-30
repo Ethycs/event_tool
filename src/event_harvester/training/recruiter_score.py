@@ -7,8 +7,10 @@ from dataclasses import dataclass
 from typing import Optional
 
 from event_harvester.config import LLMConfig
+from event_harvester.observability.tracing import traced
 
 logger = logging.getLogger("event_harvester.training.recruiter_score")
+_TRACER = "event_harvester.training.recruiter_score"
 
 
 @dataclass
@@ -349,6 +351,7 @@ def grade_email(message: dict, body: str = "") -> RecruiterGrade:
     )
 
 
+@traced("training.grade_recruiters", tracer_name=_TRACER)
 def grade_emails_batch(
     messages: list[dict],
     bodies: dict[str, str] | None = None,
@@ -386,6 +389,7 @@ def grade_emails_batch(
     return grades
 
 
+@traced("training.grade_recruiters.llm_refine", tracer_name=_TRACER)
 def _llm_refine_borderline(
     grades: list[RecruiterGrade],
     messages: list[dict],

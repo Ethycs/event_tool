@@ -9,8 +9,10 @@ from telethon.tl.types import InputMessagesFilterPinned as _PinnedFilter
 from telethon.tl.types import Message
 
 from event_harvester.config import TelegramConfig
+from event_harvester.observability.tracing import set_span_attrs, traced
 
 logger = logging.getLogger("event_harvester.telegram")
+_TRACER = "event_harvester.sources.telegram"
 
 
 def _should_include_dialog(
@@ -54,6 +56,7 @@ def _msg_to_dict(
     return d
 
 
+@traced("source.telegram.read", tracer_name=_TRACER)
 async def read_telegram_messages(
     cutoff: datetime,
     cfg: TelegramConfig,
@@ -150,6 +153,7 @@ async def read_telegram_messages(
         "Telegram: %d message(s) (%d pinned) since %s UTC",
         len(messages), n_pinned, cutoff.strftime("%Y-%m-%d %H:%M"),
     )
+    set_span_attrs(**{"message.count": len(messages), "message.pinned": n_pinned})
     return messages
 
 

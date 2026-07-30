@@ -3,6 +3,31 @@
 import json
 from pathlib import Path
 
+# ── Repo-anchored paths ───────────────────────────────────────────────────
+#
+# Every on-disk location the app owns hangs off REPO_ROOT, never off the
+# current working directory. Two classes of bug motivated centralising this:
+#
+# 1. **CWD-relative paths.** `data/...` as a bare relative path resolves
+#    against wherever the process was started. The stdio MCP server is
+#    launched by whatever client spawns it, so it silently used a *different*
+#    fingerprint store and event cache than the CLI — same repo, same config,
+#    two sets of state.
+# 2. **Hand-counted `.parents[N]`.** This file is `src/event_harvester/utils.py`,
+#    so the root is `parents[2]` from here — but modules one level deeper need
+#    `parents[3]`, and the repo has already shipped that off-by-one twice
+#    (the classifier directory, then the message cache, which landed in
+#    `src/data/`). Counting it once here means no other module counts at all.
+#
+# `parents[2]`: utils.py -> event_harvester -> src -> <repo root>.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DATA_DIR = REPO_ROOT / "data"
+
+
+def data_path(*parts: str) -> Path:
+    """A path under the repo's ``data/`` directory, independent of the CWD."""
+    return DATA_DIR.joinpath(*parts)
+
 
 # ── INI parsing ───────────────────────────────────────────────────────────
 

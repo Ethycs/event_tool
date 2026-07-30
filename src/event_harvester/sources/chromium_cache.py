@@ -464,8 +464,14 @@ def read_cached_pages(
                     text = extract_text_from_html(html)
                     if len(text) < min_text_length:
                         continue
-                    # Gzip classifier gate
-                    if gzip_event_score(text) > gzip_threshold:
+                    # Compressibility gate — same check the JSON branch above
+                    # uses (line ~442). This previously read
+                    # `gzip_event_score(text) > gzip_threshold`, neither of
+                    # which is defined anywhere in the module: a guaranteed
+                    # NameError, swallowed by the bare `except Exception:
+                    # continue` below, so *every* HTML page silently failed
+                    # extraction and this path had never once worked.
+                    if gzip_text_check and not is_readable_text(text.encode()):
                         n_gzip_rejected += 1
                         continue
                     seen_urls.add(url)

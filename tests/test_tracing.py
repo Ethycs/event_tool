@@ -143,3 +143,148 @@ def test_module_imports_cleanly():
     assert hasattr(tracing_mod, "init_tracing")
     assert hasattr(tracing_mod, "get_tracer")
     assert hasattr(tracing_mod, "current_span_event")
+    assert hasattr(tracing_mod, "traced")
+    assert hasattr(tracing_mod, "set_span_attrs")
+
+
+# ── @traced ───────────────────────────────────────────────────────────
+#
+# `traced` decorates ~60 functions across the package, including every MCP
+# tool and every L1 web verb, so a defect in it is a defect everywhere. The
+# properties that matter are: it returns what the function returns, it does
+# not swallow exceptions, and it preserves the signature metadata FastMCP
+# introspects to build tool schemas.
+
+
+@pytest.fixture
+def spans():
+    """Capture spans emitted during a test."""
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    tracing_mod.init_tracing(debug=False)
+    exporter = InMemorySpanExporter()
+    trace.get_tracer_provider().add_span_processor(SimpleSpanProcessor(exporter))
+    return exporter
+
+
+class TestTracedDecorator:
+    def test_sync_returns_value_and_emits_span(self, spans):
+        @tracing_mod.traced("t.sync", tracer_name="test.traced")
+        def add(a, b):
+            tracing_mod.set_span_attrs(**{"t.sum": a + b})
+            return a + b
+
+        assert add(2, 3) == 5
+        s = [x for x in spans.get_finished_spans() if x.name == "t.sync"]
+        assert len(s) == 1
+        assert s[0].attributes.get("t.sum") == 5
+
+    async def test_async_is_awaited_not_returned_as_coroutine(self, spans):
+        """The async branch must await the function, not hand back a coroutine."""
+
+        @tracing_mod.traced("t.async", tracer_name="test.traced")
+        async def fetch(x):
+            return x * 2
+
+        assert await fetch(21) == 42
+        assert any(x.name == "t.async" for x in spans.get_finished_spans())
+
+    def test_generator_yields_all_items(self, spans):
+        @tracing_mod.traced("t.gen", tracer_name="test.traced")
+        def counter(n):
+            yield from range(n)
+
+        assert list(counter(4)) == [0, 1, 2, 3]
+        assert any(x.name == "t.gen" for x in spans.get_finished_spans())
+
+    def test_exception_propagates_and_is_recorded(self, spans):
+        """Instrumentation must never change control flow."""
+
+        @tracing_mod.traced("t.boom", tracer_name="test.traced")
+        def boom():
+            raise ValueError("kaboom")
+
+        with pytest.raises(ValueError, match="kaboom"):
+            boom()
+
+        s = [x for x in spans.get_finished_spans() if x.name == "t.boom"]
+        assert len(s) == 1
+        assert s[0].attributes.get("error.message") == "kaboom"
+
+    async def test_async_exception_propagates(self, spans):
+        @tracing_mod.traced("t.aboom", tracer_name="test.traced")
+        async def boom():
+            raise RuntimeError("async kaboom")
+
+        with pytest.raises(RuntimeError, match="async kaboom"):
+            await boom()
+        assert any(x.name == "t.aboom" for x in spans.get_finished_spans())
+
+    def test_static_attributes_are_attached(self, spans):
+        @tracing_mod.traced("t.static", tracer_name="test.traced", **{"t.kind": "demo"})
+        def f():
+            return None
+
+        f()
+        s = [x for x in spans.get_finished_spans() if x.name == "t.static"]
+        assert s[0].attributes.get("t.kind") == "demo"
+
+    def test_signature_metadata_survives(self):
+        """FastMCP builds tool schemas by introspecting the decorated function.
+
+        If `traced` dropped __annotations__ or replaced the signature with
+        (*args, **kwargs), every MCP tool would register with an empty schema
+        and clients would lose all parameter names.
+        """
+        import inspect
+
+        @tracing_mod.traced("t.sig", tracer_name="test.traced")
+        def tool(index: int, dry_run: bool = False) -> dict:
+            """Docstring survives too."""
+            return {}
+
+        assert tool.__name__ == "tool"
+        assert tool.__doc__ == "Docstring survives too."
+        # This module sets `from __future__ import annotations`, so raw
+        # __annotations__ values are strings (PEP 563). Resolve them the way
+        # a schema builder does rather than comparing to the type object.
+        assert inspect.get_annotations(tool, eval_str=True)["index"] is int
+        params = inspect.signature(tool).parameters
+        assert list(params) == ["index", "dry_run"]
+        assert params["dry_run"].default is False
+
+    def test_default_span_name_from_qualname(self, spans):
+        @tracing_mod.traced(tracer_name="test.traced")
+        def some_function():
+            return 1
+
+        some_function()
+        names = [x.name for x in spans.get_finished_spans()]
+        assert any(n.endswith("some_function") for n in names)
+
+    def test_works_when_otel_unavailable(self, monkeypatch):
+        """With no OTel installed the decorator must still be transparent."""
+        monkeypatch.setattr(tracing_mod, "_OTEL_OK", False)
+
+        @tracing_mod.traced("t.noop", tracer_name="test.traced")
+        def f(x):
+            tracing_mod.set_span_attrs(**{"ignored": x})
+            return x + 1
+
+        assert f(1) == 2
+
+    def test_set_span_attrs_skips_none(self, spans):
+        """None-valued attributes are dropped so callers can pass optionals."""
+
+        @tracing_mod.traced("t.none", tracer_name="test.traced")
+        def f():
+            tracing_mod.set_span_attrs(**{"t.present": "yes", "t.absent": None})
+
+        f()
+        s = [x for x in spans.get_finished_spans() if x.name == "t.none"]
+        assert s[0].attributes.get("t.present") == "yes"
+        assert "t.absent" not in s[0].attributes

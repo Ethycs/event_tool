@@ -20,8 +20,10 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 from event_harvester.config import GmailConfig
+from event_harvester.observability.tracing import set_span_attrs, traced
 
 logger = logging.getLogger("event_harvester.gmail")
+_TRACER = "event_harvester.sources.gmail"
 
 # gmail.modify: read + label changes + trash/untrash
 # gmail.compose: send and reply
@@ -141,6 +143,7 @@ def _get_header(headers: list[dict], name: str) -> str:
     return ""
 
 
+@traced("source.gmail.fetch", tracer_name=_TRACER)
 def fetch_messages(cfg: GmailConfig, since: datetime) -> list[dict]:
     """Fetch Gmail messages newer than `since` and return them in standard format.
 
@@ -234,6 +237,7 @@ def fetch_messages(cfg: GmailConfig, since: datetime) -> list[dict]:
         len(messages),
         since.strftime("%Y-%m-%d %H:%M"),
     )
+    set_span_attrs(**{"message.count": len(messages)})
     return messages
 
 

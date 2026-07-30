@@ -1,12 +1,26 @@
 """OpenTelemetry tracing infrastructure (soft-dependency).
 
-Provides ``init_tracing``, ``get_tracer``, and ``current_span_event`` for
-the rest of the codebase. If ``opentelemetry`` isn't importable, every
-public function becomes a no-op so the pipeline still runs.
+Provides ``init_tracing``, ``get_tracer``, ``traced``, ``set_span_attrs``,
+and ``current_span_event`` for the rest of the codebase. If
+``opentelemetry`` isn't importable, every public function becomes a no-op so
+the pipeline still runs.
 
 Idempotency: ``init_tracing`` may be called more than once. The first
 call installs the ``TracerProvider``; later calls only attach new
 exporters that weren't already attached.
+
+**Instrumenting new code**: reach for :func:`traced` rather than opening a
+span by hand. The manual
+``tracer.start_as_current_span(...) / set_attribute / record_exception``
+block is ~8 lines of identical boilerplate per function, and the codebase
+had already drifted into two spellings of it. The decorator handles sync,
+async, and generator functions, and swallows nothing.
+
+**What is instrumented**: every meaningful operation boundary — a stage, an
+I/O call, an LLM request, a page interaction, a CLI or MCP entry point.
+Deliberately *not* per-element helpers called inside tight loops
+(``score_message``, ``_pattern_to_element``); a span per message would cost
+more than it explains and would bury the spans that matter.
 """
 
 from __future__ import annotations
@@ -14,6 +28,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+from typing import Any
 
 logger = logging.getLogger("event_harvester.observability.tracing")
 
@@ -124,6 +139,116 @@ def get_tracer(name: str = "event_harvester"):
         return trace.get_tracer(name)
     except Exception:  # pragma: no cover - defensive
         return _NOOP_TRACER
+
+
+def set_span_attrs(**attrs: Any) -> None:
+    """Set attributes on the current span, if one is recording.
+
+    Lets a function body annotate the span its decorator opened without
+    plumbing the span object through. ``None`` values are skipped so callers
+    can pass optional fields unconditionally.
+    """
+    if not _OTEL_OK:
+        return
+    try:
+        span = trace.get_current_span()
+        if span is None:
+            return
+        is_rec = getattr(span, "is_recording", None)
+        if callable(is_rec) and not is_rec():
+            return
+        for k, v in attrs.items():
+            if v is not None:
+                span.set_attribute(k, v)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug("set_span_attrs failed: %s", e)
+
+
+def traced(
+    name: str | None = None,
+    *,
+    tracer_name: str = "event_harvester",
+    **static_attrs: Any,
+):
+    """Decorator: run the wrapped callable inside a span.
+
+    Handles sync functions, async functions, and generators, so call sites
+    don't have to care which they are. Exceptions are recorded on the span
+    and re-raised — instrumentation must never change control flow.
+
+    ``name`` defaults to ``"<module-tail>.<qualname>"``. Static attributes
+    are attached at entry; use :func:`set_span_attrs` from inside the body
+    for anything computed.
+
+        @traced("llm.chat", tracer_name="event_harvester.llm")
+        def chat_completion(messages, cfg):
+            set_span_attrs(**{"llm.model": cfg.model})
+            ...
+    """
+    import asyncio
+    import functools
+    import inspect
+
+    def decorate(fn):
+        span_name = name or f"{fn.__module__.rsplit('.', 1)[-1]}.{fn.__qualname__}"
+
+        def _enter(tr):
+            cm = tr.start_as_current_span(span_name)
+            return cm
+
+        if asyncio.iscoroutinefunction(fn):
+
+            @functools.wraps(fn)
+            async def async_wrapper(*a, **kw):
+                tr = get_tracer(tracer_name)
+                with _enter(tr) as span:
+                    for k, v in static_attrs.items():
+                        if v is not None:
+                            span.set_attribute(k, v)
+                    try:
+                        return await fn(*a, **kw)
+                    except Exception as e:
+                        span.set_attribute("error.message", str(e))
+                        span.record_exception(e)
+                        raise
+
+            return async_wrapper
+
+        if inspect.isgeneratorfunction(fn):
+
+            @functools.wraps(fn)
+            def gen_wrapper(*a, **kw):
+                tr = get_tracer(tracer_name)
+                with _enter(tr) as span:
+                    for k, v in static_attrs.items():
+                        if v is not None:
+                            span.set_attribute(k, v)
+                    try:
+                        yield from fn(*a, **kw)
+                    except Exception as e:
+                        span.set_attribute("error.message", str(e))
+                        span.record_exception(e)
+                        raise
+
+            return gen_wrapper
+
+        @functools.wraps(fn)
+        def sync_wrapper(*a, **kw):
+            tr = get_tracer(tracer_name)
+            with _enter(tr) as span:
+                for k, v in static_attrs.items():
+                    if v is not None:
+                        span.set_attribute(k, v)
+                try:
+                    return fn(*a, **kw)
+                except Exception as e:
+                    span.set_attribute("error.message", str(e))
+                    span.record_exception(e)
+                    raise
+
+        return sync_wrapper
+
+    return decorate
 
 
 def current_span_event(name: str, attributes: dict | None = None) -> None:

@@ -8,8 +8,10 @@ import logging
 
 from event_harvester.config import LLMConfig
 from event_harvester.llm import chat_completion
+from event_harvester.observability.tracing import traced
 
 logger = logging.getLogger("event_harvester.training.label")
+_TRACER = "event_harvester.training.label"
 
 _LABEL_SYSTEM_PROMPT = """\
 You are classifying messages as EVENT or NOISE.
@@ -53,6 +55,7 @@ def _build_label_prompt(messages: list[dict]) -> str:
     return "\n".join(lines)
 
 
+@traced("training.label_messages", tracer_name=_TRACER)
 def label_messages(
     messages: list[dict],
     cfg: LLMConfig,

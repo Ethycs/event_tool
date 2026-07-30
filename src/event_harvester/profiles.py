@@ -19,7 +19,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from event_harvester.observability.tracing import traced
+
 logger = logging.getLogger("event_harvester.profiles")
+_TRACER = "event_harvester.profiles"
 
 PROFILES_FILE = Path("data/profiles.json")
 
@@ -36,6 +39,7 @@ class Profile:
     caps: dict[str, Any] = field(default_factory=dict)
 
 
+@traced("profiles.load", tracer_name=_TRACER)
 def load_profiles(path: Path | None = None) -> list[Profile]:
     """Load profiles from JSON. Returns [] if the file is missing.
 
@@ -84,6 +88,7 @@ def find_profile(profiles: list[Profile], name: str) -> Profile | None:
     return None
 
 
+@traced("profiles.apply", tracer_name=_TRACER)
 def apply_profile_by_name(cfg, name: str) -> bool:
     """Convenience: load profiles, find by ``name``, apply to ``cfg``.
 

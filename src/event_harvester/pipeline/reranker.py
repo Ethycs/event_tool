@@ -9,7 +9,10 @@ import logging
 import os
 from pathlib import Path
 
+from event_harvester.observability.tracing import set_span_attrs, traced
+
 logger = logging.getLogger("event_harvester.pipeline.reranker")
+_TRACER = "event_harvester.pipeline.reranker"
 
 _EVENT_QUERY = (
     "upcoming event, meetup, hackathon, workshop, conference, party, "
@@ -62,14 +65,27 @@ def _resolve_model_source():
     return _MODEL_ID, False
 
 
+@traced("rerank.model.get", tracer_name=_TRACER)
 def _get_model():
     """Lazy-load the cross-encoder.
 
     Local copy first; HuggingFace only if no local copy exists.
     """
     global _model
+    # Cold start is seconds and can silently become a HuggingFace download;
+    # the span distinguishes "cached" from "loaded from disk" from "went to
+    # the network", which the log lines only tell you if you are watching.
+    if _model is not None:
+        set_span_attrs(**{"rerank.model.cached": True})
+        return _model
+
+    set_span_attrs(**{"rerank.model.cached": False})
     if _model is None:
         source, is_local = _resolve_model_source()
+        set_span_attrs(**{
+            "rerank.model.source": str(source),
+            "rerank.model.is_local": is_local,
+        })
 
         from sentence_transformers import CrossEncoder
 
@@ -81,6 +97,7 @@ def _get_model():
             logger.info("Loading reranker from local model store: %s", source)
             _model = CrossEncoder(source, max_length=512)
             logger.info("Reranker loaded (local).")
+            set_span_attrs(**{"rerank.model.loaded_from": "local"})
             return _model
 
         # No local copy.  Try the HF cache offline first, then the network.
@@ -90,6 +107,7 @@ def _get_model():
         try:
             _model = CrossEncoder(source, max_length=512)
             logger.info("Reranker loaded (HF cache).")
+            set_span_attrs(**{"rerank.model.loaded_from": "hf_cache"})
         except Exception:
             # First run -- need to download, go online.
             os.environ.pop("HF_HUB_OFFLINE", None)
@@ -101,6 +119,7 @@ def _get_model():
             )
             _model = CrossEncoder(source, max_length=512)
             logger.info("Reranker loaded (downloaded).")
+            set_span_attrs(**{"rerank.model.loaded_from": "huggingface_download"})
     return _model
 
 
@@ -113,8 +132,8 @@ def _resolve_message_dates(content, timestamp, today):
     from datetime import datetime
 
     from event_harvester.pipeline.weights import (
-        GATE_DATE_RE,
         _EVENT_LINK_DOMAINS,
+        GATE_DATE_RE,
         _event_proximity_score,
         _resolve_date,
     )
@@ -148,6 +167,20 @@ def _resolve_message_dates(content, timestamp, today):
     return best_proximity, has_future, has_event_link
 
 
+@traced("rerank.cross_encoder.predict", tracer_name=_TRACER)
+def _score_pairs(model, pairs):
+    """Run the cross-encoder. Split out so the GPU work gets its own span.
+
+    This is the single most expensive step in the pipeline that isn't an API
+    call, and it was previously indistinguishable from the filtering around
+    it -- if `rerank.messages` is slow, this span says whether that is model
+    inference or the date-resolution loop.
+    """
+    set_span_attrs(**{"rerank.pair_count": len(pairs)})
+    return model.predict(pairs, batch_size=64, show_progress_bar=True)
+
+
+@traced("rerank.messages", tracer_name=_TRACER)
 def rerank_messages(
     messages: list[dict],
     query: str = _EVENT_QUERY,
@@ -160,11 +193,12 @@ def rerank_messages(
 
     Combined score = semantic (0-10) + date proximity (0-10) + bonuses.
     """
+    set_span_attrs(**{"rerank.message.in": len(messages), "rerank.top_k": top_k})
     if not messages:
         return []
 
-    from datetime import date
     import re
+    from datetime import date
 
     from event_harvester.pipeline.weights import TIME_RE
 
@@ -197,6 +231,14 @@ def rerank_messages(
         "Reranker filter: %d -> %d (dropped %d past, %d no date/link).",
         len(messages), len(candidates), n_past, n_no_signal,
     )
+    # This pre-filter drops more messages than the cross-encoder does, and it
+    # is invisible above the reranker -- a run where everything lands in
+    # `no_signal` looks identical to a quiet week from the outside.
+    set_span_attrs(**{
+        "rerank.candidates": len(candidates),
+        "rerank.dropped_past": n_past,
+        "rerank.dropped_no_signal": n_no_signal,
+    })
 
     if not candidates:
         return []
@@ -205,7 +247,7 @@ def rerank_messages(
     model = _get_model()
     pairs = [[query, m.get("content", "")[:512]] for m in candidates]
     logger.info("Reranker: scoring %d candidates...", len(candidates))
-    semantic_scores = model.predict(pairs, batch_size=64, show_progress_bar=True)
+    semantic_scores = _score_pairs(model, pairs)
 
     # Step 3: Combine scores
     combined = []
@@ -229,10 +271,17 @@ def rerank_messages(
     result = [m for m, _ in combined[:top_k]]
 
     if combined:
+        cutoff = combined[min(top_k - 1, len(combined) - 1)][1]
         logger.info(
             "Reranker: scored %d -> top %d (top: %.1f, cutoff: %.1f)",
             len(combined), min(top_k, len(combined)),
-            combined[0][1], combined[min(top_k - 1, len(combined) - 1)][1],
+            combined[0][1], cutoff,
         )
+        set_span_attrs(**{
+            "rerank.score.top": round(float(combined[0][1]), 2),
+            "rerank.score.cutoff": round(float(cutoff), 2),
+            "rerank.truncated": len(combined) > top_k,
+        })
 
+    set_span_attrs(**{"rerank.message.out": len(result)})
     return result

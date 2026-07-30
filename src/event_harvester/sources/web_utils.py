@@ -135,7 +135,11 @@ def _filter_known_links(event_links: list[dict]) -> list[dict]:
     entries (legacy or otherwise) are ignored — a prior sighting alone
     does NOT count as "known" since the user hasn't acted on it.
     """
-    from event_harvester.pipeline.event_match import _normalize_title, _titles_overlap, load_fingerprints
+    from event_harvester.pipeline.event_match import (
+        _normalize_title,
+        _titles_overlap,
+        load_fingerprints,
+    )
 
     fps = [fp for fp in load_fingerprints() if fp.get("status") in ("approved", "declined")]
     if not fps:

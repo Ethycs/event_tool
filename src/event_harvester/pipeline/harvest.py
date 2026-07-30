@@ -7,8 +7,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from event_harvester.config import AppConfig
-from event_harvester.ui.display import DIM, RESET
 from event_harvester.logging_tags import tag_task
+from event_harvester.observability.tracing import get_tracer
 from event_harvester.sources import (
     fetch_gmail_messages,
     fetch_web_sources,
@@ -16,7 +16,7 @@ from event_harvester.sources import (
     read_signal_messages,
     read_telegram_messages,
 )
-from event_harvester.observability.tracing import get_tracer
+from event_harvester.ui.display import DIM, RESET
 
 logger = logging.getLogger("event_harvester")
 tracer = get_tracer("event_harvester.pipeline.harvest")
@@ -238,7 +238,8 @@ async def harvest_messages(
                                     s.get("name", s["url"]) for s in all_web
                                 )
                                 logger.warning(
-                                    "Web sources %s not found. Available: %s",
+                                    "Web sources %s matched nothing — harvesting no web "
+                                    "sources this run. Available: %s",
                                     filter_names, names,
                                 )
                             else:
@@ -250,7 +251,13 @@ async def harvest_messages(
                                         "Profile lists web sources not in %s: %s",
                                         cfg.web.sources_file, sorted(missing),
                                     )
-                                web_kw["sources"] = matched
+                            # Assign even when empty. Falling through on a
+                            # zero-match filter let `fetch_web_sources` load
+                            # *every* source, which inverted the request:
+                            # the shipped `no-web` profile (`__none__`) and any
+                            # typo'd `--web-source` ran a full web harvest
+                            # instead of none.
+                            web_kw["sources"] = matched
                         msgs = await asyncio.to_thread(fetch_web_sources, **web_kw)
                         span.set_attribute("message.count", len(msgs or []))
                         return msgs

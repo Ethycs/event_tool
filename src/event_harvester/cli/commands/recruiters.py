@@ -81,9 +81,9 @@ def _run_recruiter_grading(all_messages, cfg, args) -> list:
         cfg: AppConfig
         args: argparse Namespace; expected attributes: no_analyze, auto_trash
     """
-    from event_harvester.training.recruiter_score import grade_emails_batch
     from event_harvester.sources import fetch_full_bodies
     from event_harvester.sources import gmail_trash as trash
+    from event_harvester.training.recruiter_score import grade_emails_batch
 
     gmail_msgs = [m for m in all_messages if m["platform"] == "gmail"]
     if not gmail_msgs:

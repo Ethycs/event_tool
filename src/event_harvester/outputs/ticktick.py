@@ -1,17 +1,34 @@
 """TickTick OAuth2 authentication and task creation."""
 
-import json
 import logging
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-from event_harvester.pipeline.analysis import PRIORITY_LABEL
 from event_harvester.config import TickTickConfig
-from event_harvester.ui.display import BOLD, DIM, GREEN, RED, RESET
+from event_harvester.observability.tracing import set_span_attrs, traced
+from event_harvester.pipeline.analysis import PRIORITY_LABEL
 from event_harvester.pipeline.event_match import save_fingerprint
+from event_harvester.ui.display import BOLD, DIM, GREEN, RED, RESET
 
 logger = logging.getLogger("event_harvester.outputs.ticktick")
+_TRACER = "event_harvester.outputs.ticktick"
+
+# ticktick-py's OAuth2 defaults cache_path to '.token-oauth' relative to the
+# CWD, so leaving it unset drops a live access token wherever the process
+# happened to start -- usually the repo root, where `git add -A` can catch it.
+# Pin it under data/ instead. .gitignore covers both paths; the root one is
+# kept as a guard for any token written before this was fixed.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_TOKEN_CACHE = _REPO_ROOT / "data" / ".token-oauth"
+
+
+def _migrate_legacy_token_cache() -> None:
+    """Move a pre-fix repo-root token into data/ so consent isn't re-prompted."""
+    legacy = _REPO_ROOT / ".token-oauth"
+    if legacy.exists() and not _TOKEN_CACHE.exists():
+        _TOKEN_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        legacy.replace(_TOKEN_CACHE)
+        logger.info("TickTick: moved token cache %s -> %s", legacy, _TOKEN_CACHE)
 
 
 def get_ticktick_client(cfg: TickTickConfig):
@@ -27,10 +44,13 @@ def get_ticktick_client(cfg: TickTickConfig):
         return None
 
     try:
+        _migrate_legacy_token_cache()
+        _TOKEN_CACHE.parent.mkdir(parents=True, exist_ok=True)
         auth = OAuth2(
             client_id=cfg.client_id,
             client_secret=cfg.client_secret,
             redirect_uri=cfg.redirect_uri,
+            cache_path=str(_TOKEN_CACHE),
             check_cache=True,
         )
         tt = TickTickClient(cfg.username, cfg.password, auth)
@@ -112,6 +132,7 @@ def update_task_details(tt, task: dict, new_event: dict) -> dict | None:
         return None
 
 
+@traced("ticktick.create_tasks", tracer_name=_TRACER)
 def create_ticktick_tasks(
     tt,
     events: list[dict],
@@ -120,10 +141,24 @@ def create_ticktick_tasks(
 ) -> dict[str, list]:
     """Create/update/skip events in TickTick with dedup.
 
-    Returns {"created": [...], "updated": [...], "skipped": [...]}.
+    Returns ``{"created": [...], "updated": [...], "skipped": [...],
+    "failed": [...]}``.
+
+    ``failed`` exists because per-task exceptions are caught and logged here
+    so one bad event cannot abort the batch — but that left callers unable to
+    tell a successful sync from a failed one. The Flet UI was marking events
+    approved on the strength of this function *returning*, which it does
+    either way.
     """
+    # The only stage that writes to a system outside this machine, so it is
+    # the one where "what actually happened" matters most.
+    set_span_attrs(**{
+        "ticktick.event.in": len(events),
+        "ticktick.dry_run": bool(dry_run),
+        "ticktick.project": project_name or "(default)",
+    })
     if not events:
-        return {"created": [], "updated": [], "skipped": []}
+        return {"created": [], "updated": [], "skipped": [], "failed": []}
 
     # Sync existing tasks for dedup
     existing_tasks = sync_tasks(tt, project_name)
@@ -144,7 +179,12 @@ def create_ticktick_tasks(
         else:
             logger.warning("TickTick project '%s' not found - using Inbox", project_name)
 
-    result = {"created": [], "updated": [], "skipped": [t.get("title", "") for t in to_skip]}
+    result = {
+        "created": [],
+        "updated": [],
+        "skipped": [t.get("title", "") for t in to_skip],
+        "failed": [],
+    }
 
     # Log skips
     for event in to_skip:
@@ -161,7 +201,7 @@ def create_ticktick_tasks(
 
         updated = update_task_details(tt, matched_task, event)
         if updated:
-            save_fingerprint(event, matched_task.get("id"))
+            save_fingerprint(event, matched_task.get("id"), status="approved")
             print(f"  {GREEN}~{RESET} {BOLD}{title}{RESET} {DIM}(merged new details){RESET}")
             result["updated"].append(title)
         else:
@@ -169,7 +209,6 @@ def create_ticktick_tasks(
             result["skipped"].append(title)
 
     # Handle creates
-    now = datetime.now(timezone.utc)
     for event in to_create:
         title = event.get("title", "Untitled")[:80]
         notes = event.get("notes", "")
@@ -204,10 +243,27 @@ def create_ticktick_tasks(
                 dueDate=due_date,
             )
             created_task = tt.task.create(task_obj)
-            save_fingerprint(event, created_task.get("id") if isinstance(created_task, dict) else None)
+            # status="approved", not the "auto" default. Creating a TickTick
+            # task *is* the approval — but `find_acted_fingerprint` only
+            # honours "approved"/"declined", so an "auto" entry meant every
+            # CLI-synced event came back tagged `new` in the next MCP or Flet
+            # run and was offered for approval again.
+            save_fingerprint(
+                event,
+                created_task.get("id") if isinstance(created_task, dict) else None,
+                status="approved",
+            )
             result["created"].append(title)
             print(f"  {GREEN}+{RESET} {BOLD}{title}{RESET} {DIM}({prio_label}){RESET}")
         except Exception as e:
+            result["failed"].append(title)
+            logger.warning("TickTick: failed to create %r: %s", title, e)
             print(f"  {RED}x Failed to create '{title}': {e}{RESET}")
 
+    set_span_attrs(**{
+        "ticktick.created": len(result["created"]),
+        "ticktick.updated": len(result["updated"]),
+        "ticktick.skipped": len(result["skipped"]),
+        "ticktick.failed": len(result["failed"]),
+    })
     return result

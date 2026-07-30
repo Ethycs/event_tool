@@ -13,9 +13,10 @@ Pinning them together here so a third instance fails loudly.
 
 from pathlib import Path
 
-from event_harvester.pipeline.harvest import CACHE_FILE, _DATA_DIR as HARVEST_DATA_DIR
-from event_harvester.sources.web_utils import _DATA_DIR as WEB_UTILS_DATA_DIR
+from event_harvester.pipeline.harvest import _DATA_DIR as HARVEST_DATA_DIR
+from event_harvester.pipeline.harvest import CACHE_FILE
 from event_harvester.sources.web_session import _DATA_DIR as WEB_SESSION_DATA_DIR
+from event_harvester.sources.web_utils import _DATA_DIR as WEB_UTILS_DATA_DIR
 
 
 def _repo_root() -> Path:

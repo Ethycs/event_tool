@@ -35,7 +35,6 @@ def _do_chat(uc, src: dict, tracer=None, capture=None) -> list[dict]:
 
 def _do_chat_inner(uc, src: dict, tracer=None, capture=None) -> list[dict]:
     """Chat mode: query an AI chatbot and extract events from its response."""
-    from urllib.parse import urlparse
 
     url = src["url"]
     query = src.get("query", "What events are happening this week? List each with date, time, location, and link.")
@@ -61,7 +60,6 @@ def _do_chat_inner(uc, src: dict, tracer=None, capture=None) -> list[dict]:
         return []
 
     logger.info("%s: got %d chars response", name, len(response))
-    domain = urlparse(url).netloc
 
     return [{
         "platform": "web",

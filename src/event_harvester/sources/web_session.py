@@ -15,9 +15,10 @@ from typing import Optional
 # Re-export the cookie helpers from their new home so legacy imports keep
 # working without a hard break. Prefer importing directly from
 # uc_browser.chrome_cookies in new code.
-from uc_browser.chrome_cookies import cookies_to_playwright, get_chrome_cookies
+from event_harvester.observability.tracing import traced
 
 logger = logging.getLogger("event_harvester.web_session")
+_TRACER = "event_harvester.sources.web_session"
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 _DATA_DIR = _REPO_ROOT / "data"
@@ -42,6 +43,7 @@ def extension_args() -> list[str]:
 # ── UC Detection Helpers ─────────────────────────────────────────────
 
 
+@traced("web.wait_for_uc", tracer_name=_TRACER)
 def wait_for_uc(page, timeout_ms: int = 5000) -> Optional[dict]:
     """Wait for UC extension, run detection, return window.__UC or None."""
     try:
@@ -79,6 +81,7 @@ def apply_uc_patterns(page, uc: dict) -> None:
 # ── Interactive Login ────────────────────────────────────────────────
 
 
+@traced("web.login", tracer_name=_TRACER)
 def web_login(urls: list[str] | None = None) -> None:
     """Open real Chrome for manual login with full password manager access.
 

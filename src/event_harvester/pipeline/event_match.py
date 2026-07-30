@@ -7,13 +7,19 @@ and maintains a fingerprint store for cross-run dedup.
 import logging
 import string
 from datetime import date
-from pathlib import Path
 
-from event_harvester.utils import load_json, save_json
+from event_harvester.observability.tracing import set_span_attrs, traced
+from event_harvester.utils import data_path, load_json, save_json
 
 logger = logging.getLogger("event_harvester.pipeline.event_match")
+_TRACER = "event_harvester.pipeline.event_match"
 
-FINGERPRINT_FILE = Path("data/.event_fingerprints.json")
+
+# Repo-anchored, not CWD-relative. As a bare `data/...` path this resolved
+# against whatever directory the process started in — so the stdio MCP
+# server (launched by its client, from anywhere) read and wrote a different
+# fingerprint store than the CLI, and each was invisible to the other.
+FINGERPRINT_FILE = data_path(".event_fingerprints.json")
 
 _STOP_WORDS = frozenset({"the", "a", "an", "at", "in", "on", "for", "and", "of", "to"})
 
@@ -46,6 +52,7 @@ def _normalize_date(date_val) -> str | None:
 
     try:
         from datetime import datetime
+
         from dateutil import parser as dateutil_parser
 
         d_low = dateutil_parser.parse(s, fuzzy=True, default=datetime(1900, 1, 1))
@@ -161,6 +168,7 @@ def events_match(a: dict, b: dict) -> tuple[bool, int]:
 # --------------- Fingerprint store ---------------
 
 
+@traced("fingerprint.load", tracer_name=_TRACER)
 def load_fingerprints() -> list[dict]:
     """Load fingerprints from JSON, auto-prune expired entries.
 
@@ -205,9 +213,18 @@ def load_fingerprints() -> list[dict]:
 
         pruned.append(fp)
 
+    # Pruning is silent and destructive-looking from the outside: an event the
+    # user declined last month stops being suppressed once its fingerprint
+    # ages out. The counts make that legible.
+    set_span_attrs(**{
+        "fingerprint.loaded": len(data),
+        "fingerprint.kept": len(pruned),
+        "fingerprint.pruned": len(data) - len(pruned),
+    })
     return pruned
 
 
+@traced("fingerprint.save", tracer_name=_TRACER)
 def save_fingerprint(
     event: dict,
     ticktick_id: str | None = None,
@@ -283,12 +300,14 @@ def find_acted_fingerprint(event: dict) -> dict | None:
     return None
 
 
+@traced("dedup.within_run", tracer_name=_TRACER)
 def dedup_events(events: list[dict]) -> list[dict]:
     """Within-run dedup using events_match. Returns unique events.
 
     Uses a link index for O(1) exact-link dedup and caches signatures
     to avoid recomputing them in the fuzzy-match inner loop.
     """
+    set_span_attrs(**{"dedup.event.in": len(events)})
     unique: list[dict] = []
     unique_sigs: list[dict] = []
     seen_links: set[str] = set()
@@ -315,6 +334,10 @@ def dedup_events(events: list[dict]) -> list[dict]:
             if link:
                 seen_links.add(link)
 
+    set_span_attrs(**{
+        "dedup.event.out": len(unique),
+        "dedup.collapsed": len(events) - len(unique),
+    })
     return unique
 
 

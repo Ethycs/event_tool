@@ -12,9 +12,11 @@ import os
 import re
 from pathlib import Path
 
+from event_harvester.observability.tracing import set_span_attrs, traced
 from event_harvester.pipeline.weights import SCHEDULING_KEYWORDS
 
 logger = logging.getLogger("event_harvester.pipeline.classifier")
+_TRACER = "event_harvester.pipeline.classifier"
 
 def _find_classifiers_dir() -> Path:
     """Locate the ``classifiers/`` directory holding the trained .pkl models.
@@ -203,9 +205,9 @@ def train(
 
 def _train_one(messages, labels, feature_fn, model_path):
     """Train and save a single classifier."""
+    import joblib
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.metrics import classification_report
-    import joblib
 
     X, feature_names = _features_to_array(messages, feature_fn)
     if not X:
@@ -272,6 +274,7 @@ def _load_model(path) -> dict:
     return _model_cache[key]
 
 
+@traced("classifier.predict", tracer_name=_TRACER)
 def predict(
     messages: list[dict],
     model_path: str | None = None,
@@ -282,6 +285,11 @@ def predict(
     Uses predict_proba with a low threshold to favor recall — better to
     let some noise through than miss real action items.
     """
+    set_span_attrs(**{
+        "classifier.message.count": len(messages),
+        "classifier.threshold": threshold,
+        "classifier.explicit_model": bool(model_path),
+    })
     if model_path:
         data = _load_model(model_path)
         clf, feature_names = data["model"], data["feature_names"]
@@ -336,6 +344,7 @@ def has_trained_models() -> bool:
     )
 
 
+@traced("classifier.filter_actionable", tracer_name=_TRACER)
 def filter_actionable(messages: list[dict]) -> list[dict]:
     """Filter messages to only actionable ones using trained classifier(s).
 
@@ -344,11 +353,25 @@ def filter_actionable(messages: list[dict]) -> list[dict]:
     from targeted sources, already filtered by DOM extraction, fingerprint
     dedup, and dead-page detection before reaching this point.
     """
+    set_span_attrs(**{"classifier.message.in": len(messages)})
     has_email = EMAIL_MODEL_PATH.exists()
     has_chat = CHAT_MODEL_PATH.exists()
     has_legacy = _LEGACY_MODEL_PATH.exists()
 
+    set_span_attrs(**{
+        "classifier.model.email": has_email,
+        "classifier.model.chat": has_chat,
+        "classifier.model.legacy": has_legacy,
+    })
+
     if not has_email and not has_chat and not has_legacy:
+        # A no-model run passes everything through, which downstream reads as
+        # "the classifier approved all of these". Mark it on the span so an
+        # unexpectedly permissive run is diagnosable.
+        set_span_attrs(**{
+            "classifier.bypassed": True,
+            "classifier.message.out": len(messages),
+        })
         logger.warning(
             "No classifier models found — returning all %d messages unfiltered. "
             "Run with --train-classifier to train.",
@@ -372,6 +395,12 @@ def filter_actionable(messages: list[dict]) -> list[dict]:
     actionable.extend(web_msgs)
 
     n_filtered = len(to_classify) - (len(actionable) - len(web_msgs))
+    set_span_attrs(**{
+        "classifier.bypassed": False,
+        "classifier.message.out": len(actionable),
+        "classifier.message.filtered": n_filtered,
+        "classifier.web_passthrough": len(web_msgs),
+    })
     logger.info(
         "Classifier: %d / %d actionable (filtered %d noise, %d web passthrough).",
         len(actionable), len(messages), n_filtered, len(web_msgs),

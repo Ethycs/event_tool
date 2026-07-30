@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import shutil
 import subprocess
 import sys
@@ -23,6 +24,14 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+logger = logging.getLogger("event_harvester.interlock")
+
+# Ceiling on how long to wait for any single worker reply before treating the
+# worker as wedged. Deliberately generous: first-run NPU compilation can take
+# minutes, and a false positive here kills a healthy session. The point is to
+# convert "hangs forever" into "fails after a bounded wait", not to be tight.
+DEFAULT_IO_TIMEOUT_S = 600.0
 
 __all__ = ["RyzenSession", "InterlockError"]
 
@@ -76,12 +85,16 @@ class RyzenSession:
         cache_dir: Path | str = "agent/cache",
         cache_key: str | None = None,
         tokenizer_path: Path | str | None = None,
+        io_timeout_s: float = DEFAULT_IO_TIMEOUT_S,
     ) -> None:
         self.model_path = Path(model_path).resolve()
         self.device = device
         self.cache_dir = Path(cache_dir).resolve()
         self.cache_key = cache_key
         self.tokenizer_path = str(Path(tokenizer_path).resolve()) if tokenizer_path else None
+        # 0 or None disables the timeout and restores the old block-forever
+        # behaviour, for anyone debugging a worker under a breakpoint.
+        self.io_timeout_s = io_timeout_s
 
         self._proc: subprocess.Popen[str] | None = None
         self._io_dir: Path | None = None
@@ -230,6 +243,22 @@ class RyzenSession:
 
     # -- internal helpers -----------------------------------------------------
 
+    def _kill_wedged_worker(self) -> None:
+        """Terminate an unresponsive worker; escalate to kill if it ignores us."""
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                logger.warning("Local worker ignored terminate(); killing.")
+                proc.kill()
+                proc.wait(timeout=5)
+        except Exception as exc:  # pragma: no cover - OS-dependent
+            logger.warning("Failed to kill wedged local worker: %s", exc)
+
     def _send(self, obj: dict[str, Any]) -> None:
         assert self._proc is not None and self._proc.stdin is not None
         try:
@@ -239,9 +268,64 @@ class RyzenSession:
         except BrokenPipeError as exc:
             raise InterlockError("Worker process died unexpectedly.") from exc
 
-    def _recv(self) -> dict[str, Any]:
+    def _recv(self, timeout_s: float | None = None) -> dict[str, Any]:
+        """Read one JSON line from the worker.
+
+        ``readline()`` on a pipe blocks forever, and the only failure this
+        used to recover from was a *clean* worker exit (which closes stdout
+        and returns ""). A worker that is alive but wedged — hung on NPU
+        init, stuck in a generate loop, deadlocked — would hang
+        ``chat_completion(backend="local")`` indefinitely, with no timeout
+        anywhere above it to break the wait.
+
+        The read runs on an explicit **daemon** thread. That detail is
+        load-bearing: `ThreadPoolExecutor` threads are non-daemon and are
+        joined by an `atexit` hook, so abandoning a blocked `readline` on a
+        pool thread hangs interpreter shutdown instead of the call — trading
+        one hang for a worse one. A daemon thread is simply dropped.
+
+        On timeout the worker is killed, because a session whose response we
+        abandoned is desynchronised: the next ``_recv`` would read *this*
+        call's reply.
+        """
         assert self._proc is not None and self._proc.stdout is not None
-        line = self._proc.stdout.readline()
+
+        if timeout_s is None:
+            timeout_s = self.io_timeout_s
+
+        if timeout_s and timeout_s > 0:
+            import threading
+
+            box: dict[str, Any] = {}
+
+            def _read() -> None:
+                try:
+                    box["line"] = self._proc.stdout.readline()  # type: ignore[union-attr]
+                except Exception as exc:  # pragma: no cover - pipe torn down
+                    box["error"] = exc
+
+            t = threading.Thread(target=_read, name="ryzen-recv", daemon=True)
+            t.start()
+            t.join(timeout_s)
+
+            if t.is_alive():
+                logger.error(
+                    "Local worker did not respond within %.0fs; killing it.",
+                    timeout_s,
+                )
+                self._kill_wedged_worker()
+                raise InterlockError(
+                    f"Worker process timed out after {timeout_s:.0f}s "
+                    f"(alive but unresponsive); killed."
+                )
+            if "error" in box:
+                raise InterlockError(
+                    f"Reading from worker failed: {box['error']}"
+                ) from box["error"]
+            line = box.get("line", "")
+        else:
+            line = self._proc.stdout.readline()
+
         if not line:
             raise InterlockError(
                 "Worker process closed stdout (crashed or exited prematurely)."

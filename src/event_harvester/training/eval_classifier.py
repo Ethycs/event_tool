@@ -5,6 +5,7 @@ import logging
 import random
 from pathlib import Path
 
+from event_harvester.observability.tracing import traced
 from event_harvester.pipeline.analysis import prioritize
 from event_harvester.pipeline.classifier import (
     filter_actionable as classifier_filter,
@@ -13,15 +14,17 @@ from event_harvester.pipeline.classifier import (
     has_trained_models,
     predict,
 )
-from event_harvester.ui.display import DIM, RED, RESET
-from event_harvester.sources import filter_read_sent as gmail_filter
 from event_harvester.pipeline.weights import extract_events, prefilter_events
+from event_harvester.sources import filter_read_sent as gmail_filter
+from event_harvester.ui.display import DIM, RED, RESET
 
 logger = logging.getLogger("event_harvester")
+_TRACER = "event_harvester.training.eval"
 
 W = 64
 
 
+@traced("training.eval", tracer_name=_TRACER)
 def run_eval(
     load_labels: str,
     *,
@@ -273,4 +276,7 @@ def _save_eval_samples(
 
     print(f"\nReview files in {eval_dir}/")
     print("Set 'manual_label' to 1 (actionable) or 0 (noise) for each message.")
-    print("Then retrain: pixi run event-harvester --load-labels <corrected-file>\n")
+    print(
+        "Then retrain: pixi run event-harvester classifier train "
+        "--in-labels <corrected-file>\n"
+    )

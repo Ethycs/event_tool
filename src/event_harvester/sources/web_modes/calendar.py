@@ -13,6 +13,7 @@ import logging
 import re
 from datetime import datetime, timezone
 
+from event_harvester.observability.tracing import get_tracer
 from event_harvester.sources.web_utils import (
     DEFAULT_SCROLL_SECONDS,
     _extract_event_links,
@@ -23,7 +24,6 @@ from event_harvester.sources.web_utils import (
     _scroll_for_seconds,
     _wait_cloudflare,
 )
-from event_harvester.observability.tracing import get_tracer
 
 logger = logging.getLogger("event_harvester.web_fetch")
 

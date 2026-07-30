@@ -5,20 +5,23 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from event_harvester.config import AppConfig
-from event_harvester.ui.display import BOLD, DIM, RESET, print_message
+from event_harvester.observability.tracing import traced
 from event_harvester.sources import (
     create_persistent_client,
     find_discord_cache,
     read_discord_messages,
     read_telegram_messages,
 )
+from event_harvester.ui.display import BOLD, DIM, RESET, print_message
 
 logger = logging.getLogger("event_harvester.watch")
+_TRACER = "event_harvester.watch"
 
 # Cap the seen set to prevent unbounded memory growth
 _MAX_SEEN_IDS = 50_000
 
 
+@traced("watch.loop", tracer_name=_TRACER)
 async def watch_mode(
     cfg: AppConfig,
     interval: int,

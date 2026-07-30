@@ -16,20 +16,26 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 from event_harvester import __version__
 from event_harvester.cli.parse_helpers import VALID_PLATFORMS, resolve_platforms
 from event_harvester.config import AppConfig, load_config
-from event_harvester.pipeline.event_match import find_acted_fingerprint, save_fingerprint
-from event_harvester.pipeline import Pipeline
+from event_harvester.observability.tracing import traced
 from event_harvester.outputs.report import generate_report
+from event_harvester.pipeline import Pipeline
+from event_harvester.pipeline.event_match import find_acted_fingerprint, save_fingerprint
+from event_harvester.utils import DATA_DIR as _DATA_DIR
 from event_harvester.utils import load_json, save_json
 
 logger = logging.getLogger("event_harvester.mcp")
+_TRACER = "event_harvester.servers.mcp_server"
 
-DATA_DIR = Path("data")
+# Repo-anchored, not CWD-relative. This server is normally spawned over stdio
+# by an MCP client, which sets the working directory — so a bare `data/` path
+# meant the cached events lived wherever the client happened to start us, and
+# `approve_event` could act on a different cache than `harvest_events` wrote.
+DATA_DIR = _DATA_DIR
 LATEST_EVENTS_FILE = DATA_DIR / ".mcp_events.json"
 
 
@@ -344,6 +350,7 @@ def build_server(
         name="config",
         mime_type="application/json",
     )
+    @traced("mcp.resource.config_resource", tracer_name=_TRACER)
     def config_resource() -> str:
         """Current Event Harvester configuration summary."""
         return json.dumps(_summarize_config(load_config()), indent=2)
@@ -353,16 +360,19 @@ def build_server(
         name="latest-events",
         mime_type="application/json",
     )
+    @traced("mcp.resource.latest_events_resource", tracer_name=_TRACER)
     def latest_events_resource() -> str:
         """Latest MCP harvest result cached on disk."""
         return json.dumps(_load_latest_events(), indent=2)
 
     @server.tool()
+    @traced("mcp.tool.config_summary", tracer_name=_TRACER)
     def config_summary() -> dict[str, Any]:
         """Return enabled sources, caps, and credential readiness."""
         return _summarize_config(load_config())
 
     @server.tool()
+    @traced("mcp.tool.harvest_events", tracer_name=_TRACER)
     async def harvest_events(
         days: int | None = None,
         only: str | None = None,
@@ -406,6 +416,7 @@ def build_server(
         )
 
     @server.tool()
+    @traced("mcp.tool.list_latest_events", tracer_name=_TRACER)
     def list_latest_events(status: str = "all") -> dict[str, Any]:
         """List events from the latest MCP harvest cache."""
         wanted = status.strip().lower()
@@ -425,6 +436,7 @@ def build_server(
         }
 
     @server.tool()
+    @traced("mcp.tool.approve_event", tracer_name=_TRACER)
     def approve_event(index: int, dry_run: bool = False) -> dict[str, Any]:
         """Approve an event from the latest harvest and sync it to TickTick."""
         try:
@@ -473,6 +485,7 @@ def build_server(
         return {"ok": True, "event": _public_event(event, index), "ticktick": result}
 
     @server.tool()
+    @traced("mcp.tool.decline_event", tracer_name=_TRACER)
     def decline_event(index: int) -> dict[str, Any]:
         """Decline an event from the latest harvest and save its fingerprint."""
         try:
@@ -484,6 +497,7 @@ def build_server(
         return {"ok": True, "event": _public_event(event, index)}
 
     @server.tool()
+    @traced("mcp.tool.generate_latest_report", tracer_name=_TRACER)
     def generate_latest_report(output_path: str = "events_report.md") -> dict[str, Any]:
         """Generate a Markdown report from the latest MCP harvest cache."""
         data = _load_latest_events()

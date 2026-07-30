@@ -12,7 +12,7 @@ import pytest
 
 from event_harvester.config import AppConfig
 from event_harvester.pipeline import Pipeline, PipelineResult
-
+from event_harvester.pipeline.analysis import ExtractionResult
 
 # ── helpers ──────────────────────────────────────────────────────────
 
@@ -70,13 +70,13 @@ def patch_pipeline_deps(monkeypatch):
         "filter_drops": 0,        # how many from messages to drop in filter_read_sent
         "events": [],             # what extract_events_llm returns
         "summary": "fake summary",
-        "rejects": {              # set as extract_events_llm._last_rejects after call
+        "rejects": {              # pre-LLM buckets on the returned ExtractionResult
             "classifier": [],
             "reranker": [],
             "caps": [],
         },
-        "llm_dropped": [],        # _extract_events_cloud._last_llm_dropped
-        "llm_no_events": [],      # _extract_events_cloud._last_llm_no_events
+        "llm_dropped": [],        # -> rejects["llm_past"]
+        "llm_no_events": [],      # -> rejects["llm_no_events"]
         "fingerprints": {},       # event-id -> {"status": "..."} (None = no fp)
         "last_caps_arg": "UNSET", # what was passed to extract_events_llm
         "last_harvest_kwargs": None,
@@ -94,8 +94,10 @@ def patch_pipeline_deps(monkeypatch):
 
     def fake_extract(messages, days_back, llm_cfg, caps=None):
         state["last_caps_arg"] = caps
-        fake_extract._last_rejects = dict(state["rejects"])
-        return state["summary"], list(state["events"])
+        rejects = dict(state["rejects"])
+        rejects["llm_past"] = list(state["llm_dropped"])
+        rejects["llm_no_events"] = list(state["llm_no_events"])
+        return ExtractionResult(state["summary"], list(state["events"]), rejects)
 
     def fake_save(messages, path):
         state["save_messages_calls"].append((len(messages), path))
@@ -112,7 +114,6 @@ def patch_pipeline_deps(monkeypatch):
     # only re-exports symbols; the import bindings the runtime reads
     # are in the orchestrator module).
     import event_harvester.pipeline.orchestrator as pl_mod
-    import event_harvester.pipeline.analysis as analysis_mod
 
     monkeypatch.setattr(pl_mod, "harvest_messages", fake_harvest)
     monkeypatch.setattr(pl_mod, "save_messages", fake_save)
@@ -121,20 +122,9 @@ def patch_pipeline_deps(monkeypatch):
     monkeypatch.setattr(pl_mod, "extract_links", fake_extract_links)
     monkeypatch.setattr(pl_mod, "find_acted_fingerprint", fake_find_fp)
 
-    # _extract_events_cloud is read via getattr inside Pipeline.run from
-    # the analysis module, so patch the attributes there too.
-    fake_cloud = type("FakeCloud", (), {
-        "_last_llm_dropped": state["llm_dropped"],
-        "_last_llm_no_events": state["llm_no_events"],
-    })
-    monkeypatch.setattr(analysis_mod, "_extract_events_cloud", fake_cloud)
-
-    # And our fake_extract needs to keep state-> object in sync when run.
-    def _sync_attrs():
-        fake_cloud._last_llm_dropped = state["llm_dropped"]
-        fake_cloud._last_llm_no_events = state["llm_no_events"]
-    state["_sync_cloud"] = _sync_attrs
-
+    # No `_extract_events_cloud` patching any more: the LLM reject buckets
+    # now ride back on the ExtractionResult rather than being read off that
+    # function object, so there is nothing module-level left to fake.
     return state
 
 
@@ -202,7 +192,6 @@ async def test_run_full_pipeline_tags_status_and_collects_rejects(patch_pipeline
     }
     state["llm_dropped"] = [{"title": "Past event"}]
     state["llm_no_events"] = [{"author": "bot"}]
-    state["_sync_cloud"]()  # propagate llm_dropped/no_events into FakeCloud
 
     result = await Pipeline(AppConfig()).run(no_kwargs=_no_kwargs())
 

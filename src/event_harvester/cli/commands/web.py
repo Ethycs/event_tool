@@ -1,25 +1,32 @@
-"""Web command — manage web sources (list/add/test/login)."""
+"""Web command — manage web sources (list/add/test/probe/login)."""
 
 import logging
 
-from event_harvester.ui.display import BOLD, DIM, GREEN, RED, RESET
+from event_harvester.observability.tracing import get_tracer
+from event_harvester.ui.display import BOLD, DIM, GREEN, RED, RESET, YELLOW
 
 logger = logging.getLogger("event_harvester")
+tracer = get_tracer("event_harvester.cli.commands.web")
 
 
 async def web_cmd(args, cfg) -> int:
     """Dispatch to the appropriate web subcommand."""
     sub = args.web_command
-    if sub == "list":
-        return _web_list(args, cfg)
-    if sub == "add":
-        return _web_add(args, cfg)
-    if sub == "test":
-        return _web_test(args, cfg)
-    if sub == "login":
-        return _web_login(args, cfg)
-    logger.error("Unknown web subcommand: %s", sub)
-    return 1
+    with tracer.start_as_current_span(f"cli.web.{sub}") as span:
+        span.set_attribute("cli.subcommand", sub)
+        if sub == "list":
+            return _web_list(args, cfg)
+        if sub == "add":
+            return _web_add(args, cfg)
+        if sub == "test":
+            return _web_test(args, cfg)
+        if sub == "probe":
+            return _web_probe(args, cfg)
+        if sub == "login":
+            return _web_login(args, cfg)
+        span.set_attribute("error.message", f"unknown subcommand {sub}")
+        logger.error("Unknown web subcommand: %s", sub)
+        return 1
 
 
 # ── Subcommand handlers ──────────────────────────────────────────────
@@ -60,16 +67,171 @@ def _web_list(args, cfg) -> int:
 
 
 def _web_test(args, cfg) -> int:
-    """Run diagnostics on a URL without saving."""
+    """Run diagnostics on a URL without saving.
+
+    Tries the browser-free feed probe first: if the site publishes iCalendar,
+    that is the answer and spinning up Playwright to confirm it would only
+    cost a few seconds to reach a worse recommendation.
+    """
+    if not getattr(args, "no_probe", False):
+        feed = _probe_and_report(args.url)
+        if feed:
+            print(f"\n  {GREEN}Recommended mode: ics{RESET} — use {BOLD}{feed.url}{RESET}\n")
+            print(f"  {DIM}Re-run with --no-probe to force browser diagnostics.{RESET}\n")
+            return 0
+
     _run_url_diagnostics(args.url)
     return 0
 
 
 def _web_add(args, cfg) -> int:
-    """Run diagnostics and add the URL to data/web_sources.json."""
+    """Run diagnostics and add the URL to data/web_sources.json.
+
+    A discovered feed replaces the URL being added — adding
+    ``https://example.com`` when the events live at
+    ``https://example.com/events/?ical=1`` should store the feed, not the
+    homepage that merely links to it.
+    """
+    if not args.mode and not getattr(args, "no_probe", False):
+        feed = _probe_and_report(args.url)
+        if feed:
+            _add_source_to_config(feed.url, "ics", source_page=args.url)
+            return 0
+
     detected_mode = _run_url_diagnostics(args.url)
     mode = args.mode or detected_mode
     _add_source_to_config(args.url, mode)
+    return 0
+
+
+def _probe_and_report(url: str, *, timeout_s: int = 10):
+    """Run the feed probe and print what it found. Returns the best candidate or None."""
+    from event_harvester.sources.feed_probe import probe_feeds
+
+    print(f"  {DIM}Probing for a calendar feed (no browser)...{RESET}")
+    found = probe_feeds(url, timeout_s=timeout_s)
+    if not found:
+        print(f"  {DIM}No iCalendar feed found — falling back to the browser.{RESET}\n")
+        return None
+
+    best = found[0]
+    plat = f" via {best.platform}" if best.platform else ""
+    print(
+        f"  {GREEN}{BOLD}Feed found{RESET} ({best.origin}{plat}): {best.url}\n"
+        f"    {best.events} event(s), {best.future_events} upcoming"
+    )
+    for extra in found[1:4]:
+        print(f"    {DIM}also: {extra.url} ({extra.future_events} upcoming){RESET}")
+    return best
+
+
+def _web_probe(args, cfg) -> int:
+    """Probe URLs — or every configured non-ICS source — for calendar feeds.
+
+    This is the bulk path. ``web add`` handles one site at a time; this
+    answers "which of the venues I already have could stop using a browser?"
+    and, with ``--apply``, rewrites them in place.
+    """
+    from event_harvester.sources.feed_probe import probe_feeds
+
+    urls: list[str]
+    sources_by_url: dict[str, dict] = {}
+
+    if getattr(args, "urls", None):
+        urls = list(args.urls)
+    else:
+        from event_harvester.sources.web_fetch import _load_web_sources
+
+        sources = _load_web_sources()
+        sources_by_url = {s["url"]: s for s in sources}
+        urls = [s["url"] for s in sources if s.get("mode") != "ics"]
+        if not urls:
+            print(f"{DIM}No non-ICS sources configured to probe.{RESET}")
+            return 0
+        print(f"\n{BOLD}Probing {len(urls)} configured source(s) for calendar feeds{RESET}")
+        print(f"{DIM}Sources already in ics mode are skipped.{RESET}\n")
+
+    hits: list[tuple[str, object]] = []
+    with tracer.start_as_current_span("cli.web.probe.batch") as span:
+        span.set_attribute("probe.url_count", len(urls))
+        for url in urls:
+            src = sources_by_url.get(url, {})
+            label = src.get("name") or url
+            mode = src.get("mode")
+            prefix = f"  {BOLD}{label:18}{RESET}" + (f" {DIM}({mode}){RESET}" if mode else "")
+            found = probe_feeds(url, timeout_s=getattr(args, "timeout", 10) or 10)
+            if found:
+                best = found[0]
+                plat = f", {best.platform}" if best.platform else ""
+                print(
+                    f"{prefix}  {GREEN}FEED{RESET}  {best.url}\n"
+                    f"    {DIM}{best.future_events} upcoming of {best.events}"
+                    f" ({best.origin}{plat}){RESET}"
+                )
+                hits.append((url, best))
+            else:
+                print(f"{prefix}  {DIM}none{RESET}")
+        span.set_attribute("probe.hit_count", len(hits))
+
+    print(f"\n{BOLD}{len(hits)}/{len(urls)}{RESET} source(s) have a usable feed.")
+
+    if not hits:
+        return 0
+    if not getattr(args, "apply", False):
+        print(f"{DIM}Re-run with --apply to switch these to ics mode.{RESET}\n")
+        return 0
+    if not sources_by_url:
+        print(f"{YELLOW}--apply only works when probing configured sources "
+              f"(omit the URL arguments).{RESET}\n")
+        return 0
+
+    return _apply_feed_hits(hits, sources_by_url)
+
+
+def _apply_feed_hits(hits, sources_by_url: dict[str, dict]) -> int:
+    """Rewrite probed sources to ics mode, preserving name/category/cooldown."""
+    from event_harvester.sources.web_fetch import _WEB_SOURCES_FILE, _load_web_sources
+    from event_harvester.utils import save_json
+
+    sources = _load_web_sources()
+    by_url = {s["url"]: s for s in sources}
+    changed = 0
+    skipped = 0
+
+    with tracer.start_as_current_span("cli.web.probe.apply") as span:
+        for old_url, best in hits:
+            src = by_url.get(old_url)
+            if src is None:
+                continue
+            # A feed with nothing upcoming is not evidence the feed works —
+            # it is equally consistent with a stale export nobody updates.
+            # Switching a browser source to it would silently zero the venue.
+            if best.future_events < 1:
+                print(
+                    f"  {YELLOW}skipped{RESET} {src.get('name', '?')} — feed has 0 upcoming "
+                    f"events ({best.url})"
+                )
+                skipped += 1
+                continue
+            # Browser-only knobs are meaningless for a direct feed fetch; drop
+            # them rather than leave dead config behind.
+            for key in ("scroll_seconds", "api_pattern", "native_chrome", "api_only", "query"):
+                src.pop(key, None)
+            src["url"] = best.url
+            src["mode"] = "ics"
+            if old_url != best.url:
+                src["source_page"] = old_url
+            changed += 1
+            print(f"  {GREEN}switched{RESET} {src.get('name', '?')} -> ics  {best.url}")
+        span.set_attribute("apply.changed_count", changed)
+        span.set_attribute("apply.skipped_count", skipped)
+
+    if changed:
+        save_json(_WEB_SOURCES_FILE, sources)
+        print(f"\n{GREEN}{BOLD}Updated{RESET} {changed} source(s) in {_WEB_SOURCES_FILE}")
+    if skipped:
+        print(f"{DIM}{skipped} source(s) left unchanged — see above.{RESET}")
+    print()
     return 0
 
 
@@ -244,8 +406,15 @@ def _run_url_diagnostics(url: str) -> str | None:
     return detected_mode[0]
 
 
-def _add_source_to_config(url: str, detected_mode: str | None = None) -> None:
-    """Add a web source to data/web_sources.json using the detected mode."""
+def _add_source_to_config(
+    url: str, detected_mode: str | None = None, *, source_page: str | None = None
+) -> None:
+    """Add a web source to data/web_sources.json using the detected mode.
+
+    ``source_page`` is the human-facing page a feed URL was discovered from.
+    It is stored so the entry still says which venue it belongs to when the
+    feed URL is an opaque CDN path (``cdn.dnalounge.com/calendar/...``).
+    """
     from urllib.parse import urlparse
 
     from event_harvester.sources.web_fetch import _WEB_SOURCES_FILE, _load_web_sources
@@ -257,12 +426,19 @@ def _add_source_to_config(url: str, detected_mode: str | None = None) -> None:
         print(f"\n  {BOLD}Already configured{RESET} — {url} is already in web_sources.json")
         return
 
-    name = urlparse(url).netloc.split(".")[0]
-    if name in ("www", "business"):
-        name = urlparse(url).netloc.split(".")[-2]
+    # Name from the page the user actually typed, not the feed host: a feed on
+    # tockify.com or calendar.google.com would otherwise name every venue
+    # after the platform.
+    name_source = source_page or url
+    name = urlparse(name_source).netloc.split(".")[0]
+    if name in ("www", "business", "cdn", "calendar", "tockify"):
+        parts = urlparse(name_source).netloc.split(".")
+        name = parts[-2] if len(parts) >= 2 else name
 
     mode = detected_mode or "calendar"
     source = {"url": url, "name": name, "mode": mode}
+    if source_page and source_page != url:
+        source["source_page"] = source_page
     if mode == "feed":
         source["api_pattern"] = r"api|graphql"
         source["scroll_seconds"] = 15

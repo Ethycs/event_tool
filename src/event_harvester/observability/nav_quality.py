@@ -26,7 +26,10 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from event_harvester.observability.tracing import traced
+
 logger = logging.getLogger(__name__)
+_TRACER = "event_harvester.observability.nav_quality"
 
 
 _CLASSIFY_PROMPT = """You are inspecting screenshots of a web-scraping pipeline's navigation.
@@ -176,6 +179,7 @@ def _load_trace_records(trace_jsonl_path: Path) -> list[dict]:
     return records
 
 
+@traced("navquality.pick_key_frames", tracer_name=_TRACER)
 def pick_key_frames(trace_jsonl_path: Path, limit: int = 3) -> list[Path]:
     """Pick the most informative PNGs from a navigation trace.
 

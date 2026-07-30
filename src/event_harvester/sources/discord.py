@@ -15,7 +15,10 @@ from typing import Optional
 
 from ccl_chromium_reader.ccl_chromium_cache import ChromiumBlockFileCache
 
+from event_harvester.observability.tracing import set_span_attrs, traced
+
 logger = logging.getLogger("event_harvester.discord")
+_TRACER = "event_harvester.sources.discord"
 
 _MSG_URL_RE = re.compile(r"/channels/(\d+)/messages")
 
@@ -103,6 +106,7 @@ def _parse_message_blobs(body: bytes) -> list[dict]:
     return []
 
 
+@traced("source.discord.read", tracer_name=_TRACER)
 def read_discord_messages(
     cutoff: datetime,
     cache_path: Optional[Path] = None,
@@ -192,4 +196,5 @@ def read_discord_messages(
         "Discord: %d message(s) since %s UTC",
         len(messages), cutoff.strftime("%Y-%m-%d %H:%M"),
     )
+    set_span_attrs(**{"message.count": len(messages)})
     return messages

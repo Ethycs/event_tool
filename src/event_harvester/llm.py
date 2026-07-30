@@ -12,6 +12,9 @@ from pathlib import Path
 from typing import Any
 
 from event_harvester.config import LLMConfig
+from event_harvester.observability.tracing import set_span_attrs, traced
+
+_TRACER = "event_harvester.llm"
 
 logger = logging.getLogger("event_harvester.llm")
 
@@ -50,6 +53,7 @@ def shutdown_local() -> None:
         _local_cfg_key = None
 
 
+@traced("llm.chat", tracer_name=_TRACER)
 def chat_completion(
     messages: list[dict[str, str]],
     cfg: LLMConfig,
@@ -62,9 +66,22 @@ def chat_completion(
     Routes to litellm (``backend="litellm"``) or local ONNX inference
     (``backend="local"``).
     """
+    set_span_attrs(**{
+        "llm.backend": cfg.backend,
+        "llm.model": cfg.model,
+        "llm.max_tokens": max_tokens,
+        "llm.message_count": len(messages),
+        "llm.request_chars": sum(len(m.get("content") or "") for m in messages),
+        "llm.structured_output": bool(response_format),
+    })
     if cfg.backend == "local":
-        return _complete_local(messages, cfg, max_tokens=max_tokens)
-    return _complete_litellm(messages, cfg, max_tokens=max_tokens, response_format=response_format)
+        out = _complete_local(messages, cfg, max_tokens=max_tokens)
+    else:
+        out = _complete_litellm(
+            messages, cfg, max_tokens=max_tokens, response_format=response_format
+        )
+    set_span_attrs(**{"llm.response_chars": len(out), "llm.response_empty": not out})
+    return out
 
 
 def _suppress_litellm_noise():
@@ -77,6 +94,7 @@ def _suppress_litellm_noise():
 _litellm_init = False
 
 
+@traced("llm.litellm.completion", tracer_name=_TRACER)
 def _complete_litellm(
     messages: list[dict[str, str]],
     cfg: LLMConfig,
@@ -108,36 +126,65 @@ def _complete_litellm(
     elif any(tag in model for tag in ("gpt-5", "o1-", "o3-")):
         kwargs["reasoning_effort"] = "minimal"
 
+    set_span_attrs(**{
+        "llm.litellm_model": model,
+        "llm.reasoning_effort": kwargs.get("reasoning_effort"),
+    })
+
     resp = completion(**kwargs)
     content = resp.choices[0].message.content or ""
+    finish_reason = resp.choices[0].finish_reason
+
+    # Token counts are the only reliable cost signal we get back, and they are
+    # otherwise invisible -- litellm logs nothing by default and the pipeline
+    # discards the response object. Put them on the span.
+    usage = getattr(resp, "usage", None)
+    set_span_attrs(**{
+        "llm.finish_reason": finish_reason,
+        "llm.prompt_tokens": getattr(usage, "prompt_tokens", None) if usage else None,
+        "llm.completion_tokens": getattr(usage, "completion_tokens", None) if usage else None,
+        "llm.total_tokens": getattr(usage, "total_tokens", None) if usage else None,
+    })
 
     # Reasoning models (GPT-5, o1, o3) may exhaust tokens on reasoning
     # with empty content. Log a warning so the caller knows.
-    if not content and resp.choices[0].finish_reason == "length":
+    if not content and finish_reason == "length":
         logger.warning(
             "LLM returned empty content (finish_reason=length, used %d tokens on reasoning). "
             "Increase max_tokens.",
-            resp.usage.completion_tokens if resp.usage else 0,
+            usage.completion_tokens if usage else 0,
         )
 
     return content
 
 
+@traced("llm.local.generate", tracer_name=_TRACER)
 def _complete_local(
     messages: list[dict[str, str]],
     cfg: LLMConfig,
     *,
     max_tokens: int,
 ) -> str:
+    restarted = False
     try:
         sess = _get_local_session(cfg)
         result = sess.generate(messages, max_tokens=max_tokens)
     except Exception:
         # Session crashed — restart and retry once.
         logger.warning("Local session crashed, restarting...")
+        restarted = True
         shutdown_local()
         sess = _get_local_session(cfg)
         result = sess.generate(messages, max_tokens=max_tokens)
+
+    # The restart is silent apart from one WARNING line; on the span it shows
+    # up as a first-class attribute, so a run that is quietly thrashing the
+    # local worker is visible rather than inferred from log volume.
+    set_span_attrs(**{
+        "llm.local.restarted": restarted,
+        "llm.local.tokens_generated": result.get("tokens_generated"),
+        "llm.local.elapsed_s": result.get("elapsed_s"),
+    })
 
     logger.info(
         "Local generation: %d tokens in %.2fs",
@@ -161,6 +208,7 @@ def _resolve_vision_model(cfg: LLMConfig) -> str:
     return "gpt-4o-mini"
 
 
+@traced("llm.vision", tracer_name=_TRACER)
 def vision_completion(
     prompt: str,
     image_paths: list[Path],
@@ -186,11 +234,16 @@ def vision_completion(
         )
 
     content: list[dict[str, Any]] = []
+    image_bytes = 0
+    missing = 0
     for path in image_paths:
         if not path.exists():
             logger.warning("vision_completion: image %s missing, skipping", path)
+            missing += 1
             continue
-        b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+        raw = path.read_bytes()
+        image_bytes += len(raw)
+        b64 = base64.b64encode(raw).decode("ascii")
         content.append({
             "type": "image_url",
             "image_url": {"url": f"data:image/png;base64,{b64}"},
@@ -198,6 +251,17 @@ def vision_completion(
     content.append({"type": "text", "text": prompt})
 
     model = _resolve_vision_model(cfg)
+    # Images dominate vision cost, and a silently-skipped one turns a quality
+    # verdict into a guess -- both belong on the span, not just in the log.
+    set_span_attrs(**{
+        "llm.vision_model": model,
+        "llm.max_tokens": max_tokens,
+        "llm.image_count": len(image_paths),
+        "llm.image_sent_count": len(content) - 1,
+        "llm.image_missing_count": missing,
+        "llm.image_bytes": image_bytes,
+        "llm.prompt_chars": len(prompt),
+    })
     logger.info(
         "vision_completion: model=%s images=%d",
         model,
@@ -211,4 +275,12 @@ def vision_completion(
         messages=[{"role": "user", "content": content}],
         max_tokens=max_tokens,
     )
-    return resp.choices[0].message.content
+    usage = getattr(resp, "usage", None)
+    out = resp.choices[0].message.content
+    set_span_attrs(**{
+        "llm.prompt_tokens": getattr(usage, "prompt_tokens", None) if usage else None,
+        "llm.completion_tokens": getattr(usage, "completion_tokens", None) if usage else None,
+        "llm.total_tokens": getattr(usage, "total_tokens", None) if usage else None,
+        "llm.response_chars": len(out or ""),
+    })
+    return out

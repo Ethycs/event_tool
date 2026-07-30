@@ -14,7 +14,6 @@ from event_harvester.pipeline.state import (
     PipelineStateMachine,
 )
 
-
 # ── Initial state ────────────────────────────────────────────────────
 
 

@@ -11,13 +11,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from event_harvester.pipeline import harvest as harvest_mod
 from event_harvester.config import AppConfig
+from event_harvester.pipeline import harvest as harvest_mod
 
 
 def _make_msg(platform: str) -> dict:
@@ -195,3 +194,69 @@ def test_wall_time_is_roughly_max_not_sum(cfg):
     # Sequential would be ~2.5s. Concurrent should be ~0.5s plus
     # thread-pool startup; allow up to 1.5s for slow CI / cold pools.
     assert elapsed < 1.5, f"harvest took {elapsed:.2f}s, expected < 1.5s"
+
+
+# ── web-source name filtering ────────────────────────────────────────
+
+
+class TestWebSourceFilter:
+    """A name filter that matches nothing must harvest nothing.
+
+    `fetch_web_sources(sources=None)` means "load them all", so the old code
+    — which simply never set `sources` when zero entries matched — inverted
+    the request. The shipped `no-web` profile (`web_sources: ["__none__"]`)
+    ran a *full* web harvest, and so did any typo'd `--web-source`.
+    """
+
+    def _run_with_filter(self, cfg, monkeypatch, *, all_sources, **harvest_kw):
+        seen: dict = {}
+
+        def fake_fetch(**kw):
+            seen["sources"] = kw.get("sources", "UNSET")
+            return []
+
+        monkeypatch.setattr(
+            "event_harvester.sources.web_fetch._load_web_sources",
+            lambda: all_sources,
+        )
+        patches = _patch_all_sources(web=lambda **kw: fake_fetch(**kw))
+        for p in patches:
+            p.start()
+        try:
+            asyncio.run(harvest_mod.harvest_messages(
+                cfg, skip_cache=True,
+                no_discord=True, no_telegram=True, no_gmail=True, no_signal=True,
+                **harvest_kw,
+            ))
+        finally:
+            for p in patches:
+                p.stop()
+        return seen.get("sources", "UNSET")
+
+    def test_matching_name_passes_only_that_source(self, cfg, monkeypatch):
+        all_src = [{"name": "luma", "url": "u1"}, {"name": "erobay", "url": "u2"}]
+        got = self._run_with_filter(
+            cfg, monkeypatch, all_sources=all_src, web_source="luma",
+        )
+        assert [s["name"] for s in got] == ["luma"]
+
+    def test_zero_match_passes_empty_list_not_everything(self, cfg, monkeypatch):
+        """The regression: an unmatched filter must not mean 'all sources'."""
+        all_src = [{"name": "luma", "url": "u1"}, {"name": "erobay", "url": "u2"}]
+        got = self._run_with_filter(
+            cfg, monkeypatch, all_sources=all_src, web_source="__none__",
+        )
+        assert got == [], "a zero-match filter must harvest no web sources"
+
+    def test_typo_does_not_silently_harvest_all(self, cfg, monkeypatch):
+        all_src = [{"name": "luma", "url": "u1"}]
+        got = self._run_with_filter(
+            cfg, monkeypatch, all_sources=all_src, web_source="lumaa",
+        )
+        assert got == []
+
+    def test_no_filter_leaves_sources_unset(self, cfg, monkeypatch):
+        """With no filter at all, fetch_web_sources must load them itself."""
+        all_src = [{"name": "luma", "url": "u1"}]
+        got = self._run_with_filter(cfg, monkeypatch, all_sources=all_src)
+        assert got == "UNSET"

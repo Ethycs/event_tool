@@ -1,8 +1,7 @@
 """LLM-based task extraction from messages."""
 
-import json
 import logging
-import re
+from dataclasses import dataclass, field
 
 from event_harvester.config import LLMConfig
 from event_harvester.llm import chat_completion
@@ -10,6 +9,41 @@ from event_harvester.observability.tracing import get_tracer
 
 logger = logging.getLogger("event_harvester.pipeline.analysis")
 tracer = get_tracer("event_harvester.pipeline.analysis")
+
+# The five reject buckets every caller expects, in pipeline order.
+REJECT_BUCKETS = ("classifier", "caps", "reranker", "llm_past", "llm_no_events")
+
+
+def empty_rejects() -> dict[str, list[dict]]:
+    """A full reject dict with every bucket present and empty."""
+    return {bucket: [] for bucket in REJECT_BUCKETS}
+
+
+@dataclass
+class ExtractionResult:
+    """Everything :func:`extract_events_llm` produces.
+
+    Replaces three side-channel function attributes that used to carry the
+    reject buckets out of this module — ``extract_events_llm._last_rejects``,
+    ``_extract_events_cloud._last_llm_dropped/._last_llm_no_events``, and
+    ``_parse_event_ini._last_dropped``. Those were broken in two distinct ways:
+
+    1. ``_extract_events_cloud``'s attributes were read by the orchestrator
+       *unconditionally*, including on runs where ``backend="local"`` meant
+       that function never executed — so a local run reported whatever the
+       previous cloud run had left behind, or nothing at all.
+    2. ``_parse_event_ini._last_dropped`` was written and then read as two
+       separate statements while up to 5 ``ThreadPoolExecutor`` workers called
+       it concurrently, so one batch could read another batch's dropped list.
+
+    Returning the data makes both impossible, and is what allows the extract
+    stage to be moved off the event loop with ``asyncio.to_thread`` — a
+    function attribute shared across threads would have made that worse.
+    """
+
+    summary: str
+    events: list[dict]
+    rejects: dict[str, list[dict]] = field(default_factory=empty_rejects)
 
 
 from event_harvester.utils import parse_llm_ini
@@ -28,6 +62,7 @@ def build_prompt(messages: list[dict], days_back: int) -> str:
     so the LLM doesn't have to re-parse relative dates.
     """
     from datetime import date, datetime
+
     from event_harvester.pipeline.weights import DATE_RE, TIME_RE, _resolve_date
 
     today = date.today()
@@ -267,8 +302,8 @@ def extract_events_llm(
     days_back: int,
     cfg: LLMConfig,
     caps=None,
-) -> tuple[str, list[dict]]:
-    """Send messages to LLM and return (summary, tasks).
+) -> ExtractionResult:
+    """Send messages to the LLM and return an :class:`ExtractionResult`.
 
     If `caps` (CapConfig) is provided, applies per-source quotas before
     LLM extraction. Messages are scored first, then capped per source,
@@ -282,20 +317,26 @@ def extract_events_llm(
     """
     if not cfg.is_configured:
         logger.warning("LLM not configured - skipping analysis.")
-        return "", []
+        return ExtractionResult("", [])
 
-    from event_harvester.pipeline.classifier import filter_actionable as classifier_filter, has_trained_models
+    from event_harvester.pipeline.classifier import filter_actionable as classifier_filter
+    from event_harvester.pipeline.classifier import has_trained_models
 
     total = len(messages)
-    if caps and (getattr(caps, "no_cap", False) or caps.total < 0):
-        # no_cap or caps.total = -1 bypasses both per-source and global
-        # trimming. Use the message count itself as the rerank top_k so
-        # nothing is dropped.
+    if caps is None or getattr(caps, "no_cap", False) or caps.total < 0:
+        # Three ways a caller says "don't cap this run", all equivalent here:
+        #   caps=None      -- the orchestrator's unlimited_caps path, which is
+        #                     what CLI `--only` takes. This used to fall through
+        #                     to a literal 150, so `--only` silently trimmed to
+        #                     the default total after advertising no caps.
+        #   caps.no_cap    -- the UI checkbox / MCP no_cap param / profile flag.
+        #   caps.total < 0 -- the -1 "unlimited" sentinel (e.g. CAP_TOTAL=-1).
+        # Use the message count itself as the rerank top_k so nothing is dropped.
         cap_total = max(total, 1)
     else:
-        cap_total = caps.total if caps else 150
+        cap_total = caps.total
 
-    rejects: dict[str, list[dict]] = {}
+    rejects: dict[str, list[dict]] = empty_rejects()
 
     if has_trained_models():
         after_clf = classifier_filter(messages)
@@ -340,43 +381,36 @@ def extract_events_llm(
             total, len(filtered), cfg.display_name,
         )
 
-    # Stash rejects for callers that want them
-    extract_events_llm._last_rejects = rejects
-
+    # Only the backend that actually runs contributes LLM-stage rejects. The
+    # orchestrator used to read them off `_extract_events_cloud` regardless of
+    # which backend ran, so local runs reported stale or empty buckets.
     if cfg.backend == "local":
-        return _extract_events_local(filtered, days_back, cfg)
+        summary, events, llm_rejects = _extract_events_local(filtered, days_back, cfg)
+    else:
+        logger.info(
+            "Sending %d messages to %s (backend=%s) ...",
+            len(filtered), cfg.display_name, cfg.backend,
+        )
+        summary, events, llm_rejects = _extract_events_cloud(filtered, days_back, cfg)
 
-    logger.info("Sending %d messages to %s (backend=%s) ...", len(filtered), cfg.display_name, cfg.backend)
-    return _extract_events_cloud(filtered, days_back, cfg)
+    rejects.update(llm_rejects)
+    return ExtractionResult(summary, events, rejects)
 
 
 def _extract_events_cloud(
     messages: list[dict], days_back: int, cfg: LLMConfig,
     batch_size: int = 10,
-) -> tuple[str, list[dict]]:
-    """Extract events using parallel batched requests (cloud APIs handle concurrency)."""
+) -> tuple[str, list[dict], dict[str, list[dict]]]:
+    """Extract events using parallel batched requests (cloud APIs handle concurrency).
+
+    Returns ``(summary, events, llm_rejects)``. ``llm_rejects`` carries the
+    ``llm_past``/``llm_no_events`` buckets back to the caller instead of being
+    stashed on this function object — see :class:`ExtractionResult`.
+    """
     import concurrent.futures
 
     batches = [messages[i:i + batch_size] for i in range(0, len(messages), batch_size)]
     logger.info("Cloud extraction: %d messages in %d parallel batches", len(messages), len(batches))
-
-    def _process_batch(batch):
-        try:
-            raw = chat_completion(
-                messages=[
-                    {"role": "system", "content": _EVENT_EXTRACTION_PROMPT},
-                    {"role": "user", "content": build_prompt(batch, days_back)},
-                ],
-                cfg=cfg,
-                max_tokens=4096,
-            )
-            _, tasks = _parse_event_ini(raw)
-            if not tasks:
-                logger.debug("Batch raw output:\n%s", raw[:500])
-            return tasks
-        except Exception:
-            logger.exception("Batch failed")
-            return []
 
     all_tasks: list[dict] = []
     raw_outputs: list[str] = []
@@ -395,9 +429,13 @@ def _extract_events_cloud(
                     cfg=cfg,
                     max_tokens=4096,
                 )
-                _, tasks = _parse_event_ini(raw)
-                dropped = getattr(_parse_event_ini, "_last_dropped", [])
+                # `dropped` comes back from the call itself. It used to be read
+                # from `_parse_event_ini._last_dropped` on the next line, while
+                # up to 5 pool workers called the same function -- so a batch
+                # could read a sibling batch's dropped list.
+                _, tasks, dropped = _parse_event_ini(raw)
                 span.set_attribute("events.extracted", len(tasks))
+                span.set_attribute("events.dropped_past", len(dropped))
                 return tasks, raw, dropped, batch if not tasks else []
             except Exception as e:
                 logger.exception("Batch failed (%s)", type(e).__name__)
@@ -421,10 +459,6 @@ def _extract_events_cloud(
             raw_outputs[0][:1000],
         )
 
-    # Stash LLM-stage rejects for --show-rejects
-    _extract_events_cloud._last_llm_dropped = llm_dropped
-    _extract_events_cloud._last_llm_no_events = llm_no_events
-
     # Deduplicate (fingerprint match pass)
     from event_harvester.pipeline.event_match import dedup_events
     with tracer.start_as_current_span("match.fingerprints") as span:
@@ -434,7 +468,7 @@ def _extract_events_cloud(
         span.set_attribute("events.in", len(all_tasks))
         span.set_attribute("events.out", len(unique))
 
-    return "", unique
+    return "", unique, {"llm_past": llm_dropped, "llm_no_events": llm_no_events}
 
 
 _PRIO_MAP = {"HIGH": 5, "MED": 3, "MEDIUM": 3, "LOW": 1}
@@ -443,13 +477,20 @@ _PRIO_MAP = {"HIGH": 5, "MED": 3, "MEDIUM": 3, "LOW": 1}
 def _extract_events_local(
     messages: list[dict], days_back: int, cfg: LLMConfig,
     batch_size: int = 10,
-) -> tuple[str, list[dict]]:
+) -> tuple[str, list[dict], dict[str, list[dict]]]:
     """Extract tasks using simple numbered list format (local models).
 
     Processes messages in batches to stay within the model's context window.
+
+    Returns ``(summary, events, llm_rejects)`` with the same bucket shape as
+    :func:`_extract_events_cloud`. This backend previously produced no reject
+    buckets at all, so a local run's `--show-rejects` output silently showed
+    the *cloud* function's leftovers.
     """
     all_tasks: list[dict] = []
     summary = ""
+    llm_dropped: list[dict] = []
+    llm_no_events: list[dict] = []
 
     for i in range(0, len(messages), batch_size):
         batch = messages[i : i + batch_size]
@@ -472,12 +513,17 @@ def _extract_events_local(
                 logger.exception("LLM call failed on batch %d", batch_num)
                 span.set_attribute("error.message", str(e))
                 span.record_exception(e)
+                llm_dropped.append({"title": "(batch error)", "reason": str(e)})
+                llm_no_events.extend(batch)
                 continue
 
-            batch_summary, batch_tasks = _parse_event_ini(raw)
+            batch_summary, batch_tasks, batch_dropped = _parse_event_ini(raw)
             span.set_attribute("events.extracted", len(batch_tasks))
+            span.set_attribute("events.dropped_past", len(batch_dropped))
+            llm_dropped.extend(batch_dropped)
             if not batch_tasks:
                 logger.debug("Batch %d raw LLM output:\n%s", batch_num, raw[:500])
+                llm_no_events.extend(batch)
             if not summary and batch_summary:
                 summary = batch_summary
             all_tasks.extend(batch_tasks)
@@ -490,18 +536,19 @@ def _extract_events_local(
         span.set_attribute("events.in", len(all_tasks))
         span.set_attribute("events.out", len(unique))
 
-    return summary, unique
+    return summary, unique, {"llm_past": llm_dropped, "llm_no_events": llm_no_events}
 
 
-def _parse_event_ini(raw: str) -> tuple[str, list[dict]]:
+def _parse_event_ini(raw: str) -> tuple[str, list[dict], list[dict]]:
     """Parse INI-formatted LLM output into event dicts.
 
-    Drops events with dates that resolve to the past.
-    Stashes dropped events in _parse_event_ini._last_dropped for
-    --show-rejects reporting.
+    Returns ``(summary, events, dropped)``. ``dropped`` holds events whose
+    date resolved to the past, for ``--show-rejects``. It is returned rather
+    than stashed on the function object because this runs on up to 5 pool
+    threads at once — see :class:`ExtractionResult`.
     """
-    import configparser
     from datetime import date as date_type
+
     from dateutil import parser as dateutil_parser
 
     today = date_type.today()
@@ -564,5 +611,4 @@ def _parse_event_ini(raw: str) -> tuple[str, list[dict]]:
             "due_in_days": None,
         })
 
-    _parse_event_ini._last_dropped = dropped
-    return "", events
+    return "", events, dropped
