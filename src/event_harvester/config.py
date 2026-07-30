@@ -90,7 +90,11 @@ class TickTickConfig:
 class GmailConfig:
     credentials_file: str = "credentials.json"
     token_file: str = "token.json"
-    query: str = "newer_than:7d"
+    # Extra Gmail search terms, ANDed with the `after:` filter the harvest
+    # derives from --days-back. Empty by default: this used to be
+    # "newer_than:7d", which silently won that AND and capped every run at a
+    # week no matter what --days-back said.
+    query: str = ""
     max_results: int = 200
 
     @property
@@ -276,6 +280,8 @@ def load_config() -> AppConfig:
         gmail=GmailConfig(
             credentials_file=os.getenv("GMAIL_CREDENTIALS_FILE", "credentials.json"),
             token_file=os.getenv("GMAIL_TOKEN_FILE", "token.json"),
+            query=os.getenv("GMAIL_QUERY", ""),
+            max_results=int(os.getenv("GMAIL_MAX_RESULTS", "200")),
         ),
         signal=SignalConfig(
             db_path=os.getenv("SIGNAL_DB_PATH"),

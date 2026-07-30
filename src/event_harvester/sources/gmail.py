@@ -7,6 +7,7 @@ import base64
 import json
 import logging
 import os
+import sys
 import tempfile
 from datetime import datetime
 from email.mime.text import MIMEText
@@ -44,6 +45,46 @@ def _decode_env_json(env_key: str) -> dict | None:
         return None
 
 
+def _use_token(label: str, creds: Optional[Credentials], token_path: Path) -> Optional[Credentials]:
+    """Make one credential candidate usable, or return None so the caller moves on.
+
+    Returning None rather than raising is the point: a candidate that cannot be
+    refreshed is not a fatal condition while another candidate is still untried.
+    """
+    if creds is None:
+        return None
+    if creds.valid:
+        return creds
+    if creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+            # Persist refreshed token back to env-compatible format
+            token_path.write_text(creds.to_json())
+            logger.info("Gmail: refreshed credentials from %s", label)
+            return creds
+        except Exception as e:
+            logger.warning(
+                "Gmail: %s could not be refreshed (%s) — trying the next source", label, e,
+            )
+            return None
+    logger.warning(
+        "Gmail: %s is unusable (expired=%s, refresh_token=%s)",
+        label, creds.expired, bool(creds.refresh_token),
+    )
+    return None
+
+
+def _oauth_flow_allowed() -> bool:
+    """Whether it is safe to open a browser and block on human consent."""
+    if os.getenv("GMAIL_OAUTH_INTERACTIVE", "").lower() in ("1", "true", "yes"):
+        return True
+    try:
+        return sys.stdin.isatty()
+    except Exception:
+        # A closed or replaced stdin is itself evidence nobody is watching.
+        return False
+
+
 def _get_credentials(cfg: GmailConfig) -> Optional[Credentials]:
     """Load Gmail OAuth2 credentials.
 
@@ -51,35 +92,51 @@ def _get_credentials(cfg: GmailConfig) -> Optional[Credentials]:
     1. GMAIL_TOKEN_JSON env var (base64-encoded token)
     2. token.json file on disk
     3. Fresh OAuth flow using credentials (env or file)
-    """
-    creds = None
 
-    # Try token from env first
+    Each candidate is tried *to completion* — including its refresh — before the
+    next is considered. An earlier candidate that parses but cannot be refreshed
+    must not mask a later one that works: a stale `GMAIL_TOKEN_JSON` sitting in
+    `.env` alongside a perfectly good `token.json` used to take Gmail down
+    entirely, because merely parsing was enough to claim the slot.
+    """
+    token_path = Path(cfg.token_file)
+    candidates: list[tuple[str, Credentials]] = []
+
     token_data = _decode_env_json("GMAIL_TOKEN_JSON")
     if token_data:
         try:
-            creds = Credentials.from_authorized_user_info(token_data, SCOPES)
+            candidates.append(
+                ("GMAIL_TOKEN_JSON", Credentials.from_authorized_user_info(token_data, SCOPES)),
+            )
         except Exception as e:
             logger.debug("Gmail: env token parse failed: %s", e)
 
-    # Fall back to token file
-    token_path = Path(cfg.token_file)
-    if creds is None and token_path.exists():
-        creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
-
-    if creds and creds.valid:
-        return creds
-
-    if creds and creds.expired and creds.refresh_token:
+    if token_path.exists():
         try:
-            creds.refresh(Request())
-            # Persist refreshed token back to env-compatible format
-            token_path.write_text(creds.to_json())
-            return creds
+            candidates.append(
+                (cfg.token_file, Credentials.from_authorized_user_file(str(token_path), SCOPES)),
+            )
         except Exception as e:
-            logger.warning("Gmail: token refresh failed: %s", e)
+            logger.debug("Gmail: token file parse failed: %s", e)
 
-    # Need fresh OAuth flow — try credentials from env, then file
+    for label, candidate in candidates:
+        creds = _use_token(label, candidate, token_path)
+        if creds is not None:
+            return creds
+
+    # Every stored token is dead — a fresh OAuth flow is the only way forward,
+    # and it opens a browser and blocks on human consent. That is fine at a
+    # terminal and wrong everywhere else: under the MCP stdio server, a service
+    # runner, or a scheduled harvest it hangs the run waiting for a click nobody
+    # will make. Refuse unless there is a human present, or an explicit override.
+    if not _oauth_flow_allowed():
+        logger.error(
+            "Gmail: all stored tokens are dead and no interactive terminal is "
+            "attached, so the consent flow was skipped. Re-authorise by running "
+            "a harvest from a terminal, or set GMAIL_OAUTH_INTERACTIVE=1 to force it.",
+        )
+        return None
+
     creds_data = _decode_env_json("GMAIL_CREDENTIALS_JSON")
     if creds_data:
         # Write to temp file for InstalledAppFlow (it needs a file path)

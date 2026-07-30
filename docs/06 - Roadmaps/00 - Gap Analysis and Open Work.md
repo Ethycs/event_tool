@@ -49,6 +49,17 @@ Ordered by blast radius. Every one of these was silent — the run looked succes
 10. ~~**`RyzenSession._recv()` blocks forever.**~~ ✅ **Fixed.** `readline()` had no timeout, so only a *clean* worker exit was recoverable; an alive-but-wedged worker hung `chat_completion(backend="local")` indefinitely. Now bounded by `io_timeout_s` (default 600s, generous because first-run NPU compilation is slow), after which the worker is killed — a session whose reply was abandoned is desynchronised. The read runs on an explicit **daemon** thread, not a `ThreadPoolExecutor`: pool threads are non-daemon and joined at interpreter exit, so abandoning a blocked `readline` there hangs shutdown instead of the call. (Caught by the test suite hanging.) Pinned by `tests/test_interlock.py`. **[V]**
 11. ~~**`web_modes/feed.py` tags messages with the source name.**~~ ✅ **Fixed.** Emitted `"platform": "instagram"` instead of `"web"`, violating `EH-STD-MSG-v0`, so `CapConfig.get("instagram")` fell through to a default and the `web` cap never applied to feed sources. All three sites now emit `"web"`; the source name moved to `channel`. **The existing test did not catch this** because it passed `"web"` as the argument production was getting wrong — it now passes a real source name. **[V]**
 
+## Tier 1b — Found after the Tier 1 sweep
+
+Not in the original as-built read. Found on 2026-07-30 by asking "is the Gmail connector actually green?" and checking rather than reasoning — which is the same method that produced everything in Tier 1, applied to a source nobody had exercised.
+
+| # | Gap | Status |
+|---|---|---|
+| 1b.1 | **A dead `GMAIL_TOKEN_JSON` masked a working `token.json`.** `_get_credentials` treated "parsed successfully" as "claims the credential slot": the env token was checked first, and the file fallback was guarded by `if creds is None`, so a stale env token that merely *parsed* blocked it. When that token's refresh returned `invalid_grant`, the code skipped straight past a perfectly good on-disk credential to a fresh OAuth flow. **Gmail had been silently returning zero messages.** **[V]** — reproduced live: the env token expired 2026-03-25, `token.json` refreshed fine | ✅ Fixed 2026-07-30 — candidates are now tried *to completion*, refresh included, before the next is considered. Pinned by `tests/test_gmail_credentials.py::TestCredentialPrecedence` |
+| 1b.2 | **The fallback was a hang, not a recovery.** With every stored token dead, `_get_credentials` calls `InstalledAppFlow.run_local_server()` — it opens a browser and blocks on human consent. Under the stdio MCP server or a scheduled harvest, nobody is there to click | ✅ Fixed 2026-07-30 — the flow now requires a TTY, or `GMAIL_OAUTH_INTERACTIVE=1`. Otherwise it logs what to do and returns `None`, so the source skips instead of wedging the run |
+| 1b.3 | **`--days-back` never reached Gmail.** See 2.11 — the hardcoded `newer_than:7d` won its AND with `after:` | ✅ Fixed 2026-07-30 |
+| 1b.4 | `GMAIL_TOKEN_JSON` in the user's `.env` is dead (expired 2026-03-25, refresh rejected). Harmless now that the fallback works, but it costs a failed round-trip and a warning on **every** Gmail call — and `_get_service` is called once per operation, not once per run | 🔲 **Open — user action.** Re-export it from the refreshed `token.json`, or delete the line and let the file be the source of truth |
+
 ## Tier 2 — Structural (> 3 days, or needs a decision first)
 
 | # | Gap | Why it matters | Decision needed |
@@ -63,7 +74,7 @@ Ordered by blast radius. Every one of these was silent — the run looked succes
 | 2.8 | No cleanup policy for `data/.web_traces/` — JSONL, PNGs, GIFs, `quality.json` accumulate forever; both `close()` methods are explicit no-ops | Unbounded disk growth | No (already in `TODO.md`) |
 | 2.9 | `chat_completion` has no API-key-based model fallback (only `vision_completion` does), so an Anthropic-only setup silently sends `gpt-4o-mini` unless `LLM_MODEL` is set | Confusing first-run failure for a valid configuration | No |
 | 2.10 | `quality_check` only runs from `serve`; `harvest` and `watch` can write screenshots but never score them | The VLM verdict is the whole point of the screenshots | No |
-| 2.11 | Dead/inert config: `WEB_SOURCES_FILE`, `GmailConfig.query`/`max_results`, `AppConfig.dry_run`, `OPENROUTER_API_KEY` are read by nothing or never populated | Config that appears to work and doesn't | No |
+| 2.11 | Dead/inert config: `WEB_SOURCES_FILE`, ~~`GmailConfig.query`/`max_results`~~, `AppConfig.dry_run`, `OPENROUTER_API_KEY` are read by nothing or never populated | Config that appears to work and doesn't | No — 🟡 **partly closed 2026-07-30.** The Gmail half was worse than "inert": `query` *was* read by `fetch_messages`, just never populated, so it sat at its `"newer_than:7d"` default and was ANDed with the `after:` filter derived from `--days-back`. `newer_than:7d` won that AND, so **every run saw seven days regardless of what was asked for**. Default is now empty and both fields load from `GMAIL_QUERY`/`GMAIL_MAX_RESULTS`. The other three are untouched |
 
 ## Tier 3 — Feature backlog (unchanged from `TODO.md`)
 

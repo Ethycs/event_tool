@@ -8,7 +8,7 @@ Four independent message sources — Discord, Telegram, Gmail, Signal — each e
 
 1. Discord messages only exist in the harvester's view if the Discord desktop/web client actually rendered them recently — this is Chromium's HTTP cache, not a message store, and is subject to Discord's own cache eviction regardless of `DAYS_BACK`.
 2. Telegram requires a pre-existing `.session` file, or an interactive phone+code login via `scripts/auth_telegram.py` run first — `TelegramClient.start()` blocks on stdin if no session exists and none is supplied.
-3. Gmail requires either a valid `token.json`/`GMAIL_TOKEN_JSON` with a refresh token, or a one-time interactive OAuth consent flow (`InstalledAppFlow.run_local_server`) that opens a local browser — this cannot complete headless.
+3. Gmail requires either a valid `token.json`/`GMAIL_TOKEN_JSON` with a refresh token, or a one-time interactive OAuth consent flow (`InstalledAppFlow.run_local_server`) that opens a local browser — this cannot complete headless, and since 2026-07-30 it is **not attempted** headless: the flow is gated on `sys.stdin.isatty()` or `GMAIL_OAUTH_INTERACTIVE=1`, so a credential-less run skips Gmail rather than blocking on a consent click nobody will make.
 4. Signal Desktop must be installed and already linked/synced so `%APPDATA%\Signal\sql\db.sqlite` (or the macOS/Linux equivalents) exists; key extraction goes through `sigexport.crypto.get_key`, which is itself platform-specific (Windows DPAPI, macOS Keychain, Linux libsecret).
 5. All four sources are given one shared UTC cutoff, `datetime.now(utc) - timedelta(days=cfg.days_back)` (`DAYS_BACK` env, default 7), computed once in `pipeline/harvest.py:harvest_messages`. No source module reads `DAYS_BACK` itself.
 
@@ -18,7 +18,7 @@ Four independent message sources — Discord, Telegram, Gmail, Signal — each e
 |---|---|---|---|---|
 | Discord (`discord.py`) | None — reads local Chromium HTTP cache, no login | `%APPDATA%\discord\Cache\Cache_Data` (Windows); `/mnt/c/Users/*/AppData/Roaming/discord/Cache/Cache_Data` (WSL); `~/.config/discord/Cache/Cache_Data` (fallback, see BUG below); optional `DISCORD_CACHE_PATH` override | Copies the whole cache dir to a temp dir before parsing, specifically to dodge the lock held by a running Discord client | Cache dir not found → logs info, returns `[]` (silent, not an error) |
 | Telegram (`telegram.py`) | MTProto session (Telethon) | `TELEGRAM_API_ID`/`TELEGRAM_API_HASH`/`TELEGRAM_PHONE` env vars + `<TELEGRAM_SESSION>.session` file at repo root (`harvest_session.session` by default, confirmed present in this checkout) | N/A (network API, no local DB lock) | Per-dialog exceptions (flood-wait, restricted dialogs) are caught and logged, that dialog is skipped — partial results, not a hard failure |
-| Gmail (`gmail.py`) | OAuth2, `gmail.modify` + `gmail.compose` scopes | Priority order: `GMAIL_TOKEN_JSON` env (base64 JSON) → `token.json` file → `GMAIL_CREDENTIALS_JSON` env / `credentials.json` file for a fresh `InstalledAppFlow` | N/A | No credentials found → logs info, returns `[]`; token refresh failure falls through to interactive OAuth, which hangs/fails headless |
+| Gmail (`gmail.py`) | OAuth2, `gmail.modify` + `gmail.compose` scopes | Priority order: `GMAIL_TOKEN_JSON` env (base64 JSON) → `token.json` file → `GMAIL_CREDENTIALS_JSON` env / `credentials.json` file for a fresh `InstalledAppFlow`. Each stored token is tried **to completion, refresh included**, before the next — until 2026-07-30 a stale env token that merely parsed blocked the file from being read at all | N/A | No credentials found → logs info, returns `[]`; a token that cannot be refreshed logs a warning and moves to the next source; all tokens dead → interactive OAuth **only with a TTY** (or `GMAIL_OAUTH_INTERACTIVE=1`), else logs and returns `None` |
 | Signal (`signal.py`) | OS-native key extraction (`sigexport.crypto.get_key`) unlocking a SQLCipher DB | `%APPDATA%\Signal\sql\db.sqlite` (Windows), `~/Library/Application Support/Signal/...` (macOS), `~/.config/Signal/...` (Linux); optional `SIGNAL_DB_PATH` override (the only name — `SIGNAL_DATA_PATH` appeared once, in a warning string, and was corrected 2026-07-29) | **None** — connects directly to `db.sqlite` with no temp-copy step, unlike Discord/`chromium_cache.py` (known rough edge, see below) | Key extraction or DB open failure → logs error, returns `[]` |
 | `chromium_cache.py` (generic) | None | `find_chrome_cache`/`find_edge_cache` under `%LOCALAPPDATA%\...\Cache\Cache_Data` (Windows), plus a Darwin branch for Chrome only | Copies cache dir to temp before parsing (same pattern as `discord.py`) | Not wired to any pipeline caller in this repo — see dead-code note below |
 
@@ -69,7 +69,7 @@ Four independent message sources — Discord, Telegram, Gmail, Signal — each e
 
 **Domain:** Gmail REST API via `google-api-python-client`. Also the only messaging source with write actions (`reply`, `trash`, `delete`, `mark_read`, `mark_unread`).
 **Runs at:** Sync functions; `fetch_messages` is called via `asyncio.to_thread` from `pipeline/harvest.py:_run_gmail`. `reply`/`trash` are called synchronously and directly from `outputs/obsidian.py` (user-approval flow), not from the async harvest path.
-**Inputs:** `cfg: GmailConfig` (`credentials_file` default `credentials.json`, `token_file` default `token.json`, `query` default `"newer_than:7d"`, `max_results` default 200) plus env vars `GMAIL_TOKEN_JSON` / `GMAIL_CREDENTIALS_JSON` (base64-encoded JSON, preferred — "no loose files") and `GMAIL_CREDENTIALS_FILE`/`GMAIL_TOKEN_FILE`. `token.json` exists at repo root in this checkout (git-ignored).
+**Inputs:** `cfg: GmailConfig` (`credentials_file` default `credentials.json`, `token_file` default `token.json`, `query` default `""` from `GMAIL_QUERY`, `max_results` default 200 from `GMAIL_MAX_RESULTS` — the default was `"newer_than:7d"` until 2026-07-30, which won its AND against the `after:` filter and capped every run at seven days regardless of `--days-back`) plus env vars `GMAIL_TOKEN_JSON` / `GMAIL_CREDENTIALS_JSON` (base64-encoded JSON, preferred — "no loose files") and `GMAIL_CREDENTIALS_FILE`/`GMAIL_TOKEN_FILE`. `token.json` exists at repo root in this checkout (git-ignored).
 **Outputs:** message dicts, see schema table; `fetch_full_bodies` returns a separate `dict[message_id, body_text]` (not part of the standard message shape).
 
 ### Internal structure
@@ -163,10 +163,14 @@ All four production sources (Discord, Telegram, Gmail, Signal) share the base sh
 ## Verification
 
 ```
-pixi run -e dev pytest tests/test_discord.py -v
+pixi run -e dev pytest tests/test_discord.py tests/test_gmail_credentials.py tests/test_chromium_cache.py -v
 ```
 
-This exercises the only automated coverage for this subsystem: the 8 `_parse_message_blobs` cases in `discord.py` (array/single/mixed-type parsing, empty/invalid input, missing-`id` rejection, whitespace and UTF-8 handling). It does **not** touch cache discovery, decompression, the `ChromiumBlockFileCache` integration, or any of `telegram.py`/`gmail.py`/`signal.py`/`chromium_cache.py` — there is no test file for any of those four modules in `tests/`.
+`test_discord.py` covers the 8 `_parse_message_blobs` cases (array/single/mixed-type parsing, empty/invalid input, missing-`id` rejection, whitespace and UTF-8 handling). It does **not** touch cache discovery, decompression, or the `ChromiumBlockFileCache` integration.
+
+`test_gmail_credentials.py` (added 2026-07-30) covers **credential resolution only** — precedence between a stale env token and a working file token, refresh persistence, and the TTY gate on the OAuth flow. `fetch_messages`, `filter_read_sent`, `_extract_body`, and every write action (`reply`/`trash`/`delete`/`mark_*`) remain untested.
+
+`telegram.py` and `signal.py` still have no test file at all.
 
 To confirm the dead-code claim about `chromium_cache.py` independently:
 
