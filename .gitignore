@@ -18,6 +18,10 @@ ENV/
 credentials.json
 token.json
 client_secret_*.json
+# ticktick-py's OAuth2 cache defaults to `.token-oauth` in the CWD and
+# outputs/ticktick.py never overrides cache_path, so the first successful
+# TickTick consent drops a live access token at the repo root.
+.token-oauth
 
 # IDE
 .vscode/
@@ -77,3 +81,11 @@ reports/
 probe_out.txt
 test.md
 interview.py
+
+# DVC pointers must stay visible even though the data they point at does not.
+# The blanket `data/*` above swallows them, and `dvc add` refuses to create a
+# pointer it cannot commit ("bad DVC file name ... is git-ignored").  The
+# pointers carry md5 hashes only -- no message content -- and they are the only
+# way a clone can `dvc pull` this data back from the lakeFS store.
+!data/*.dvc
+!data/.gitignore

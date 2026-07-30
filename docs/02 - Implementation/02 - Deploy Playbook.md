@@ -1,4 +1,5 @@
 # event_tool — Redeploy Playbook
+**Status:** CURRENT · **Date:** 2026-07-29 · **Applies to:** standing up `event_harvester` on a server · **Depends on:** `docs/02 - Implementation/01 - Credentials & First Run.md`
 
 A reproducible procedure for standing up (or re-standing-up) **event_harvester**
 on a server, with **all secrets sourced from Infisical** and **browser session

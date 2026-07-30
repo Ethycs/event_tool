@@ -1,0 +1,126 @@
+# Test Suite Inventory
+
+**Status:** Living Document · **Date:** 2026-07-29 · **Applies to:** `tests/`
+
+## Verdict
+
+`tests/` holds 26 files and 412 `def test_*` functions, which collect to **479 tests — all passing in 14.8s, measured 2026-07-29** (the gap is `@pytest.mark.parametrize` expansion), covering roughly 40 of the ~75 non-trivial modules under `src/event_harvester/`. Coverage is strong and behavioral for the pure-function layers (parsing, scoring, state machines, prompt building) but there is **zero dedicated coverage for the entire `ui/` package** (`ui/app.py` alone is 1456 lines — larger than the next three untested modules combined), plus no coverage for `sources/chromium_cache.py`, `sources/gmail.py`, `_interlock_worker.py`, and `pipeline/classifier.py`. No test in the suite touches a real network socket, a real browser, or real credentials — everything is mocked, monkeypatched, or duck-typed — so the suite should be safe to run unattended on a clean checkout.
+
+---
+
+## 1. Inventory
+
+Legend: **behavioral** = asserts specific input→output values/content; **shape/smoke** = asserts presence, non-crash, or type only.
+
+| Test file | Module(s) under test | # tests | What it actually pins |
+|---|---|---|---|
+| `test_analysis.py` | `pipeline/analysis.py` (`build_prompt`, `extract_events_llm`) | 9 | Behavioral. Prompt grouping by platform/channel, content truncation to 400 chars, per-chat message cap (last 60), header counts, and LLM-response→event-dict parsing (mocked `chat_completion`). |
+| `test_app.py` | `cli/commands/serve.py` (`_latest_runs_by_source`) | 2 | Behavioral. Picks lexicographically-latest `.jsonl` per source dir; skips empty dirs and non-dir files. |
+| `test_cli_parser.py` | `cli/parse_helpers.py`, `cli/parser.py`, `cli/dispatch.py` (`_normalize_argv` only) | 66 | Behavioral. Cap-arg parsing, platform CSV parsing, mutual-exclusion of `--only`/`--skip`, full argparse routing for every subcommand (harvest/watch/web/recruiters/classifier/serve/mcp), pre-dispatch argv normalization, backward-compat bare-invocation equivalence. **`dispatch.py`'s actual command-execution/error-handling logic is not exercised** — only the argv-rewrite helper is. |
+| `test_config.py` | `config.py` | 8 | Behavioral. Env-var loading incl. invalid-int fallback, `validate_config` warning generation/suppression, `is_configured` properties, `litellm_model` passthrough. |
+| `test_data_paths.py` | `pipeline/harvest.py`, `sources/web_utils.py`, `sources/web_session.py` (all: `_DATA_DIR`/`CACHE_FILE` constants only) | 3 | Regression pin, narrow scope. Asserts the four independently-computed data-dir constants agree and none resolve under `src/`. Does not exercise any other behavior of these three modules. |
+| `test_discord.py` | `sources/discord.py` (`_parse_message_blobs` only) | 8 | Behavioral but narrow — one helper function. JSON blob parsing (array/single/mixed-garbage/empty/invalid/whitespace/utf-8), not the cache-reading or Discord-API code paths. |
+| `test_event_match.py` | `pipeline/event_match.py` | 16 | Behavioral. Title normalization/stop-word removal, title-overlap threshold (50%), title+date / link-based match scoring, fingerprint save/find/auto-prune (past-dated and stale no-date entries), dedup. |
+| `test_harvest_async.py` | `pipeline/harvest.py` (`harvest_messages` orchestration) | 4 | Behavioral, with one timing-based assertion. All 5 sources aggregate; deterministic output order regardless of completion order; one source's exception doesn't kill the others (and is logged); wall-clock time is roughly `max()` not `sum()` of source latencies — **this last assertion is a wall-clock timing test** (asserts `< 1.5s` for 5×0.5s sleeps), a source of potential CI flakiness. |
+| `test_llm_vision.py` | `llm.py` (`vision_completion` only) | 7 | Behavioral, fully mocked `litellm.completion`. Multi-image content-list construction, missing-file skip + warning log, vision-model override, Anthropic/OpenAI fallback model selection, response text passthrough, large-batch (>5 images) warning. |
+| `test_mcp_server.py` | `servers/mcp_server.py` (internal helpers only) | 7 | Mostly behavioral, one shape-only. Source-filter CSV/array parsing + rejection of unknown sources, `_source_kwargs` defaulting/override logic, `only`+`skip` mutual exclusion, latest-events cache round-trip. `test_summarize_config_has_mcp_client_relevant_fields` is **shape assertion only** (checks keys exist / model string truthy, not specific values). **The actual `@mcp.tool` handlers (`harvest_events`, `approve_event`, `decline_event`, etc.) are not tested at all** — only private helper functions. |
+| `test_nav_quality.py` | `observability/nav_quality.py` | 31 | Behavioral, the most thorough file in the suite. `compute_score` formula (all classification baselines, capping, clamping), `parse_classification` label-matching priority, `pick_key_frames` selection/limit/malformed-line/missing-image logic, and `NavQualityScorer.score_source` end-to-end (mocked `vision_completion`) incl. the per-run image budget and error fallback. One placeholder: `test_nav_quality_scorer_instantiates` is **smoke test only** — docstring literally says "Placeholder ... just must construct cleanly." |
+| `test_navigation_trace.py` | `observability/navigation_trace.py` | 19 | Behavioral. Step counting, chrome-extension URL filtering, parent linkage, screenshot-attached recording, and (when `opentelemetry` is importable — else `pytest.skip`) real OTel span-event emission via `InMemorySpanExporter`. `test_close_is_idempotent` is smoke-only ("should not raise"). |
+| `test_obsidian.py` | `outputs/obsidian.py` | 17 | Behavioral. Substring assertions against generated markdown: frontmatter fields, callouts, checkboxes, wikilinks, TickTick deep links, tag presence (`#scheduled`, `#pinned`), recruiter-report score buckets and strikethrough-for-trash. No test asserts the full document byte-for-byte — every assertion is a targeted substring check. |
+| `test_pipeline.py` | `pipeline/orchestrator.py` (`Pipeline`, `PipelineResult`) | 12 | Behavioral, seams mocked (`harvest_messages`, `extract_events_llm`, `filter_read_sent`, `find_acted_fingerprint`). Empty-harvest short-circuit, skip-analyze branch, full-run status tagging + reject-bucket isolation (regression: rejects dict must not leak `llm_past`/`llm_no_events` keys back into the shared object), source-count-by-platform, `unlimited_caps` plumbing, reporter stage/checkpoint sequencing, harvest-kwargs forwarding. `test_validate_passes_no_kwargs_through_to_config_check` is **shape assertion only** — its own docstring says it doesn't check warning text, just that a list comes back. |
+| `test_pipeline_state.py` | `pipeline/state.py` | 15 | Behavioral, exhaustive. Every legal/illegal transition in the state table (parametrized), self-loop no-ops, `reset()` force-to-idle from any state, exact lowercase string values for each enum member (explicitly called out as a contract other components rely on). |
+| `test_profiles.py` | `profiles.py` | 16 | Behavioral. Profile-file loading incl. malformed JSON / wrong top-level key / duplicate names / missing name (all raise `ProfileError`), `find_profile` lookup, `apply_profile` field-by-field mutation (including the "untouched fields survive" and "empty web_sources means all" cases), `apply_profile_by_name` success/missing-name/missing-file paths. |
+| `test_recruiter_score.py` | `training/recruiter_score.py` | 28 | Behavioral. Domain extraction, sender/subject/body scoring deltas for staffing-firm penalties, body-shop format, template openers, calendar links, meeting requests, quality-company mentions, salary mentions, C2C penalties; score→action bucket boundaries (0/20/21/45/46/65/66/100); end-to-end `grade_email` on synthetic spam/quality/borderline messages; batch sort-by-score and body-augmented scoring. |
+| `test_report.py` | `outputs/report.py` | 8 | Behavioral. TickTick deep-link URL encoding (all-day vs timed, special chars, no-date), markdown report generation from validated events / raw-event fallback / links section / empty-state message. |
+| `test_screenshot_capture.py` | `observability/screenshot_capture.py` | 12 | Behavioral. PNG write + round-trip via PIL, failure handling (returns `None`, logs), settle-wait vs `time.sleep` fallback, animated-GIF assembly, per-run snap cap, consecutive-failure circuit breaker and its reset-on-success. `test_close_is_idempotent` is smoke-only. |
+| `test_ticktick.py` | `outputs/ticktick.py` (`create_ticktick_tasks` only) | 2 | Behavioral but very narrow — only 2 tests. Confirms dry-run mode doesn't call the TickTick API and returns a 1-item `created` list; confirms empty input returns the empty-shape dict. **The create/update/skip-dedup branches (the actual non-dry-run logic) are entirely unexercised.** |
+| `test_tracing.py` | `observability/tracing.py` | 5 | Mostly behavioral, one smoke. Idempotent `init_tracing()`, real span capture via `InMemorySpanExporter`, `current_span_event` attaching to current span and no-op'ing without one, graceful no-op tracer when `_OTEL_OK` is patched `False`. `test_module_imports_cleanly` is **smoke test only** (docstring: "just re-import it here as a smoke check"). Assumes `opentelemetry` is installed — unlike its sibling in `test_navigation_trace.py`, it has no `pytest.skip` guard. |
+| `test_web_fetch_helpers.py` | `sources/web_utils.py`, `sources/web_modes/calendar.py` (`_parse_calcium_links`), `sources/web_modes/feed.py` (`_extract_posts_from_api`) | 35 | Behavioral, second-most thorough file. Junk-title heuristic, cooldown store round-trip incl. corrupt-file and window-expiry, a **documented latent bug** (`test_load_web_sources_when_file_missing_returns_empty_dict` pins that a missing sources file returns `{}` instead of falling back to `_DEFAULT_SOURCES`, on purpose, so a future fix is visible as an intentional test change), known-link filtering (approved/declined honored, unlabeled "auto" sightings ignored — itself a regression test for a bug that hid 90%+ of a calendar), Calcium calendar HTML parsing + entity unescaping + ID-based dedup, Instagram GraphQL walker (edges/items shapes, nested recursion, short-caption drop), raw-HTML text extraction (script/style stripping, whitespace collapse), the date-cluster-centering `_decimate_text` algorithm, JSON-LD event extraction (`@graph` wrapper, `@type` list), dead-page detection (incl. a 3000-char scan-window boundary). |
+| `test_web_fetch_parallel.py` | `sources/web_fetch.py` (`_chunk_sources` only) | 6 | Behavioral but narrow — one helper. Round-robin chunking, `n=1`, `n=0` treated as 1, `n` larger than source count (empty chunks dropped), uneven splits. |
+| `test_web_ics_diag.py` | `cli/commands/web.py` (`_is_ics_url`, `_diagnose_ics`, `_run_url_diagnostics`) | 4 | Behavioral regression test. URL-suffix/scheme detection for `webcal://`/`.ics` variants; pins that an ICS URL short-circuits before a browser is ever constructed (fails the test if `UCBrowser` is instantiated); empty-feed result is reported as `None`, not silently claimed as success. |
+| `test_web_primitives.py` | `web_primitives.py` | 44 | Behavioral, exercised entirely against duck-typed `FakeUC`/`FakePage` — the most extensive file by test count. `Element.to_dict`, bbox-shape parsing (3 rect formats), pattern→Element promotion, confidence-based arbitration, every discovery verb (search box, pagination, login wall, modal, feed container, chat input incl. ML-hit-over-pattern preference), every action verb (click/fill+submit/scroll incl. window vs container/dismiss-modal/wait-for-navigation incl. timeout→`False`), every extraction verb (text incl. failure→`""`, event-from-meta, screenshot incl. failure→`b""`). |
+| `test_weights.py` | `pipeline/weights.py` | 28 | Behavioral. Recency-score buckets, link-type scoring (event/tech/social/gif-skip/generic), link extraction+scoring+dedup-by-URL (keeps higher-scored duplicate), event-signal extraction (scheduling keywords, date/time capture, short-message skip), and an extensive parametrized sweep of `has_date_or_event_signal` regex coverage (ordinals, relative time, 24h time, ISO dates, ranges, timezones, year mentions, phrases, event-platform links) including a negative-case sweep. |
+
+**Totals:** 26 test files, 412 test functions (479 collected after parametrize expansion), spanning ~40 of the ~75 non-trivial (`>10` line) modules under `src/event_harvester/`.
+
+---
+
+## 2. Coverage gap — modules with no dedicated test coverage
+
+Every module below has **zero** references from any file in `tests/` (confirmed by grep across the whole `tests/` tree, not just filename matching). Sorted by line count, descending. Trivial `__init__.py`/re-export shims (`sources/__init__.py`, `cli/__init__.py`, etc., all ≤10 lines of pure imports) are excluded as out of scope.
+
+| Module | Lines | Notes |
+|---|---:|---|
+| `src/event_harvester/ui/app.py` | 1456 | **Largest untested module in the repo by a wide margin** — bigger than the next three combined. Flet UI/app-state wiring; `no coverage`. |
+| `src/event_harvester/sources/chromium_cache.py` | 514 | Chromium disk-cache parsing (`find_browser_cache`, `read_cache_entries`, etc.) — the lowest-level, most parsing-bug-prone source reader; `no coverage`. |
+| `src/event_harvester/sources/gmail.py` | 454 | Gmail fetch/reply/trash/`filter_read_sent`; `no coverage`. `filter_read_sent` is depended on by `pipeline/orchestrator.py` (mocked away in `test_pipeline.py`) but never tested against a real message set. |
+| `src/event_harvester/_interlock_worker.py` | 388 | `no coverage`. |
+| `src/event_harvester/pipeline/classifier.py` | 379 | `no coverage` — only ever referenced as a `monkeypatch.setattr("...classifier.has_trained_models", return_value=False)` target in `test_analysis.py`, i.e. it is patched *off*, never exercised. |
+| `src/event_harvester/cli/commands/harvest.py` | 361 | The `harvest` subcommand's actual execution path (as opposed to its argparse wiring, which is tested); `no coverage`. |
+| `src/event_harvester/training/eval_classifier.py` | 276 | `no coverage`. |
+| `src/event_harvester/interlock.py` | 254 | `no coverage`. |
+| `src/event_harvester/pipeline/reranker.py` | 238 | `no coverage` — the reranker sits directly in the events pipeline between classification and caps. |
+| `src/event_harvester/ui/server.py` | 217 | `no coverage`. |
+| `src/event_harvester/sources/signal.py` | 167 | `no coverage`. |
+| `src/event_harvester/sources/telegram.py` | 160 | `no coverage` — only its *fake* replacement is exercised, inside `test_harvest_async.py`. |
+| `src/event_harvester/ui/display.py` | 152 | `no coverage`. |
+| `src/event_harvester/sources/web_modes/search.py` | 152 | `no coverage` — the sibling `calendar.py`/`feed.py` web-modes are tested, `search.py` is not. |
+| `src/event_harvester/sources/web_modes/ics.py` | 141 | `no coverage` — only ever monkeypatched away (`_do_ics_inner` replaced with a fake) in `test_web_ics_diag.py`; its own parsing logic is never run. |
+| `src/event_harvester/training/label.py` | 126 | `no coverage`. |
+| `src/event_harvester/cli/commands/recruiters.py` | 121 | `no coverage`. |
+| `src/event_harvester/watch.py` | 84 | `no coverage`. |
+| `src/event_harvester/cli/commands/classifier.py` | 77 | `no coverage`. |
+| `src/event_harvester/pipeline/dedup.py` | 75 | `no coverage`. |
+| `src/event_harvester/sources/web_modes/chat.py` | 73 | `no coverage`. |
+| `src/event_harvester/sources/web_modes/raw.py` | 70 | `no coverage` (its likely helper, `_extract_text`, lives in and is tested via `web_utils.py`, not this file). |
+| `src/event_harvester/utils.py` | 55 | `no coverage`. |
+| `src/event_harvester/cli/commands/watch.py` | 40 | `no coverage`. |
+| `src/event_harvester/logging_tags.py` | 30 | `no coverage`. |
+| `src/event_harvester/cli/commands/mcp.py` | 22 | `no coverage`. |
+| `src/event_harvester/sources/uc_browser.py` | 17 | `no coverage` of the real class — only its *duck-typed fake* (`FakeUC`) is exercised, in `test_web_primitives.py`. |
+
+---
+
+## 3. Fixtures and fragility
+
+`tests/conftest.py` is minimal: it provides exactly one shared fixture, `sample_messages` (5 hand-written Discord/Telegram messages spanning 2 days, used by `test_analysis.py`). Every other fixture in the suite (`tmp_path`-based cache/cooldown/fingerprint redirection, `monkeypatch` of module-level seams, `FakePage`/`FakeUC`/`FakeReporter`/`FakeCapture` duck-types) is defined locally in its own test file.
+
+**Network / browser / credentials:** none found. Every test that would otherwise need Playwright, a live browser, or real API credentials substitutes a hand-written duck-typed fake (`FakePage`, `FakeUC` in `test_web_primitives.py`; `FakePage` in `test_screenshot_capture.py`; mocked `litellm.completion`/`chat_completion` in `test_llm_vision.py`/`test_analysis.py`; `MagicMock` TickTick client in `test_ticktick.py`). This is a genuine strength of the suite — it should run identically on a clean checkout with no network access and no `.env`.
+
+**Fragile / environment-dependent tests, named:**
+
+- `tests/test_harvest_async.py::test_wall_time_is_roughly_max_not_sum` — asserts wall-clock elapsed time `< 1.5s` for 5 sources each sleeping 0.5s. This is a real-time timing assertion; it is the one test in the suite that could flake under CPU contention or a slow/cold thread pool, per its own comment ("allow up to 1.5s for slow CI / cold pools").
+- `tests/test_tracing.py` (all 5 tests) — imports `opentelemetry.sdk.trace` unconditionally at module scope with **no `pytest.skip` guard**. If `opentelemetry` is not installed in the active pixi env, this file fails to collect rather than skipping gracefully. Its sibling test in `test_navigation_trace.py::test_record_emits_span_event_when_span_active` does the safer thing and wraps the same import in `try/except ImportError: pytest.skip(...)`.
+- `tests/test_navigation_trace.py`, `tests/test_tracing.py` — both mutate process-global OpenTelemetry state (`trace.get_tracer_provider()`, `tracing_mod._PROVIDER_INSTALLED`). `test_tracing.py`'s own `reset_tracing_state` fixture docstring admits "The TracerProvider is process-global so we can't truly uninstall it" — meaning test order/isolation across the two files depends on cooperative fixture behavior rather than true isolation. Low risk in a single `pytest` run, but a source of cross-file coupling if either file is run standalone in certain orders.
+- `tests/test_llm_vision.py`, `tests/test_screenshot_capture.py` — depend on Pillow (`PIL.Image`) being installed to synthesize real PNG bytes; not "fragile" per se (pixi should provide it) but is an implicit environment dependency worth naming since these tests don't skip if `PIL` is absent — they'll fail at import/collection.
+- `tests/test_pipeline.py`, `tests/test_harvest_async.py` — use `@pytest.mark.asyncio`, so they depend on `pytest-asyncio` being registered as a plugin in the pixi env; not otherwise a problem, just a collection-time dependency to be aware of.
+
+No test reads or writes anything under the real repo `data/` directory — everywhere that matters, the module-level path constant (`CACHE_FILE`, `_COOLDOWN_FILE`, `FINGERPRINT_FILE`, `_WEB_SOURCES_FILE`, `PROFILES_FILE`, `LATEST_EVENTS_FILE`) is monkeypatched to a `tmp_path`. `test_data_paths.py` is the one file that intentionally asserts against the *real* (non-tmp) `_DATA_DIR` constants, but only compares path objects — it performs no I/O.
+
+---
+
+## 4. What a golden test would pin here (and doesn't exist today)
+
+The suite is thorough at the unit level but has almost no **fixed-input → fixed-output snapshot** tests — the kind that catch "this still basically works but the output silently changed shape" regressions that per-field substring assertions miss. Five concrete candidates:
+
+1. **Fixed message set → fixed extracted-event JSON**, in `tests/test_analysis.py` or a new `tests/test_golden_extraction.py`. Take a small, realistic multi-platform message batch (reuse/extend `conftest.py`'s `sample_messages`), mock `chat_completion` to a *frozen* LLM response string, and assert the entire resulting `events` list equals a frozen expected structure — not just `events[0]["title"]`. Protects `build_prompt`/`extract_events_llm` from a change that alters which fields survive parsing, or silently drops/renames a field, without anyone touching the one or two fields the current tests happen to check.
+
+2. **Fixed recruiter-email corpus → fixed grade table**, in `tests/test_recruiter_score.py`. A frozen list of ~10 representative emails (spam/quality/borderline/edge) run through `grade_emails_batch`, asserted against a frozen list of `(score, action)` tuples. Protects the additive scoring heuristics in `_score_sender`/`_score_subject`/`_score_body` from drifting in aggregate as individual deltas are tuned — today's tests check each delta component in isolation, so nothing catches a change that shifts the *combined* score across a threshold boundary for a realistic email.
+
+3. **Fixed event set → full Obsidian report snapshot**, in `tests/test_obsidian.py`. Freeze `write_events_report`'s complete markdown output for a fixed `_sample_events()`/`_sample_links()` input (byte-for-byte or with the date/timestamp normalized) instead of the current ~10 independent substring checks. Protects against a formatting regression that breaks Obsidian rendering in a way no single substring assertion happens to probe (e.g., a stray unescaped `|` breaking every table, or checkbox/callout syntax drifting).
+
+4. **Fixed near-duplicate event batch → fixed dedup output**, in `tests/test_event_match.py`. A frozen list of 8-10 events with intentional near-duplicates (title variants, date-only matches, link-only matches, genuine distinct events) run through `dedup_events`, asserted against a frozen expected surviving set. Protects the `_titles_overlap` 50%-threshold heuristic and `events_match` scoring from silently changing which events get merged as the pipeline's most impactful dedup logic evolves.
+
+5. **End-to-end `Pipeline.run()` golden result**, in `tests/test_pipeline.py`. A single test with a frozen multi-platform message set fed through all the real mocked seams at once (not the current pattern of one assertion axis per test), asserting the entire `PipelineResult` (all fields: `events`, `source_counts`, `rejects`, `links`, `_status` tags) against a frozen expected object. Protects the orchestration wiring itself — the current 12 tests each isolate one behavior (empty harvest, skip-analyze, reject buckets, source counts, caps, reporter calls) but nothing pins that all of them still compose correctly into one coherent result at once.
+
+---
+
+## Verification
+
+Run: `pixi run test`
+
+What to conclude from the output:
+- **`479 passed` and nothing else** (the measured baseline on 2026-07-29 — no skips, no xfails) → the suite is in the state this document describes; the coverage gaps above are real gaps, not tests silently failing to collect.
+- **`test_tracing.py` fails to collect** (rather than fails/skips) → `opentelemetry` is missing from the active pixi env; see §3 fragility note — install it or the whole file is unusable, not just degraded.
+- **`test_harvest_async.py::test_wall_time_is_roughly_max_not_sum` fails intermittently** → CPU contention/cold thread pool, not a real regression in `harvest_messages`'s concurrency; rerun before treating it as a bug (see §3).
+- **Any failure outside those two named fragility points** should be treated as a genuine regression — the rest of the suite is deterministic, network-free, and credential-free by construction.

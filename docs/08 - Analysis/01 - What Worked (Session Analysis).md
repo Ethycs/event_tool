@@ -1,4 +1,5 @@
 # What Worked — Session Analysis
+**Status:** Analysis · **Date:** 2026-05-30 (session date; not reconciled since) · **Applies to:** the browser-auth investigation session · **Source:** `docs/09 - Archived/2026-05-30_browser-auth-session-transcript.md`
 
 This file is the aggregated output of 6 parallel analysis agents that read disjoint segments of `docs/session_transcript.md` (the 990 KB / 34,389-line transcript of this session). Each agent was asked to identify **only what worked** — confirmed-functional items, passing tests, usable output. Failed attempts and rolled-back code are intentionally excluded; those live in [docs/browser_attempts.md](browser_attempts.md).
 

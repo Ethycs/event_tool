@@ -1,4 +1,5 @@
 # Browser Configuration Attempt Log
+**Status:** Living Document (append-only) · **Date:** 2026-07-29 · **Applies to:** every browser launch configuration tried for this project · **Known gap:** the `scripts/browser_configs.py` + `scripts/browser_test.py` harness referenced at the end of this file no longer exists — record new attempts by hand
 
 This file is the canonical record of every browser launch configuration we have tried for this project, along with the method used and the outcome observed. Each entry has a stable `BC-NNN` ID. Before proposing a new approach, scan this log so we don't repeat configurations that have already been ruled out.
 

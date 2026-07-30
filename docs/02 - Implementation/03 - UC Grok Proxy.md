@@ -1,4 +1,5 @@
 # Calling `uc-grok` via the litellm proxy
+**Status:** CURRENT · **Date:** 2026-07-29 · **Applies to:** `litellm.config.yaml`, `uc_provider_loader.py` · **Depends on:** `docs/03 - Architecture/10 - LLM Layer & Interlock.md`
 
 The litellm proxy fronts our browser-driven Grok client as an OpenAI-compatible
 endpoint. Any OpenAI SDK, curl, Cline/Continue plugin, etc. that can point at a

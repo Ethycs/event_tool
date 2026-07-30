@@ -1,4 +1,5 @@
 # Universal Controller + Playwright Integration Guide
+**Status:** Living Document · **Date:** 2026-07-29 · **Applies to:** `ext/universal_controller/`, `sources/uc_browser.py` (external component brought into this repo)
 
 ## Overview
 

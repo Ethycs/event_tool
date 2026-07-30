@@ -1,4 +1,5 @@
 # Pixi CLI Quick Reference
+**Status:** Living Document · **Date:** 2026-07-29 · **Applies to:** the pixi toolchain (external reference; not project-specific)
 
 Pixi is a fast, cross-platform package manager built on the conda ecosystem. It manages project dependencies via a `pixi.toml` (or `pyproject.toml`) manifest and a `pixi.lock` lockfile.
 
