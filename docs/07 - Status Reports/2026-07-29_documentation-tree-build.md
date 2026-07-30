@@ -1,6 +1,6 @@
 # Session Handoff — Documentation tree build
 
-**Date**: 2026-07-29 · **Status**: ✅ LANDED (docs), 🟡 IN FLIGHT (the defects they exposed)
+**Date**: 2026-07-29 · **Status**: ✅ LANDED — **partly superseded** by [2026-07-29_fix-pass-1.md](2026-07-29_fix-pass-1.md) (same day)
 **Scope**: `docs/` (new tree, 24 new docs), `CLAUDE.md`, `TODO.md`, `.gitignore` — **all uncommitted in the working tree**
 
 ## 1. What this session did (chronological)
@@ -11,6 +11,7 @@
 4. Dispatched 15 documentation agents in parallel, one per subsystem, each instructed to read its files in full, write in house style, and mark uncertainty rather than smooth it over.
 5. Wrote the cross-cutting docs by hand: the tree index, the system overview, the design-rationale doc, the gap analysis, the glossary, the archive index, the drift note, and this handoff.
 6. Independently re-verified the highest-impact agent findings against the code (see §3) and corrected three false claims agents made.
+7. Swept the tree for house-style compliance: **every doc now opens with a status block except the archived transcript**, which is correct — archived docs are snapshots and are never edited.
 
 ## 2. Changes in the working tree
 
@@ -62,4 +63,21 @@ Three agent claims were **wrong** and have been corrected in place: that `docs/0
 | `docs/04 - Reference/CLI Command Reference.md` · `MCP Tool Reference.md` | Derived from `parser.py` and the server, not from `README.md` |
 | `docs/05 - Standards/EH-STD-{MSG,EVENT,WEBSRC}-v0` | Record schemas, each with a non-conformance section |
 
-**First action for the next session**: run `git status` to confirm the 24 new docs and 7 staged renames are still uncommitted, then run `pixi run event-harvester --no-cap` — it should fail with "unrecognized arguments", confirming finding 3. Then decide item 1 (fix `README.md` vs. reduce it), because Tier 0 cannot be closed without that call.
+## 6. Exact state of the tree at handoff
+
+| Fact | Value |
+|---|---|
+| Docs in `docs/` | 39 files, ~76k words, 11 numbered folders |
+| Written this session | 25 new (15 by agents, 10 by hand); 7 relocated via `git mv`; 1 (`Great Engineer Personas.md`) added by the user and given a status block |
+| Test baseline | 479 passed, 0 failed, 14.76s — **re-run before trusting this number** |
+| Source code | **Unchanged.** The only non-doc edits are `.gitignore` (+`.token-oauth`), `CLAUDE.md` (rewritten), `TODO.md` (reduced to a pointer) |
+| Git | Committed as `ed3a4ee "Docs Pass"` (by the user, mid-session). `git mv` renames landed as renames, so history follows. Three later edits — the user's `Great Engineer Personas.md`, the drift-note tree count, and §6/§7 of this report — are staged on top |
+| Not mine | `.dvc/`, `.dvcignore`, and six `*.dvc` pointer files appeared in the tree mid-session. `git add -A` briefly staged them; they were unstaged and are **untracked again**. Do not commit them without asking — they look like an in-progress DVC/lakeFS setup |
+
+## 7. Things a cold reader will get wrong
+
+1. **The agent findings are not uniformly trustworthy.** `[V]` in the roadmap means I read the code; `[R]` means an agent said so. Three agent claims were already found false (an "empty" `00 - Theory/` that wasn't, a "missing" `pixi_guide.md` that had moved, a test count of 412 against a measured 479). Treat `[R]` as a lead.
+2. **`05 - Standards` says "Normative" but nothing has been ratified.** The three record specs were reverse-engineered from the code and each carries a §4 listing where the code already violates them. Until someone decides per item, they describe rather than govern.
+3. ~~**`README.md` is still wrong.**~~ **Superseded the same day** by [2026-07-29_fix-pass-1.md](2026-07-29_fix-pass-1.md), which rewrote it as a landing page and closed Tier 0.1–0.5. This report's findings 1–3 and the open-work list in §4 are the state *before* that pass; read the fix-pass report for what is still open.
+
+**Superseded**: this report describes the documentation build only. For current state — 482 tests, Tier 0 closed except 0.9, Tier 1.1 fixed — read [2026-07-29_fix-pass-1.md](2026-07-29_fix-pass-1.md). It is the newer file in this folder, which is the one to start from.

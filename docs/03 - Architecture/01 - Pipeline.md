@@ -57,21 +57,32 @@ A checkpoint (`await reporter.checkpoint()`) fires before each of the four `upda
 
 **Internal structure**, in order (`analysis.py:265-350`):
 1. If `not cfg.is_configured`: return `("", [])` immediately, log a warning.
-2. `cap_total` is computed once: unlimited only if a caps object was passed **and** (`caps.no_cap` or `caps.total < 0`); otherwise `caps.total if caps else 150` — see BUG below.
+2. `cap_total` is computed once: `max(len(messages), 1)` — i.e. no limit — if `caps is None` **or** `caps.no_cap` **or** `caps.total < 0`; otherwise `caps.total`. The three ways a caller says "don't cap this run" all converge here. *(Fixed 2026-07-29; the `caps is None` case used to fall through to a hardcoded `150` — see the resolved BUG note below.)*
 3. If `classifier.has_trained_models()`: `filter_actionable()` → `rejects["classifier"]`; then `prioritize_with_caps()` (or a flat sort+slice to `cap_total` if `caps` is falsy) → `rejects["caps"]`; then `rerank_messages(top_k=cap_total)` (falls back to a plain score-sort if `sentence-transformers` isn't installed) → `rejects["reranker"]`.
 4. Else (no trained classifiers): skip straight to caps (`prioritize_with_caps` or `prioritize(max_messages=cap_total)`) → `rejects["caps"]`; `rejects["reranker"]` is never set in this branch (the orchestrator's `setdefault` fills it with `[]`).
-5. `extract_events_llm._last_rejects = rejects` — **stashed on the function object**, read back by the orchestrator via `getattr`.
+5. Rejects are **returned** on an `ExtractionResult(summary, events, rejects)`. *Changed 2026-07-30: they used to be stashed on the function object (`extract_events_llm._last_rejects`) and read back by the orchestrator via `getattr`.*
 6. Dispatch to `_extract_events_local` (backend `"local"`) or `_extract_events_cloud` (everything else).
 
-`_extract_events_cloud` (`analysis.py:353-437`): splits into batches of 10, submits each to the thread pool, calls `chat_completion()` then `_parse_event_ini(raw)`, and for empty-result batches records the whole batch into `llm_no_events`. After the pool drains: `_extract_events_cloud._last_llm_dropped = llm_dropped` and `._last_llm_no_events = llm_no_events` — **both stashed on the function object**, both read by the orchestrator (and, per the BUG above, read even when this function never ran). Finally runs `dedup_events()` (from `event_match.py`) as a within-run fingerprint-based collapse.
+`_extract_events_cloud`: splits into batches of 10, submits each to the thread pool, calls `chat_completion()` then `_parse_event_ini(raw)`, and for empty-result batches records the whole batch into `llm_no_events`. Returns `(summary, events, llm_rejects)`. Finally runs `dedup_events()` (from `event_match.py`) as a within-run fingerprint-based collapse.
 
-`_parse_event_ini()` (`analysis.py:496-568`): parses the LLM's INI-format response, drops events whose parsed date is in the past into a `dropped` list, and stashes it as `_parse_event_ini._last_dropped` — **also a function-attribute side channel**.
+`_extract_events_local`: same return shape. *Changed 2026-07-30 — it previously produced no reject buckets at all, so a local run's `--show-rejects` displayed the cloud function's leftovers.*
+
+`_parse_event_ini()`: parses the LLM's INI-format response and returns `(summary, events, dropped)`, where `dropped` holds events whose parsed date is in the past.
+
+**~~Three function-attribute side channels~~ — removed 2026-07-30.** `extract_events_llm._last_rejects`, `_extract_events_cloud._last_llm_dropped/._last_llm_no_events`, and `_parse_event_ini._last_dropped` were module-level mutable state used to smuggle data past the return type. They broke in two ways:
+
+1. The orchestrator read `_extract_events_cloud`'s attributes **unconditionally**, including on `backend="local"` runs where that function never executed — so a local run reported a previous cloud run's leftovers, or nothing.
+2. `_parse_event_ini._last_dropped` was written and then read as two separate statements while up to 5 pool workers called it concurrently, so one batch could read a sibling's dropped list.
+
+Returning the data closed both, and was the prerequisite for moving the whole stage onto a worker thread — see the `to_thread` note in the orchestrator section.
 
 **Hard constraints:** batch size is fixed at 10 messages for both backends (`batch_size: int = 10` default param, not config-driven). `_EVENT_EXTRACTION_PROMPT` and `build_prompt()` escape every literal `%` to `%%` to survive a downstream printf-style formatter in litellm/httpx logging (`analysis.py:82-86`) — an intentional workaround, not a parsing bug.
 
 **Failure modes:** a batch-level exception in `_process_batch_with_raw` is caught, logged with `logger.exception`, and turned into a synthetic `llm_dropped` entry (`{"title": "(batch error)", "reason": str(e)}`) plus the whole batch added to the not-tasks list, but not into `llm_no_events` (`analysis.py:401-406`) — one bad batch does not fail the run, it just silently contributes zero events and one reject-bucket line.
 
-**BUG — `caps=None` does not mean unlimited, despite the name `unlimited_caps`.** When `Pipeline.run(unlimited_caps=True)` passes `caps=None` into `extract_events_llm`, step 2 above evaluates `caps.total if caps else 150` — since `None` is falsy, `cap_total` falls back to the **hardcoded literal `150`**, not "no limit." That value is then used as `max_messages`/`top_k` for `prioritize()`/`rerank_messages()`. So `harvest --only telegram` (or MCP `only="telegram"`) — whose entire stated purpose is "the user has already scoped the run and caps would silently drop their target source" (`cli/commands/harvest.py:69-73`) — still silently drops any qualifying messages past the top 150 by score before the LLM ever sees them. Genuine `caps.total = -1` or `caps.no_cap = True` (a caps object *is* passed) correctly bypass the limit; only the `caps=None` code path is broken. `tests/test_pipeline.py::test_unlimited_caps_passes_none_to_extract` only asserts `caps is None` reaches `extract_events_llm` — it does not exercise `analysis.py`'s internal handling of `None`, so this drift is untested.
+**~~BUG~~ — resolved 2026-07-29: `caps=None` now means unlimited, matching the name `unlimited_caps`.** Kept here because the failure is instructive. When `Pipeline.run(unlimited_caps=True)` passed `caps=None` into `extract_events_llm`, step 2 evaluated `caps.total if caps else 150` — `None` is falsy, so `cap_total` fell back to the **hardcoded literal `150`**, not "no limit," and that value was then used as `max_messages`/`top_k` for `prioritize()`/`rerank_messages()`. So `harvest --only telegram` (or MCP `only="telegram"`) — whose entire stated purpose is "the user has already scoped the run and caps would silently drop their target source" (`cli/commands/harvest.py:69-73`) — silently dropped anything past the top 150 by score before the LLM saw it. `caps.total = -1` and `caps.no_cap = True` were always handled correctly; only the `caps=None` path was broken, because it was the one spelling of "unlimited" the condition did not enumerate.
+
+The test that should have caught it, `tests/test_pipeline.py::test_unlimited_caps_passes_none_to_extract`, asserted only that `caps is None` *reaches* `extract_events_llm`. The regression test added with the fix, `tests/test_analysis.py::TestCapEffect`, counts the messages that actually reach `_extract_events_cloud` instead — 200 in, 200 out for both `caps=None` and an all-`-1` `CapConfig`, with `CapConfig(total=40)` still trimming.
 
 **`dead code?`** — `summary` returned by both `_extract_events_local` and `_extract_events_cloud` is effectively always `""`/unused downstream: `_extract_events_cloud` hardcodes `return "", unique`; `_extract_events_local` threads `batch_summary` from `_parse_event_ini`, but `_parse_event_ini` always returns `""` as its first element (`analysis.py:568`, `_PRIO_MAP`/`PRIORITY_LABEL` constants near the top of the file also appear unused by any code path read here — `unverified`, not traced further outside this subsystem).
 
@@ -156,7 +167,7 @@ A checkpoint (`await reporter.checkpoint()`) fires before each of the four `upda
 | `group_by_source` | `False` | output bucketing flag, not read by anything in this subsystem's files |
 | per-source value `-1` | — | unlimited for that one source only (checked individually in `prioritize_with_caps`) |
 | `caps.get(platform)` | — | unknown platform name falls back to the **`web`** cap, not `total` (`config.py:188-196`) — deliberate, since `web_fetch` tags messages with sub-source names like `luma`/`eventbrite` that aren't top-level `CapConfig` fields |
-| `unlimited_caps=True` (orchestrator) → `caps=None` | — | **not** unlimited — see BUG in the `analysis.py` section; silently falls back to a hardcoded 150-message cap |
+| `unlimited_caps=True` (orchestrator) → `caps=None` | — | unlimited (fixed 2026-07-29 — it used to fall back to a hardcoded 150-message cap; see the resolved BUG note in the `analysis.py` section) |
 
 ## Reject buckets — where each is populated
 
@@ -228,5 +239,5 @@ pixi run pytest tests/test_pipeline.py tests/test_pipeline_state.py tests/test_e
 
 Expect all tests green. In particular:
 - `test_pipeline.py::test_run_full_pipeline_tags_status_and_collects_rejects` demonstrates the five-key reject shape and the `_status` tagging described above.
-- `test_pipeline.py::test_unlimited_caps_passes_none_to_extract` only proves `caps=None` reaches `extract_events_llm` — it does **not** cover the hardcoded-150 fallback documented as a BUG in this file; a red flag to add a regression test would be a call to `extract_events_llm(messages, days_back, cfg, caps=None)` with >150 qualifying messages and asserting more than 150 reach the LLM call.
+- `test_pipeline.py::test_unlimited_caps_passes_none_to_extract` only proves `caps=None` reaches `extract_events_llm`. The gap it left — the hardcoded-150 fallback — is now covered by `test_analysis.py::TestCapEffect`, which calls `extract_events_llm(..., caps=None)` with 200 qualifying messages and asserts all 200 reach the LLM call. That is the pattern worth copying for the rest of Tier 1: assert the effect, not the argument.
 - `test_event_match.py::TestFingerprintStore` exercises the pruning rules but writes to a `tmp_path`-monkeypatched `FINGERPRINT_FILE`, so it does not exercise the CWD-relative-path rough edge noted above.

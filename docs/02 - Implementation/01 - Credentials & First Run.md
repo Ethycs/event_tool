@@ -16,7 +16,7 @@ Copy-Item .env.example .env
 | Gmail | `GMAIL_CREDENTIALS_FILE`/`GMAIL_CREDENTIALS_JSON`, `GMAIL_TOKEN_FILE`/`GMAIL_TOKEN_JSON` | Google Cloud Console → APIs & Services → Credentials (OAuth client, Desktop app type) | `interactive — cannot be automated` (browser OAuth consent, once; auto-refreshes silently after) | `token.json` at repo root (or `GMAIL_TOKEN_JSON`, base64) |
 | Discord | `DISCORD_CACHE_PATH` (optional override) | n/a — no token, no login flow in this tool | none in-tool, but **requires** the Discord desktop client already installed, logged in, and having opened the channels you want harvested | none written by this tool — reads the Electron client's own cache in place |
 | Signal | `SIGNAL_DB_PATH` (optional override) | n/a — no token | none in-tool, but **requires** Signal Desktop already installed and logged in | none written by this tool — reads Signal Desktop's own encrypted DB in place |
-| TickTick | `TICKTICK_CLIENT_ID`, `TICKTICK_CLIENT_SECRET`, `TICKTICK_REDIRECT_URI`, `TICKTICK_USERNAME`, `TICKTICK_PASSWORD`, `TICKTICK_PROJECT` (optional) | [developer.ticktick.com](https://developer.ticktick.com) → Manage Apps → + App Name; redirect URL `http://127.0.0.1:8080` | `interactive — cannot be automated` (browser consent **plus** manually pasting the redirected URL back into the terminal — see §2.5) | `.token-oauth` at repo root — **BUG: not gitignored, see §3** |
+| TickTick | `TICKTICK_CLIENT_ID`, `TICKTICK_CLIENT_SECRET`, `TICKTICK_REDIRECT_URI`, `TICKTICK_USERNAME`, `TICKTICK_PASSWORD`, `TICKTICK_PROJECT` (optional) | [developer.ticktick.com](https://developer.ticktick.com) → Manage Apps → + App Name; redirect URL `http://127.0.0.1:8080` | `interactive — cannot be automated` (browser consent **plus** manually pasting the redirected URL back into the terminal — see §2.5) | `data/.token-oauth` — gitignored; pinned explicitly since 2026-07-29, see §3 |
 | OpenAI | `OPENAI_API_KEY` | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) | none — plain key | n/a (env var only) |
 | Anthropic | `ANTHROPIC_API_KEY` | [console.anthropic.com](https://console.anthropic.com) | none — plain key, used as fallback when `OPENAI_API_KEY` is unset (`config.py` `load_config()`) | n/a (env var only) |
 
@@ -60,7 +60,7 @@ No token. `sources/signal.py` opens Signal Desktop's SQLCipher database directly
 
 1. Prerequisite outside this tool: Signal Desktop installed and logged in (`%APPDATA%/Signal/sql/db.sqlite` on Windows must exist).
 2. Auto-detected; override with `SIGNAL_DB_PATH` if needed. `SignalConfig.is_configured` always returns `True` — Signal is treated as "configured" by presence, so a missing/unreadable DB fails at harvest time with a logged error, not a startup warning.
-3. **BUG:** the not-found warning in `sources/signal.py` (`_find_signal_dir`) prints `"SIGNAL_DATA_PATH=%s does not exist"` when you set an invalid override — but the actual env var `config.py` reads is `SIGNAL_DB_PATH`. The message references a variable name that doesn't exist anywhere else in the codebase; if you're debugging a bad override, look for `SIGNAL_DB_PATH`, not `SIGNAL_DATA_PATH`.
+3. The override env var is `SIGNAL_DB_PATH` (`config.py:281`). *Fixed 2026-07-29: the not-found warning in `sources/signal.py:23` used to print `"SIGNAL_DATA_PATH=%s does not exist"` — a variable name that appears nowhere else in the codebase — which sent anyone debugging a bad override looking for the wrong thing. It now prints `SIGNAL_DB_PATH`.*
 4. **Reset:** nothing to reset — no cached credential, just the live Signal Desktop state.
 
 ### 2.5 TickTick
@@ -69,8 +69,8 @@ No token. `sources/signal.py` opens Signal Desktop's SQLCipher database directly
 2. First call to `outputs/ticktick.py` `get_ticktick_client()` constructs a `ticktick.oauth2.OAuth2`, which (per the vendored `ticktick-py` package, `.pixi/envs/default/Lib/site-packages/ticktick/oauth2.py`) does the following if no valid cached token exists:
    - Opens your default browser to TickTick's authorize URL (`webbrowser.open`).
    - **Then prompts on stdin**: `"Enter the URL you were redirected to: "` — you must copy the full redirected URL (including the `code=...&state=...` query string) from the browser's address bar and paste it back into the terminal. `interactive — cannot be automated`, and more manual than a typical "click Allow" OAuth flow — there is no local callback listener despite the redirect URI being `127.0.0.1:8080`.
-3. The resulting token dict is written by `CacheHandler` to **`.token-oauth`** in the process's current working directory — i.e. the repo root, since `event-harvester` is invoked from there.
-4. **Reset:** delete `.token-oauth` and rerun; step 2 repeats. The token has no refresh token in this flow (`ticktick-py`'s `validate_token` just re-requests a full new token via the same interactive prompt once `expire_time` passes), so expect to redo this periodically, not just once per machine.
+3. The resulting token dict is written by `CacheHandler` to **`data/.token-oauth`**. The library's default is `.token-oauth` relative to the process's CWD — i.e. wherever `event-harvester` was launched from — so `get_ticktick_client()` passes an explicit `cache_path` anchored to the repo root (fixed 2026-07-29). It also calls `_migrate_legacy_token_cache()` first, which moves a pre-fix root-level `.token-oauth` into `data/` once so you are not re-prompted. `unverified`: no TickTick credentials exist in this checkout, so neither the pinned path nor the migration has been exercised end-to-end.
+4. **Reset:** delete `data/.token-oauth` and rerun; step 2 repeats. The token has no refresh token in this flow (`ticktick-py`'s `validate_token` just re-requests a full new token via the same interactive prompt once `expire_time` passes), so expect to redo this periodically, not just once per machine.
 
 ### 2.6 OpenAI / Anthropic
 
@@ -87,9 +87,9 @@ Cross-referencing `.gitignore` against every credential file this doc names:
 | `credentials.json` | you (Google Cloud Console download) | Yes — `credentials.json` |
 | `token.json` | Gmail OAuth flow | Yes — `token.json` |
 | `client_secret_*.json` | (alternate Google download naming) | Yes — `client_secret_*.json` |
-| `.token-oauth` | TickTick OAuth flow (`ticktick-py`'s `CacheHandler`) | **No — not matched by any pattern in `.gitignore`** |
+| `data/.token-oauth` | TickTick OAuth flow (`ticktick-py`'s `CacheHandler`) | Yes — `.token-oauth` (no leading slash, so it matches at any depth), and `data/*` covers it too |
 
-**BUG:** `.token-oauth` — the TickTick access-token cache file — has no entry in `.gitignore`. It doesn't exist in this checkout right now (verified: absent from the repo root as of this writing), but the moment someone runs the TickTick OAuth flow from the repo root (the normal invocation path, since `event-harvester` runs from there and the client passes no explicit `cache_path`), it will land as an untracked, **unignored** file containing a live access token. `git add -A` / `git add .` at that point would stage a real credential. Fix: add `.token-oauth` to `.gitignore` before anyone runs the TickTick flow from this checkout.
+**~~BUG~~ — fixed 2026-07-29, in two layers.** `.token-oauth` — the TickTick access-token cache — had no `.gitignore` entry. It did not exist in this checkout, but the first TickTick OAuth run from the repo root would have dropped a live access token there as an untracked, **unignored** file, and `git add -A` would have staged a real credential. Both layers are now in place: `.gitignore` matches `.token-oauth` at any depth (the guard), and `outputs/ticktick.py` passes an explicit `cache_path` under `data/` so it never lands at the repo root in the first place (the fix). Keep both — the ignore rule still protects anyone running an older checkout or a differently-configured client.
 
 No other credential-bearing file was found untracked-but-unignored — `data/*` (with the `web_sources.json` carve-out) covers `data/.playwright_state.json`, `data/.chrome_profile/`, and the labeled-message caches; `.ssh/` is separately ignored.
 

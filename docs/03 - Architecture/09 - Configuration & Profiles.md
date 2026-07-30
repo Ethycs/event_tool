@@ -83,7 +83,7 @@
 |---|---|---|---|---|---|
 | `db_path` | `Optional[str]` | `None` | `SIGNAL_DB_PATH` | none | Override for auto-detected Signal Desktop data directory |
 
-`is_configured` is hard-coded `True`. **BUG**: `db_path` is passed as `override_path` into `sources/signal.py:_find_signal_dir()`, but that function's "path does not exist" warning hard-codes the wrong env-var name — `logger.warning("SIGNAL_DATA_PATH=%s does not exist", override_path)` (`sources/signal.py:23`) — when the actual variable is `SIGNAL_DB_PATH`. The warning will mislead anyone debugging a bad override.
+`is_configured` is hard-coded `True`. `db_path` is passed as `override_path` into `sources/signal.py:_find_signal_dir()`, whose "path does not exist" warning names `SIGNAL_DB_PATH` — the variable actually read. *Fixed 2026-07-29: it used to hard-code `SIGNAL_DATA_PATH`, which exists nowhere else in the codebase.*
 
 ### `LLMConfig`
 
@@ -228,7 +228,7 @@ Discord (`need_discord`) is accepted as a parameter but has **no corresponding w
 | `web_sources` | list of strings | no (default `[]`) | Names from `data/web_sources.json`; `[]` means "don't restrict" (all sources) |
 | `caps` | object | no (default `{}`) | Merged into `cfg.caps` via `setattr` — any key, not validated against `VALID_CAP_KEYS` |
 
-The repo's `data/profiles.json` ships three profiles: `tech-meetups` (Luma/Eventbrite/Meetup, relaxed caps), `sf-local` (SF Chamber + erobay only), and `no-web` — which sets `web_sources: ["__none__"]`, a sentinel name that matches nothing in `data/web_sources.json`, so the web-fetch filter effectively selects zero sources (not special-cased in code; it just relies on no real source being named `__none__`).
+The repo's `data/profiles.json` ships three profiles: `tech-meetups` (Luma/Eventbrite/Meetup, relaxed caps), `sf-local` (SF Chamber + erobay only), and `no-web` — which sets `web_sources: ["__none__"]`, a sentinel name that matches nothing in `data/web_sources.json`, so the web-fetch filter selects zero sources. Not special-cased in code; it relies on no real source being named `__none__` **and** on a zero-match filter meaning zero. *That second half only became true on 2026-07-30 — before then an unmatched filter fell through to "all sources", so this profile ran a full web harvest. See BUG-WEBSRC-1 in `EH-STD-WEBSRC-v0`.*
 
 **Applying a profile** (`apply_profile`, `profiles.py:111-132`):
 1. `cfg.web.selected_names = list(profile.web_sources)` (full replace, not merge — an empty list explicitly clears any prior selection, per `test_empty_web_sources_means_all`).

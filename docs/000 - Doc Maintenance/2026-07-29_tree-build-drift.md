@@ -13,11 +13,12 @@ docs/
 ├── 01 - Design/                   1 doc — why the system has this shape 🟡 thin; rationale still lives in docstrings
 ├── 02 - Implementation/           4 docs — env, creds, deploy, dev loop ✅
 ├── 03 - Architecture/             12 docs — overview + 11 subsystems    ✅ complete
-├── 04 - Reference/                6 docs — UC, pixi, CLI, MCP, glossary ✅
+├── 04 - Reference/                7 docs — UC, pixi, CLI, MCP, glossary,  ✅
+│                                  Fable + engineer personas
 ├── 05 - Standards/                4 docs — docs style + 3 record specs  🟡 v0 DRAFT, not yet frozen
 ├── 06 - Roadmaps/                 1 doc — gap analysis                  ✅ supersedes TODO.md
-├── 07 - Status Reports/           1 doc — this session's handoff        ✅
-├── 08 - Analysis/                 3 docs — browser log, what-worked,    ⚠️ browser log cites missing scripts
+├── 07 - Status Reports/           4 docs — tree build + 3 fix passes    ✅ (1 at time of writing)
+├── 08 - Analysis/                 3 docs — browser log, what-worked,    ✅ (was ⚠️ — see Resolution log)
 │                                  test inventory
 └── 09 - Archived/                 1 transcript + ARCHIVE-INDEX          ✅
 ```
@@ -80,3 +81,35 @@ One note per session that changes code without the matching doc. Name it `YYYY-M
 | 2026-07-29 | `TODO.md` reduced to a pointer; open work lives in `06 - Roadmaps` where items can carry tier, dependency, and verification status | this session |
 | 2026-07-29 | `CLAUDE.md` rewritten: its `./pixi_guide.md` pointer had already broken (file moved to `docs/guides/` before this session) and three agents independently reported it as missing | this session |
 | 2026-07-29 | Gaps 1–6 recorded, none actioned in this pass | this session |
+| 2026-07-29 | Gap 1 resolved by the **alternative**, not the cheap fix: `README.md` is now a landing page. It keeps install, first run, and system shape; it delegates the full flag and tool tables to `04 - Reference`, which are derived from `parser.py` and the server. Rationale: the tables drifted *because* they were duplicated, so fixing them in place would have re-armed the same trap | this session |
+| 2026-07-29 | Gap 2 resolved by marking the harness dead rather than restoring it — nobody has asked for `BC-NNN` automation since 2026-04-28, and the log's value is the eleven lessons, not the runner | this session |
+| 2026-07-29 | Gap 3 resolved by deleting the count from `web_modes/__init__.py` and pointing at `__all__`. `grok_tools.py` left alone: it lives in the `ext/universal_controller` submodule, so the fix belongs upstream | this session |
+
+## Resolution log
+
+Appended after the first fix pass, same day. Gaps 4, 5, and 6 are unchanged and still open.
+
+| Gap | State | Where the fix landed |
+|---|---|---|
+| 1 — `README.md` untrue | ✅ Closed | `README.md` rewritten as a landing page; five contradictions gone; a "Verification" block at the bottom names the three commands that would catch the next drift |
+| 2 — attempt log cites a removed harness | ✅ Closed | `08 - Analysis/00 - Browser Configuration Attempt Log.md`, "How to add a new attempt" step 4 now reads `harness removed — record the attempt by hand` |
+| 3 — docstring counts | 🟡 Half closed | `sources/web_modes/__init__.py` fixed. `grok_tools.py` is upstream in the submodule — tracked as roadmap 0.9, deliberately not fixed here |
+| 4 — `01 - Design` / `00 - Theory` thin | 🔲 Open | No decision yet on docstrings-as-design-lane |
+| 5 — `05 - Standards` derived, not ratified | 🔲 Open | Still the largest honest gap in the tree: the folder says Normative and nothing has been ratified |
+| 6 — transcript only partly decomposed | 🔲 Open | Nobody has read the remaining ~2,900 turns |
+
+`known rough edge`: this note's tree diagram counts docs as of the build pass. It is not regenerated automatically, so treat it as a snapshot rather than a live index — `docs/README.md` is the index.
+
+## Second resolution log — 2026-07-30 (two fix passes)
+
+Appended, not rewritten, per the cadence rule above.
+
+| Gap | State | Note |
+|---|---|---|
+| 4 — `01 - Design` / `00 - Theory` thin | 🔲 Still open | No decision yet on whether docstrings are the design lane. `pipeline/orchestrator.py`'s header and the new `ExtractionResult` docstring are both design documents living in code |
+| 5 — `05 - Standards` derived, not ratified | 🟡 **Progress, not closed** | Two §4 non-conformances were resolved *in favour of the spec* rather than amended away: `BUG-MSG-1` (feed mode's `platform` tag) and `BUG-WEBSRC-1` (the `no-web` profile). That is two decisions made out of the set; the folder is still Normative-in-name until the rest are ruled on |
+| 6 — transcript only partly decomposed | 🔲 Still open | Nobody has read the remaining ~2,900 turns |
+
+**New files this pass** (not drift, recorded so the tree diagram above is known-stale): `03 - Architecture` gained no docs but ~6 were reconciled; `07 - Status Reports` went 1 → 4; `05 - Standards` gained a `source_page` and `queries` field; `docs/` totals ~42.
+
+**Observation worth keeping.** Every defect closed on 2026-07-30 was *documented before it was fixed* — the doc build found them, the roadmap tiered them, and the fixing was mechanical afterwards. The expensive part was reading the code once, carefully. That is the argument for the tree, and it is now evidenced rather than asserted.

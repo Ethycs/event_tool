@@ -2,7 +2,9 @@
 
 **Status:** CURRENT · **Date:** 2026-07-29 · **Applies to:** `src/event_harvester/cli/parser.py`, `src/event_harvester/cli/dispatch.py`, `src/event_harvester/cli/commands/*.py`, `README.md`
 
-Seven top-level subcommands (`harvest`, `watch`, `web`, `recruiters`, `classifier`, `serve`, `mcp`), all rooted at `event_harvester.cli.parser:build_parser()`. Every flag table below is transcribed directly from `parser.py`, not from `README.md` or memory — where `README.md` claims a flag or behavior the parser doesn't have, it's marked `BUG: README drift`; where the parser has a flag `README.md` never mentions, it's marked `undocumented`.
+Seven top-level subcommands (`harvest`, `watch`, `web`, `recruiters`, `classifier`, `serve`, `mcp`), all rooted at `event_harvester.cli.parser:build_parser()`. Every flag table below is transcribed directly from `parser.py`, not from `README.md` or memory.
+
+**This document is now the only complete flag list.** As of 2026-07-29 `README.md` is a landing page that shows a handful of common invocations and links here; it no longer carries flag tables of its own, precisely because the duplicate copy is what drifted. The `undocumented` markers below are therefore historical — they record which flags `README.md` never mentioned *before* that change, which is a decent proxy for "obscure", but their absence from `README.md` is now by design, not an omission. The two `BUG: README drift` items are resolved and kept for the same reason.
 
 ## Hard constraints
 
@@ -11,8 +13,8 @@ Seven top-level subcommands (`harvest`, `watch`, `web`, `recruiters`, `classifie
 3. Bare `event-harvester` (no subcommand, or leading flags with no subcommand token) defaults to `harvest`.
 4. `classifier eval --labels FILE` is required — there is no default.
 5. `web`, `recruiters`, `classifier` each require a second-level subcommand.
-6. `BUG: README drift` — `README.md:197,202` documents a `--no-cap` flag ("or use `--no-cap` to disable all caps") that does not exist anywhere in `parser.py`. `CapConfig.no_cap` is a real field, but it is reachable only through the MCP `harvest_events` tool's `no_cap` parameter, `data/profiles.json` (`{"caps": {"no_cap": true}}`), or the Flet UI checkbox — never through the CLI.
-7. `BUG: README drift` — `README.md:197,201` documents `--cap web=-1` as the way to get an unlimited web cap. `parse_cap_arg` (`parse_helpers.py:51-54`) raises `ArgumentTypeError` for any negative value, so `--cap web=-1` is `SystemExit` on the CLI even though the `-1` sentinel is real and honored elsewhere (`pipeline/analysis.py:290-291`, env var `CAP_WEB=-1`).
+6. **There is no `--no-cap` flag.** `CapConfig.no_cap` is a real field, but it is reachable only through the MCP `harvest_events` tool's `no_cap` parameter, `data/profiles.json` (`{"caps": {"no_cap": true}}`), or the Flet UI checkbox — never through the CLI. *`README.md` documented it until 2026-07-29; the docs were corrected to match the parser rather than the flag being added. If the flag is actually wanted, that is a feature request.*
+7. **`--cap web=-1` exits non-zero.** `parse_cap_arg` (`parse_helpers.py:51-54`) raises `ArgumentTypeError` for any negative value, even though the `-1` "unlimited" sentinel is real and honored everywhere else (`pipeline/analysis.py`, env var `CAP_WEB=-1`). Use `CAP_WEB=-1` in the environment. *`README.md` documented the flag form until 2026-07-29 and now documents the env form; `parse_cap_arg` was left alone because accepting the sentinel is a behavior change.*
 
 ## `harvest`
 
@@ -71,28 +73,39 @@ pixi run event-harvester watch --interval 60
 pixi run event-harvester watch --skip gmail,signal,web
 ```
 
-## `web {list, add, test, login}`
+## `web {list, add, test, probe, login}`
 
 Entry point: `commands/web.py:web_cmd`. Manages `data/web_sources.json`.
 
 | Subcommand | Purpose | Positional / flags |
 |---|---|---|
 | `web list` | List configured web sources | none |
-| `web add URL` | Diagnose `URL` and append it to `data/web_sources.json` | `url` (required); `--mode {calendar,feed,search,raw}` (default: auto-detected) |
-| `web test URL` | Diagnose `URL` without saving | `url` (required) |
+| `web add URL` | Probe for a feed, else diagnose `URL`, then append to `data/web_sources.json` | `url` (required); `--mode`, `--no-probe` |
+| `web test URL` | Same diagnosis without saving | `url` (required); `--no-probe` |
+| `web probe [URL…]` | **Added 2026-07-30.** Find iCalendar feeds without a browser. With no arguments, probes every configured source not already in `ics` mode | `urls` (optional, repeatable); `--apply`, `--timeout` |
 | `web login` | Open a browser to log into web sites and save session state | none |
 
 | Flag | Value | Default | Effect |
 |---|---|---|---|
-| `--mode` | one of `calendar`, `feed`, `search`, `raw` | `None` (auto-detected by `_run_url_diagnostics`) | `undocumented`. Overrides the auto-detected fetch mode for `web add`. |
-| `-v`, `--verbose` / `-q`, `--quiet` | flag | `False` | `undocumented`. |
+| `--mode` (`add`) | `calendar`, `feed`, `search`, `raw`, `ics` | `None` (auto-detected) | Overrides the detected fetch mode. Passing it also **skips the feed probe** — an explicit mode is taken as the answer. |
+| `--no-probe` (`add`, `test`) | flag | `False` | Skip the browser-free feed probe and go straight to Playwright. |
+| `--apply` (`probe`) | flag | `False` | Rewrite configured sources that have a feed to `ics` mode. Only valid with no URL arguments — there is nothing to rewrite for an unconfigured URL. |
+| `--timeout` (`probe`) | int (seconds) | `10` | Per-request timeout. |
+| `-v`, `--verbose` / `-q`, `--quiet` | flag | `False` | |
 
-`.ics`/`webcal://` URLs skip the browser entirely and go through a direct fetch-and-parse diagnostic (`commands/web.py:_diagnose_ics`).
+**Probe-first ordering.** `web add`/`web test` now run `feed_probe.probe_feeds` before launching a browser. If the site publishes iCalendar, that is the answer, and starting Playwright to reach a worse recommendation is wasted time. On a hit, `web add` stores the **feed** URL rather than the page it was found on, plus a `source_page` field recording where it came from — otherwise a venue whose feed lives on a CDN or on `tockify.com` would be named after the platform.
+
+`.ics`/`webcal://` URLs skip discovery entirely and are validated directly.
+
+**`--apply` safety rail:** a discovered feed with **0 upcoming events** is skipped rather than applied, and says so. Zero upcoming is equally consistent with "stale export nobody updates" as with "quiet month", and switching a working browser source to it would silently zero that venue.
 
 ```powershell
 pixi run event-harvester web list
+pixi run event-harvester web probe                      # audit every configured source
+pixi run event-harvester web probe --apply              # ...and convert the hits to ics
+pixi run event-harvester web probe https://somebar.com  # one-off check
 pixi run event-harvester web test https://lu.ma/discover
-pixi run event-harvester web add https://cdn.dnalounge.com/events.ics --mode feed
+pixi run event-harvester web add https://cdn.dnalounge.com/events.ics
 ```
 
 ## `recruiters {grade, reparse}`
@@ -213,13 +226,15 @@ Every variable is read once, in `config.py:load_config()`, at process start — 
 | `TELEGRAM_CHANNELS`, `TELEGRAM_EXCLUDE` | none | |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `--debug-otel` (partial) | Read directly in `dispatch.py`, not `config.py`. OTLP export is attached whenever this env var is set, **regardless** of `--debug-otel`; `--debug-otel` additionally attaches a console exporter. |
 
-## README drift summary
+## README drift summary — **resolved 2026-07-29**
+
+`README.md` was rewritten as a landing page in fix pass 1. Both drift bugs are gone, and the `undocumented` rows below no longer describe a defect: `README.md` deliberately does not enumerate flags any more, so "the parser has it and README doesn't" is now true of most of them by design. The table is kept as a record of which flags were never surfaced to a casual reader before that change.
 
 | Direction | Item | Detail |
 |---|---|---|
-| `BUG: README drift` | `--no-cap` | Documented in `README.md:197,202`; does not exist in `parser.py`. `CapConfig.no_cap` exists but is CLI-unreachable. |
-| `BUG: README drift` | `--cap web=-1` | Documented in `README.md:197,201` as the way to get an unlimited cap; `parse_cap_arg` rejects negative values, so this exact command is `SystemExit`. |
-| `undocumented` (parser has it, README doesn't) | `harvest`: `--show-rejects`, `--web-source`, `--no-cooldown`, `--report`, `--obsidian`, `--grade-recruiters`, `--auto-trash`, `-v`/`-q` | Listed in the `harvest` table above. |
+| ✅ was `BUG: README drift` | `--no-cap` | Documented in `README.md`; does not exist in `parser.py`. `CapConfig.no_cap` exists but is CLI-unreachable. **README corrected; flag not added.** |
+| ✅ was `BUG: README drift` | `--cap web=-1` | Documented in `README.md` as the way to get an unlimited cap; `parse_cap_arg` rejects negative values, so this exact command is `SystemExit`. **README now documents `CAP_WEB=-1`; parser unchanged.** |
+| historical `undocumented` (parser has it, README didn't) | `harvest`: `--show-rejects`, `--web-source`, `--no-cooldown`, `--report`, `--obsidian`, `--grade-recruiters`, `--auto-trash`, `-v`/`-q` | Listed in the `harvest` table above. |
 | `undocumented` | `watch`: `--interval` | README shows bare `watch` only. |
 | `undocumented` | `web add`: `--mode` | |
 | `undocumented` | `recruiters grade`: `--days`, `--auto-trash`, `--obsidian`, `--no-analyze` | README shows bare `recruiters grade` only. |

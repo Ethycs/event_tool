@@ -1,6 +1,19 @@
 # Event Harvester
 
+**Status:** CURRENT · **Date:** 2026-07-29 · **Applies to:** the repo as a whole; flag and tool tables are summarized here and authoritative in [docs/04 - Reference/](docs/04%20-%20Reference/)
+
 Pulls messages from **Discord, Telegram, Gmail, Signal, and the open web**, extracts event candidates with an LLM, and surfaces them through three review interfaces: a CLI report, an interactive Flet web app, and an MCP server for AI clients.
+
+This file is the landing page. It covers install, first run, and the shape of the system. It deliberately does **not** restate the full flag list or tool list — those drifted from the code once already, so they now live in one derived place each:
+
+| You want | Read |
+|---|---|
+| every CLI flag, with defaults and gotchas | [docs/04 - Reference/CLI Command Reference.md](docs/04%20-%20Reference/CLI%20Command%20Reference.md) |
+| every MCP tool, with parameters | [docs/04 - Reference/MCP Tool Reference.md](docs/04%20-%20Reference/MCP%20Tool%20Reference.md) |
+| how the system fits together | [docs/03 - Architecture/00 - System Overview.md](docs/03%20-%20Architecture/00%20-%20System%20Overview.md) |
+| why it has this shape | [docs/01 - Design/00 - Why The System Has This Shape.md](docs/01%20-%20Design/00%20-%20Why%20The%20System%20Has%20This%20Shape.md) |
+| what's broken / open work | [docs/06 - Roadmaps/00 - Gap Analysis and Open Work.md](docs/06%20-%20Roadmaps/00%20-%20Gap%20Analysis%20and%20Open%20Work.md) |
+| the whole doc tree | [docs/README.md](docs/README.md) |
 
 ## Pipeline
 
@@ -13,11 +26,15 @@ Web (Playwright × N) ──┘                                                 
                                                                                   └─► TickTick sync
 ```
 
-Five web modes (`calendar`, `feed`, `search`, `raw`, `chat`) run in parallel browser instances, each per-source-tunable via `data/web_sources.json`. Native-chrome mode is used for Cloudflare-gated sources.
+All three control surfaces call the same `Pipeline` class (`src/event_harvester/pipeline/orchestrator.py`); none of them re-implement stages.
+
+Six web modes — `calendar`, `feed`, `search`, `raw`, `ics`, `chat` — run in parallel browser instances, each per-source-tunable via `data/web_sources.json`. `ics` skips the browser entirely and parses the feed directly. Native-chrome mode is used for Cloudflare-gated sources and stays serial.
+
+**Adding a venue**: `web add URL` probes for a published iCalendar feed *before* launching a browser — most venue sites run a platform (WordPress + The Events Calendar, Tockify, Squarespace, an embedded Google Calendar) that already exports one at a predictable URL. A hit becomes an `ics` source: no browser, no Cloudflare, no scraping. `web probe` runs the same check across every source you already have.
 
 ## Setup
 
-This project is managed with [pixi](https://pixi.sh). See [pixi_guide.md](pixi_guide.md) for env details.
+This project is managed with [pixi](https://pixi.sh). See [docs/04 - Reference/Pixi CLI Reference.md](docs/04%20-%20Reference/Pixi%20CLI%20Reference.md) for env details — never invoke bare `python`.
 
 ```powershell
 # Install everything (conda + PyPI) into .pixi/envs/
@@ -35,7 +52,9 @@ cp .env.example .env
 | Anthropic     | `ANTHROPIC_API_KEY` (fallback if `OPENAI_API_KEY` unset)                                  | [console.anthropic.com](https://console.anthropic.com)  |
 | TickTick      | `TICKTICK_CLIENT_ID`, `TICKTICK_CLIENT_SECRET`, `TICKTICK_USERNAME`, `TICKTICK_PASSWORD`  | [developer.ticktick.com](https://developer.ticktick.com) |
 
-On first run, Telegram prompts for phone OTP once and TickTick opens a browser for OAuth consent once; both cache thereafter.
+On first run, Telegram prompts for phone OTP once and TickTick opens a browser for OAuth consent once; both cache thereafter. The TickTick consent writes a live token to `.token-oauth` at the repo root — it is gitignored, keep it that way.
+
+Full credential walkthrough: [docs/02 - Implementation/01 - Credentials & First Run.md](docs/02%20-%20Implementation/01%20-%20Credentials%20&%20First%20Run.md).
 
 ## Three ways to use it
 
@@ -54,6 +73,8 @@ Opens a control panel at <http://127.0.0.1:8550> that:
 - Shows reject panels per stage (classifier / reranker / caps / LLM) for debugging
 - (When `--debug-web-screenshots` is set) shows a Traces panel with per-source nav steps, inline screenshots, GIFs, and VLM quality badges
 
+`known rough edge`: LLM extraction runs synchronously on the UI's event loop, so the panel freezes for the duration of the extract stage and Stop reports "Stopped" while the run is still going. Tracked as Tier 1.2 in the roadmap.
+
 ### 2. CLI (one-shot batch + cron)
 
 ```powershell
@@ -67,14 +88,17 @@ pixi run event-harvester --no-analyze          # skip LLM extraction
 pixi run event-harvester --save messages.json  # snapshot raw messages
 pixi run event-harvester --load messages.json  # replay from snapshot
 pixi run event-harvester --cap discord=20,telegram=30 --cap total=100
-pixi run event-harvester --group-by-source
+pixi run event-harvester --show-rejects        # per-stage reject counts + data/rejects.ini
+pixi run event-harvester --report weekly.md    # Markdown report
 ```
 
 Subcommands:
 
 ```powershell
-pixi run event-harvester watch                 # poll every 30s
+pixi run event-harvester watch                 # poll Discord + Telegram every 30s
 pixi run event-harvester web list              # show web sources
+pixi run event-harvester web probe             # find iCalendar feeds, no browser
+pixi run event-harvester web probe --apply     # ...and switch those sources to ics
 pixi run event-harvester web test URL          # diagnostics
 pixi run event-harvester web add  URL          # diagnostics + save
 pixi run event-harvester web login             # browser login for session cookies
@@ -85,6 +109,8 @@ pixi run event-harvester classifier eval  --labels labels.json --out-samples sam
 pixi run event-harvester serve                 # Flet UI (above)
 pixi run event-harvester mcp                   # MCP server (below)
 ```
+
+Roughly twenty more flags exist that are not shown above — see the [CLI Command Reference](docs/04%20-%20Reference/CLI%20Command%20Reference.md) for the complete tables.
 
 ### 3. MCP server
 
@@ -109,16 +135,16 @@ Project-local registration for Claude Code lives in [.mcp.json](.mcp.json):
 }
 ```
 
-Exposed tools:
+Twenty tools are registered, in two groups:
 
-| Tool                     | Use                                                            |
-|--------------------------|----------------------------------------------------------------|
-| `config_summary`         | enabled sources, caps, credential readiness                    |
-| `harvest_events`         | run the full pipeline; cache extracted events                  |
-| `list_latest_events`     | list cached event candidates (filter by status)                |
-| `approve_event`          | create/update a TickTick task by index                         |
-| `decline_event`          | mark a cached event index as declined (saves fingerprint)      |
-| `generate_latest_report` | write a Markdown report from the cached events                 |
+| Group | Tools |
+|---|---|
+| Harvest / review (6) | `config_summary`, `harvest_events`, `list_latest_events`, `approve_event`, `decline_event`, `generate_latest_report` |
+| Chat / Grok (14) | `chat`, `grok_send_message`, `grok_read_conversation`, `grok_list_conversations`, `grok_delete_conversation`, `grok_new_chat`, `grok_rename_conversation`, `grok_archive_conversation`, `grok_regenerate`, `grok_stop_generation`, `grok_get_models`, `grok_switch_model`, `list_chat_sessions`, `forget_chat_session` |
+
+The second group comes from `uc_browser.mcp.grok_tools` and is registered inside a `try`/`except` (`servers/mcp_server.py:517-522`). If that import fails the server still starts, logs a warning, and exposes only the first six — so a client seeing 6 tools instead of 20 means the `uc_browser` submodule is missing, not that the server is broken.
+
+Parameters and return shapes for each: [MCP Tool Reference](docs/04%20-%20Reference/MCP%20Tool%20Reference.md).
 
 Resources: `event-harvester://config`, `event-harvester://latest-events`.
 
@@ -127,6 +153,13 @@ A stdio probe lives at [scripts/mcp_probe.py](scripts/mcp_probe.py):
 ```powershell
 pixi run python scripts/mcp_probe.py                   # list tools/resources
 pixi run python scripts/mcp_probe.py call config_summary
+```
+
+To run it as a long-lived service behind the FastMCP gateway, see [docs/02 - Implementation/02 - Deploy Playbook.md](docs/02%20-%20Implementation/02%20-%20Deploy%20Playbook.md):
+
+```powershell
+pixi run eh-service    # backend on :8765
+pixi run gateway       # gateway on :9000/mcp
 ```
 
 ## Profiles
@@ -165,7 +198,9 @@ Tunables:
 - `WEB_DEBUG_TRACE`, `WEB_DEBUG_SCREENSHOTS` — env equivalents of the CLI flags.
 - `VLM_MODEL` — override the vision model (default: `claude-sonnet-4-7` if Anthropic key, else `gpt-4o-mini`).
 - `VLM_MAX_IMAGES_PER_RUN` — image-budget circuit breaker (default `10`).
-- `OTEL_EXPORTER_OTLP_ENDPOINT` — point spans at any OTLP collector.
+- `OTEL_EXPORTER_OTLP_ENDPOINT` — point spans at any OTLP collector. Note this exports whenever it is set, with or without `--debug-otel`.
+
+Details: [docs/03 - Architecture/04 - Observability.md](docs/03%20-%20Architecture/04%20-%20Observability.md).
 
 ## Per-source scroll time
 
@@ -178,7 +213,7 @@ Each entry in `data/web_sources.json` has a `scroll_seconds` field that controls
 ]
 ```
 
-Default if omitted: 5 seconds.
+Default if omitted: 5 seconds. The full schema for a web-source entry is [EH-STD-WEBSRC-v0](docs/05%20-%20Standards/EH-STD-WEBSRC-v0%20—%20Web%20Source%20&%20Profile%20Config.md).
 
 ## Parallel web fetch
 
@@ -194,15 +229,20 @@ pixi run event-harvester --only discord,gmail
 pixi run event-harvester --skip web
 ```
 
-Per-source caps prevent any noisy source from crowding out higher-signal events. `total` is the global ceiling applied after per-source caps. Defaults: discord=50, telegram=50, gmail=30, signal=30, web=30, total=150. Set any cap to `-1` for unlimited, or use `--no-cap` to disable all caps.
+Per-source caps prevent any noisy source from crowding out higher-signal events. `total` is the global ceiling applied after per-source caps. Defaults: discord=50, telegram=50, gmail=30, signal=30, web=30, total=150.
 
 ```powershell
 pixi run event-harvester --cap discord=20,telegram=30 --cap total=100
-pixi run event-harvester --cap web=-1                 # unlimited web
-pixi run event-harvester --no-cap
 ```
 
 Env overrides: `CAP_DISCORD=100`, `CAP_TOTAL=200`, etc.
+
+Two caveats the CLI does not make obvious:
+
+- **There is no `--no-cap` flag.** `CapConfig.no_cap` is real, but it is reachable only from the MCP `harvest_events` tool, a profile in `data/profiles.json`, or the Flet UI checkbox.
+- **`--cap web=-1` exits non-zero.** `parse_cap_arg` rejects negative values. The `-1` "unlimited" sentinel is honored everywhere else, so use `CAP_WEB=-1` in the environment instead.
+
+`BUG:` `--only` disables per-source caps but still lands on a `total` ceiling of 150 downstream (`pipeline/analysis.py:296`), so "unlimited" is not unlimited. Tier 1.1 in the roadmap.
 
 ## Discord cache notes
 
@@ -214,51 +254,63 @@ Env overrides: `CAP_DISCORD=100`, `CAP_TOTAL=200`, etc.
 ## Development
 
 ```powershell
-pixi run test                 # full suite
+pixi run test                 # full suite — 479 tests, ~15s
 pixi run test tests/test_nav_quality.py -v
-ruff check src/ tests/
-ruff format src/ tests/
+pixi run lint                 # ruff check src/ tests/
+pixi run format               # ruff format src/ tests/
 ```
+
+`pixi run test`, `lint`, and `format` live in the `dev` feature. See [docs/02 - Implementation/04 - Testing & Dev Loop.md](docs/02%20-%20Implementation/04%20-%20Testing%20&%20Dev%20Loop.md) for what the suite does and does not cover — notably, `tests/test_app.py` does not test the Flet UI.
 
 ## Project structure
 
 ```
 src/event_harvester/
-├── cli/
+├── cli/                       # argparse + one file per subcommand
 │   ├── dispatch.py            # main(), routing, argv normalization
-│   ├── parser.py              # argparse subcommand setup
+│   ├── parser.py              # subcommand + flag definitions
 │   ├── parse_helpers.py       # --cap, --only, --skip parsers
-│   └── commands/              # one file per subcommand
-│       ├── harvest.py
-│       ├── watch.py
-│       ├── web.py
-│       ├── recruiters.py
-│       ├── classifier.py
-│       ├── serve.py
-│       └── mcp.py
-├── app.py                     # Flet web UI + pipeline control state machine
+│   └── commands/              # harvest, watch, web, recruiters, classifier, serve, mcp
+├── pipeline/                  # the one shared pipeline
+│   ├── orchestrator.py        # Pipeline class — every surface calls this
+│   ├── harvest.py             # async source fan-out + message cache
+│   ├── analysis.py            # LLM extract + prioritize + caps
+│   ├── classifier.py          # sklearn classifier (actionable vs noise)
+│   ├── reranker.py            # cross-encoder rerank
+│   ├── weights.py             # gate signals
+│   ├── event_match.py         # fingerprint match/dedup
+│   ├── dedup.py               # event dedup helpers
+│   └── state.py               # run state / checkpointing
+├── sources/                   # one module per input
+│   ├── discord.py             # LevelDB cache reader
+│   ├── telegram.py            # Telethon MTProto reader
+│   ├── gmail.py               # Gmail API reader
+│   ├── signal.py              # Signal Desktop SQLCipher reader
+│   ├── chromium_cache.py      # dead code? — no callers, see roadmap
+│   ├── uc_browser.py          # Playwright + UC extension wrapper
+│   ├── web_fetch.py           # web source driver
+│   ├── web_session.py         # cookie/session state
+│   ├── web_utils.py
+│   └── web_modes/             # calendar, feed, search, raw, ics, chat
+├── outputs/                   # ticktick.py, report.py, obsidian.py
+├── observability/             # navigation_trace, screenshot_capture, nav_quality, tracing
+├── servers/mcp_server.py      # Model Context Protocol server
+├── ui/                        # app.py (Flet), server.py, display.py
+├── training/                  # label.py, eval_classifier.py, recruiter_score.py
 ├── config.py                  # AppConfig, env loading, validation
-├── display.py                 # Terminal formatting
-├── harvest.py                 # async source fan-out + message cache
-├── analysis.py                # LLM extract + prioritize + caps
-├── classifier.py              # sklearn classifier (actionable vs noise)
-├── weights.py                 # reranker + gate signals
-├── event_match.py             # fingerprint match/dedup
-├── dedup.py                   # event dedup helpers
 ├── llm.py                     # litellm chat + vision wrappers
+├── interlock.py               # single-GPU/model access interlock
 ├── profiles.py                # named profiles (web sub-sources + caps)
-├── ticktick.py                # TickTick OAuth + task creation
-├── report.py                  # Markdown report writer
-├── navigation_trace.py        # JSONL nav-event recorder (Phase 1)
-├── screenshot_capture.py      # PNG + GIF capture (Phase 2)
-├── nav_quality.py             # VLM scorer + key-frame picker (Phase 3)
-├── tracing.py                 # OpenTelemetry bootstrap
-├── mcp_server.py              # Model Context Protocol server
-└── sources/
-    ├── discord.py             # LevelDB cache reader
-    ├── telegram.py            # Telethon MTProto reader
-    ├── gmail.py               # Gmail API reader
-    ├── signal.py              # Signal Desktop SQLCipher reader
-    ├── uc_browser.py          # Playwright + UC extension wrapper
-    └── web_fetch.py           # calendar/feed/search/raw/chat modes
+├── watch.py                   # poll loop
+└── web_primitives.py          # L1 page-traversal verbs
 ```
+
+## Verification
+
+```powershell
+pixi run event-harvester --help          # flags here should be a subset of what --help prints
+pixi run python scripts/mcp_probe.py     # 20 tools + 2 resources (6 tools if uc_browser is absent)
+pixi run test                            # 479 passed
+```
+
+If any of those three disagree with this file, this file is the one that is wrong — fix it here and reconcile the matching doc under `docs/`.

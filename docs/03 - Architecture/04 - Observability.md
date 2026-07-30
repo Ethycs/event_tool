@@ -1,8 +1,10 @@
 # Observability
 
-**Status:** CURRENT · **Date:** 2026-07-29 · **Applies to:** `src/event_harvester/observability/__init__.py`, `src/event_harvester/observability/navigation_trace.py`, `src/event_harvester/observability/screenshot_capture.py`, `src/event_harvester/observability/nav_quality.py`, `src/event_harvester/observability/tracing.py`, `src/event_harvester/logging_tags.py` · **Depends on:** `docs/03 - Architecture/03 - Sources — Web.md`
+**Status:** CURRENT · **Date:** 2026-07-30 (OTel coverage extended package-wide) · **Applies to:** `src/event_harvester/observability/*`, `src/event_harvester/logging_tags.py`, and the `@traced` call sites throughout the package · **Depends on:** `docs/03 - Architecture/03 - Sources — Web.md`
 
-Three independent, opt-in debug flags instrument the web-fetch path: `--debug-web-trace` records a JSONL log of every page navigation, `--debug-web-screenshots` adds per-step PNGs and scroll-sequence GIFs, and `--debug-otel` emits OpenTelemetry spans for pipeline stages and per-source web fetches. Screenshots imply trace; OTel is orthogonal to both. A fourth, always-on module (`tracing.py`) wraps OTel as a soft dependency so the whole subsystem is a no-op when `opentelemetry` isn't installed, and `logging_tags.py` is unrelated per-task log labeling that lives in this package for lack of a better home.
+Three independent, opt-in debug flags instrument the web-fetch path: `--debug-web-trace` records a JSONL log of every page navigation, `--debug-web-screenshots` adds per-step PNGs and scroll-sequence GIFs, and `--debug-otel` emits OpenTelemetry spans. Screenshots imply trace; OTel is orthogonal to both. A fourth, always-on module (`tracing.py`) wraps OTel as a soft dependency so the whole subsystem is a no-op when `opentelemetry` isn't installed, and `logging_tags.py` is unrelated per-task log labeling that lives in this package for lack of a better home.
+
+**Changed 2026-07-30:** OTel spans used to cover the web-fetch path plus a handful of pipeline stages. They now cover every meaningful operation boundary in the package — see [OTel spans in the codebase](#otel-spans-in-the-codebase). Two things that were previously impossible to observe are now on spans: **per-request LLM token counts** and **TickTick task-creation failures**.
 
 ## Hard constraints
 
@@ -170,7 +172,24 @@ Only a **successful** VLM call increments the counter (`cls._images_sent_this_ru
 
 **Domain:** OpenTelemetry soft-dependency shim. If `opentelemetry` isn't importable, `_OTEL_OK = False` and every public function degrades to a no-op (`_NoOpSpan` / `_NoOpTracer`) — the pipeline runs identically either way.
 
-**Runs at:** `init_tracing()` called once at CLI startup (`dispatch.py:104-108`, before any handler). `get_tracer(name)` called at module scope in `web_fetch.py`, `pipeline/harvest.py`, `pipeline/analysis.py`, and every `web_modes/*.py` file to obtain a per-module tracer object.
+**Runs at:** `init_tracing()` called once at CLI startup (`dispatch.py`, before any handler). `get_tracer(name)` is called at module scope, or implicitly by the `@traced` decorator, in most modules of the package.
+
+**Public API:** `init_tracing`, `get_tracer`, `current_span_event`, and — added 2026-07-30 — **`traced`** and **`set_span_attrs`**.
+
+`traced` is a decorator that runs the wrapped callable inside a span, handling sync, `async def`, and generator functions. It exists because the manual
+`tracer.start_as_current_span(...)` / `set_attribute` / `record_exception` block is ~8 lines of identical boilerplate per function, and the codebase had already drifted into two spellings of it. `set_span_attrs(**attrs)` annotates whichever span is current, so a function body can add computed attributes without threading the span object through. `None` values are skipped, so optional fields can be passed unconditionally.
+
+```python
+@traced("llm.chat", tracer_name="event_harvester.llm")
+def chat_completion(messages, cfg):
+    set_span_attrs(**{"llm.model": cfg.model})
+```
+
+Three properties `traced` guarantees, each pinned by `tests/test_tracing.py::TestTracedDecorator`:
+
+1. **It returns what the function returns** — including awaiting coroutines rather than handing back the coroutine object.
+2. **It never swallows an exception.** The error is recorded on the span as `error.message` plus `record_exception`, then re-raised. Instrumentation must not change control flow.
+3. **It preserves signature metadata** (`functools.wraps` plus an intact `inspect.signature`). This is load-bearing rather than cosmetic: FastMCP builds each MCP tool's JSON schema by introspecting the decorated function, so a decorator that collapsed the signature to `(*args, **kwargs)` would silently strip every tool's parameters. Verified live — `scripts/mcp_probe.py` still reports full parameter lists for all six harvest/review tools.
 
 **Inputs:** `init_tracing(debug: bool = False, otlp_endpoint: str | None = None)`. `debug=True` (from `--debug-otel`) attaches a `ConsoleSpanExporter` on a `SimpleSpanProcessor` (prints spans to stderr synchronously). `otlp_endpoint` (from `OTEL_EXPORTER_OTLP_ENDPOINT`) attaches an `OTLPSpanExporter` (gRPC, insecure) on a `BatchSpanProcessor`.
 
@@ -180,23 +199,47 @@ Only a **successful** VLM call increments the counter (`cls._images_sent_this_ru
 
 ### OTel spans in the codebase
 
-| Span name | Tracer | Attributes set | File |
-|---|---|---|---|
-| `harvest` (root) | `event_harvester.pipeline.harvest` | — | `pipeline/harvest.py:277` |
-| `harvest.discord` | same | — | `pipeline/harvest.py:124` |
-| `harvest.telegram` | same | — | `pipeline/harvest.py:145` |
-| `harvest.gmail` | same | — | `pipeline/harvest.py:167` |
-| `harvest.signal` | same | — | `pipeline/harvest.py:186` |
-| `harvest.web` | same | — | `pipeline/harvest.py:207` |
-| `extract.batch.{i}` | `event_harvester.pipeline.analysis` | — | `pipeline/analysis.py:387,460` |
-| `match.fingerprints` | same | — | `pipeline/analysis.py:430,487` |
-| `web.{source_name}` | `event_harvester.web_fetch` | `source.name`, `source.url`, `source.mode`; `error.message` set on exception | `sources/web_fetch.py:181-184,264` |
-| `web.{name}.calendar` | `event_harvester.web_fetch` | mode-specific (unverified — not read in full) | `sources/web_modes/calendar.py:108-109` |
-| `web.{name}.feed` | same | — | `sources/web_modes/feed.py:29-30` |
-| `web.{name}.search` | same | — | `sources/web_modes/search.py:25-26` |
-| `web.{name}.chat` | same | — | `sources/web_modes/chat.py:22-23` |
-| `web.{name}.ics` | same | — | `sources/web_modes/ics.py:34-35` |
-| `web.{name}.raw` | same | — | `sources/web_modes/raw.py:23-24` |
+Coverage was extended on 2026-07-30 from "the web-fetch path and a few pipeline stages" to **every meaningful operation boundary** — a stage, an I/O call, an LLM request, a page interaction, a CLI or MCP entry point.
+
+Deliberately *not* instrumented: per-element helpers called inside tight loops (`score_message`, `_pattern_to_element`, `event_signature`). A span per message would cost more than it explains and would bury the spans that matter. "Instrument everything" means every boundary, not every call.
+
+**Trace root.** `cli.{command}` (`cli/dispatch.py`) wraps the whole invocation. Before it existed, every span a run produced was its own orphan trace — `harvest.discord` and the `llm.chat` calls it caused ended up unrelated in the backend, so you could ask "what happened" but never "what did *this run* do" or "how long did the whole thing take". Attributes: `cli.command`, the relevant sub-command, `cli.verbose`/`cli.quiet`, `cli.exit_code`, and `cli.interrupted` on Ctrl-C.
+
+| Span | Tracer | Notable attributes |
+|---|---|---|
+| `cli.{command}` (root) | `event_harvester.cli` | `cli.command`, `cli.exit_code`, `cli.interrupted` |
+| `pipeline.run` | `…pipeline.orchestrator` | `pipeline.days_back`, `pipeline.unlimited_caps`, `pipeline.outcome` (`ok` / `no_messages` / `skipped_analysis`), `event.count`, `reject.{bucket}` per reject bucket |
+| `pipeline.{harvest,filter,extract,match}` | same | per-stage counts; `message.count.{platform}` on harvest, `link.count` on filter, `event.new`/`event.known` on match |
+| `harvest` + `harvest.{platform}` | `…pipeline.harvest` | (pre-existing) |
+| `source.{discord,telegram,gmail,signal}.*` | `…sources.{name}` | `message.count`; `message.pinned` for Telegram |
+| `classifier.filter_actionable` / `classifier.predict` | `…pipeline.classifier` | `classifier.message.in/out/filtered`, `classifier.bypassed`, `classifier.web_passthrough` |
+| `rerank.messages` | `…pipeline.reranker` | `rerank.candidates`, `rerank.dropped_past`, `rerank.dropped_no_signal`, `rerank.score.top/cutoff`, `rerank.truncated` |
+| `rerank.cross_encoder.predict` | same | `rerank.pair_count` — the GPU work, split out so it is distinguishable from the filtering around it |
+| `rerank.model.get` | same | `rerank.model.cached`, `rerank.model.loaded_from` (`local` / `hf_cache` / `huggingface_download`) |
+| `llm.chat` | `event_harvester.llm` | `llm.backend`, `llm.model`, `llm.message_count`, `llm.request_chars`, `llm.response_chars` |
+| `llm.litellm.completion` | same | **`llm.prompt_tokens`, `llm.completion_tokens`, `llm.total_tokens`**, `llm.finish_reason` |
+| `llm.local.generate` | same | `llm.local.restarted`, `llm.local.tokens_generated`, `llm.local.elapsed_s` |
+| `llm.vision` | same | `llm.image_count`, `llm.image_sent_count`, `llm.image_missing_count`, `llm.image_bytes`, token counts |
+| `extract.batch.{i}`, `match.fingerprints` | `…pipeline.analysis` | (pre-existing) |
+| `fingerprint.load` | `…pipeline.event_match` | `fingerprint.loaded/kept/pruned` |
+| `fingerprint.save`, `dedup.within_run` | same | `dedup.event.in/out`, `dedup.collapsed` |
+| `web.{source}` and `web.{name}.{mode}` | `event_harvester.web_fetch` | (pre-existing) |
+| `feedprobe` + `feedprobe.{fetch_page,discover.*,validate}` | `…sources.feed_probe` | see the web-sources doc |
+| `web.verb.{name}` (16 L1 verbs) | `event_harvester.web_primitives` | `web.found`, `web.element.selector/label/confidence`, `web.element.low_confidence`, `web.arbitrate.candidates` |
+| `mcp.tool.{name}` (6), `mcp.resource.{name}` (2) | `…servers.mcp_server` | — |
+| `ticktick.create_tasks` | `…outputs.ticktick` | `ticktick.created/updated/skipped/**failed**`, `ticktick.dry_run` |
+| `report.generate`, `obsidian.*` | `…outputs.*` | — |
+| `cli.web.{sub}`, `cli.web.probe.{batch,apply}` | `…cli.commands.web` | `probe.url_count`, `probe.hit_count`, `apply.changed_count` |
+| `profiles.{load,apply}`, `watch.loop`, `training.*`, `web.login` | various | — |
+
+Two of these exist because the thing they measure was previously *unobservable*, not merely uninstrumented:
+
+- **`llm.litellm.completion` token counts.** litellm logs nothing by default and the pipeline discards the response object, so per-run API cost was not recoverable from anything the app produced.
+- **`ticktick.failed`.** `create_ticktick_tasks` catches a per-task exception, prints it, and moves on — the failure never reaches `result`, so no caller could count it. The span attribute (and a new WARNING log line) is now the only way to learn that fewer tasks exist than events were extracted.
+
+**`web.verb.*` is the substrate for crystallised navigation.** Every `find_*` verb funnels through `_arbitrate`, which records how many candidates the detectors surfaced, which was chosen, its confidence, and whether that confidence fell below `CONFIDENCE_THRESHOLD`. A trace of an exploration run is therefore already an ordered, attributed record of the L1 verbs used to reach the content — the raw material a route distiller would consume, and the signal for which step will break first when the page changes.
+
+Every `NavigationTracer.record()`/`record_with_screenshot()` call additionally attaches a **span event** (not a new span) named after the JSONL `kind` (`open`, `framenavigated`, `popup`, `xhr`, `close`, `feed-gif`) to whatever span is current at write time, with attributes `url`, `step`, `parent` (`navigation_trace.py:141-153`, `tracing.py`). This means JSONL trace rows and OTel span events are two independent, redundant recordings of the same navigation events — the JSONL is always written; the span event is best-effort and silently dropped if no span is active or OTel is unavailable.
 
 Every `NavigationTracer.record()`/`record_with_screenshot()` call additionally attaches a **span event** (not a new span) named after the JSONL `kind` (`open`, `framenavigated`, `popup`, `xhr`, `close`, `feed-gif`) to whatever span is current at write time, with attributes `url`, `step`, `parent` (`navigation_trace.py:141-153`, `tracing.py:129-143`). This means JSONL trace rows and OTel span events are two independent, redundant recordings of the same navigation events — the JSONL is always written; the span event is best-effort and silently dropped if no span is active or OTel is unavailable.
 

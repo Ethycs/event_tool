@@ -109,7 +109,7 @@ Refuses to run if `has_trained_models()` is false (no `.pkl` at all — legacy `
 05_after_heuristic_dropped.json
 ```
 
-Each item: `{id, platform, author, timestamp, channel, content (truncated 500 chars), llm_label, llm_label_str, classifier_pred, heuristic_kept, manual_label: null}`. Verified against `data/eval_samples/02_after_classifier_kept.json` on disk — matches exactly. `manual_label` is always written `null` by the tool; filling it in is entirely a **manual step**, and nothing in the codebase reads `manual_label` back — it's for human review only (the eval CLI's printed hint "Then retrain: pixi run event-harvester --load-labels <corrected-file>" is itself **stale**: that flag name (`--load-labels`, top-level) doesn't exist in the current parser — the real flag is `classifier train --in-labels FILE`, see `cli/parser.py:287`. Flagging as **BUG: stale CLI hint text** in `eval_classifier.py:276`).
+Each item: `{id, platform, author, timestamp, channel, content (truncated 500 chars), llm_label, llm_label_str, classifier_pred, heuristic_kept, manual_label: null}`. Verified against `data/eval_samples/02_after_classifier_kept.json` on disk — matches exactly. `manual_label` is always written `null` by the tool; filling it in is entirely a **manual step**, and nothing in the codebase reads `manual_label` back — it's for human review only. The eval CLI's printed hint now reads "Then retrain: pixi run event-harvester classifier train --in-labels &lt;corrected-file&gt;" (`cli/parser.py:287`). *Fixed 2026-07-29: it used to name a top-level `--load-labels` flag that does not exist in the parser.*
 
 **Failure mode:** `run_eval` doesn't enforce that `--labels` is a held-out split distinct from what trained the model — evaluating on the same file used for training will overstate accuracy. Splitting is entirely the operator's responsibility (no `train`/`eval` split flag exists anywhere in this loop).
 
@@ -156,7 +156,7 @@ pixi run event-harvester recruiters reparse REPORT.md
 
 ## Failure modes summary
 
-- **BUG:** stale hint text in `eval_classifier.py:276` referencing a nonexistent `--load-labels` flag; correct command is `classifier train --in-labels FILE`.
+- ~~**BUG:** stale hint text in `eval_classifier.py:276` referencing a nonexistent `--load-labels` flag~~ — fixed 2026-07-29; it now prints `classifier train --in-labels FILE`.
 - **BUG (historical, fixed):** fixed-depth `.parent` chain used to resolve `classifiers/`, silently pointed at `src/classifiers`, disabled filtering entirely with no visible error — see constraint 2. The upward-search fix in `_find_classifiers_dir` is what's deployed now, but any future refactor of `pipeline/classifier.py`'s location must not reintroduce a hardcoded `.parent.parent...` depth.
 - Retrained `.pkl` files have **no effect on a running `serve`/`watch`/`mcp` process** — `_model_cache` never invalidates; a restart is required. Nothing in the CLI or docs currently reminds the operator of this.
 - `classifier eval` does not enforce a train/eval split — self-evaluation is possible and silent.

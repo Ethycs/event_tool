@@ -1,6 +1,6 @@
 # Sources — Web
 
-**Status:** CURRENT · **Date:** 2026-07-29 · **Applies to:** `src/event_harvester/sources/web_fetch.py`, `uc_browser.py`, `web_session.py`, `web_utils.py`, `src/event_harvester/sources/web_modes/{__init__,calendar,feed,search,raw,ics,chat}.py`, `src/event_harvester/web_primitives.py`, `data/web_sources.json`, `ext/helpers/extract_event_links.js` · **Depends on:** `docs/04 - Reference/Universal Controller Guide.md`
+**Status:** CURRENT · **Date:** 2026-07-30 (added `feed_probe.py`) · **Applies to:** `src/event_harvester/sources/web_fetch.py`, `uc_browser.py`, `web_session.py`, `web_utils.py`, `feed_probe.py`, `src/event_harvester/sources/web_modes/{__init__,calendar,feed,search,raw,ics,chat}.py`, `src/event_harvester/web_primitives.py`, `data/web_sources.json`, `ext/helpers/extract_event_links.js` · **Depends on:** `docs/04 - Reference/Universal Controller Guide.md`
 
 The web fetch path turns `data/web_sources.json` into a list of message dicts by driving one or more headed Chromium/Chrome instances through Universal Controller (UC), routing each source through a mode-specific handler in `web_modes/`. `web_fetch.fetch_web_sources` is the sole entry point: it splits sources into a parallel pool of "standard" browsers plus one serial pool for `native_chrome` (Cloudflare) sources, and retries Cloudflare-blocked standard sources through native Chrome afterward. Everything downstream (`pipeline/harvest.py`) treats the return value as a flat `list[dict]` of chat-shaped messages, regardless of which mode produced them.
 
@@ -16,9 +16,44 @@ The web fetch path turns `data/web_sources.json` into a list of message dicts by
 | Page navigation timeout | `cfg.web.timeout_ms`, default **30000ms** | `config.py:WebConfig.timeout_ms` |
 | Content truncation per message | Calendar/search/feed detail: 5000 chars; raw/calendar-fallback: 8000 chars; chat: 8000 chars; ICS description: 2000 chars | per-mode `content[:N]` slices |
 
+## Module: `feed_probe.py` — find a feed before reaching for a browser
+
+**Added 2026-07-30.** **Domain:** given a page URL, find a machine-readable calendar feed without launching a browser. **Runs at:** `web add`, `web test`, and `web probe` (never during a harvest). **Inputs:** a URL. **Outputs:** a ranked list of validated `FeedCandidate`s, or `[]`.
+
+**Why it exists.** Small venues do not hand-roll their events page; they run a platform, and every one of those platforms already publishes iCalendar at a predictable URL. Two pre-existing sources prove it — `powerhouse` uses `powerhousebar.com/events/?ical=1`, which is not a Powerhouse fact but The Events Calendar WordPress plugin's standard export. **Recognising the platform is worth more than recognising the site.** A hit converts a browser-driven `raw`/`calendar` source into an `ics` one: faster, more reliable, immune to Cloudflare, and already a supported mode.
+
+**Internal structure.** Four discovery lanes in decreasing order of trustworthiness, each its own span:
+
+| Lane | Origin tag | What it looks at |
+|---|---|---|
+| 1 | `link-rel` | `<link rel="alternate" type="text/calendar">` — the standard |
+| 2 | `embed` | iframes pointing at a calendar platform; a Google Calendar embed carries the calendar id in `?src=`, which *derives* the ICS URL rather than guessing it |
+| 3 | `anchor` | visible links ending `.ics` or carrying `ical=1` / `format=ical` |
+| 4 | `platform` | HTML fingerprint (Tribe/The Events Calendar, Events Manager, Tockify, Squarespace, generic WordPress) → that platform's known export URLs |
+
+Blind probes of four conventional paths run **only when the first four lanes found nothing**, so a site that declares its feed is never speculatively poked.
+
+**Validation is the filter, and that is the load-bearing design choice.** Nothing is trusted for matching a pattern — every candidate is fetched and parsed, and counts only if `icalendar` parses it and it holds ≥1 VEVENT. That is what makes the speculative pattern table safe: a wrong guess costs one request and is discarded, so the table can be optimistic without lying to the caller. A WordPress soft-404 is a 200 with HTML, so there is also a cheap `BEGIN:VCALENDAR` check before the parser is handed anything.
+
+**Hard constraints:** ≤12 validations per probe (a venue matching every pattern would otherwise fire ~15 requests at a small business's server); 2MB streamed cap on the page fetch; `event-harvester/1.0 (+feed-probe)` UA.
+
+**`known rough edge`:** HTML scanning is regex-based — the project has no HTML-parser dependency and pulling one in for four attribute lookups was not worth it. Regex over HTML is fragile; it is tolerable *here* only because every candidate is validated by fetching it, so a missed match degrades to "no feed found", never to a bad source entry.
+
+**Failure mode found by running it — per-event exports.** Squarespace puts an "add to calendar" link at every event's permalink, and each one is valid iCalendar containing exactly that event. Probing `studsf.com/calendar` first returned
+`/calendar/2026/7/30/140-olivia-lauren-amp-friends?format=ical` — one event. Adopting it would have replaced a working calendar source with a feed pinned to one night in July. Two rules now reject these:
+
+1. **Dated permalinks** (`/2026/7/30/`) are dropped at *discovery*, so they never cost a request.
+2. **Undated opaque slugs** (`/calendar/h4wr7zbsakm3fye-…?format=ical`) have nothing in the URL to match on. They are dropped after validation when a candidate is both nested under the probed page's path *and* contains ≤1 event — a real collection feed is rarely both. A genuine `/calendar/all.ics` with several events survives.
+
+Accepted cost: a venue whose only feed legitimately holds one upcoming event reads as "none". Reporting nothing beats adopting a feed that will be permanently stale.
+
+**Measured result** (`web probe` over all 27 non-ICS sources, 2026-07-30): **1 hit** — `sf-eagle`, 27 upcoming events via `webcal://wp.sf-eagle.com/events/?ical=1`. The 11 `raw` venues are bare homepages for bars that mostly use Instagram or bespoke designs rather than a calendar platform, so the platform-fingerprint payoff is much smaller here than the Powerhouse/DNA Lounge precedent suggested. The probe is cheap and correct; the SF gay-bar segment simply is not WordPress-shaped.
+
 ## Modes
 
-The README (`README.md:16`) says "Five web modes (`calendar`, `feed`, `search`, `raw`, `chat`)". **That's stale — there are six.** `ics` is a full sixth mode (own file, own OTel span, own dispatch branch in `fetch_web_sources`) that the README doesn't mention. `web_modes/__init__.py`'s own docstring also says "five... entry points" while re-exporting all six (`_do_calendar`, `_do_chat`, `_do_feed`, `_do_ics`, `_do_raw`, `_do_search`) — both are drift against the actual code, not just the README.
+**There are six web modes**, not five: `calendar`, `feed`, `search`, `raw`, `ics`, `chat`. `ics` is a full mode with its own file, OTel span, and dispatch branch in `fetch_web_sources`, and `web_modes/__init__.py` re-exports all six (`_do_calendar`, `_do_chat`, `_do_feed`, `_do_ics`, `_do_raw`, `_do_search`).
+
+*Both places that said "five" were fixed 2026-07-29 — `README.md` now says six, and the `web_modes/__init__.py` docstring points at `__all__` instead of restating a count. That second change is the durable one: a number in prose next to the list it counts is drift waiting to happen.*
 
 | Mode | Domain / what it does | When picked | Runs at | Key tunables |
 |---|---|---|---|---|

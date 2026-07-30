@@ -106,7 +106,7 @@ Message order is deterministic regardless of completion order: results are re-as
 ## Verification
 
 ```powershell
-pixi run test                                   # 479 passed, 0 failed as of 2026-07-29
+pixi run test                                   # 542 passed, 0 failed as of 2026-07-30 (fix pass 2)
 pixi run event-harvester --days 1 --dry-run     # exercise the full pipeline, write nothing external
 ```
 

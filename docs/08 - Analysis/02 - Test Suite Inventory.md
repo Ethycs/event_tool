@@ -4,7 +4,9 @@
 
 ## Verdict
 
-`tests/` holds 26 files and 412 `def test_*` functions, which collect to **479 tests — all passing in 14.8s, measured 2026-07-29** (the gap is `@pytest.mark.parametrize` expansion), covering roughly 40 of the ~75 non-trivial modules under `src/event_harvester/`. Coverage is strong and behavioral for the pure-function layers (parsing, scoring, state machines, prompt building) but there is **zero dedicated coverage for the entire `ui/` package** (`ui/app.py` alone is 1456 lines — larger than the next three untested modules combined), plus no coverage for `sources/chromium_cache.py`, `sources/gmail.py`, `_interlock_worker.py`, and `pipeline/classifier.py`. No test in the suite touches a real network socket, a real browser, or real credentials — everything is mocked, monkeypatched, or duck-typed — so the suite should be safe to run unattended on a clean checkout.
+`tests/` holds 31 files and 472 `def test_*` functions, which collect to **542 tests — all passing in ~12s, measured 2026-07-30 after fix pass 2** (the gap is `@pytest.mark.parametrize` expansion). Growth over three passes: 26 files / 412 functions / 479 collected → 31 / 472 / 542. Coverage spans roughly 45 of the ~75 non-trivial modules under `src/event_harvester/`, and is strong and behavioral for the pure-function layers (parsing, scoring, state machines, prompt building). There is still **zero dedicated coverage for the entire `ui/` package** (`ui/app.py` alone is 1456 lines — larger than the next three untested modules combined) and none for `sources/gmail.py` or `_interlock_worker.py`. *`sources/chromium_cache.py` and `interlock.py` gained their first tests on 2026-07-30 (`test_chromium_cache.py`, `test_interlock.py`); `pipeline/classifier.py` is now exercised indirectly through `test_analysis.py`.*
+
+**New since the original inventory:** `test_feed_probe.py` (19), `test_interlock.py` (6), `test_chromium_cache.py` (3), plus `TestCapEffect`, `TestRejectsComeFromTheBackendThatRan`, `TestParseEventIniIsThreadSafe`, `TestFailureReporting`, `TestWebSourceFilter`, `TestNormalizeQueries`, and `TestTracedDecorator`. These are the first tests in the suite that assert **effects** rather than call shapes — the gap that let all eleven Tier 1 bugs sit under 479 green tests. No test in the suite touches a real network socket, a real browser, or real credentials — everything is mocked, monkeypatched, or duck-typed — so the suite should be safe to run unattended on a clean checkout.
 
 ---
 
@@ -41,7 +43,7 @@ Legend: **behavioral** = asserts specific input→output values/content; **shape
 | `test_web_primitives.py` | `web_primitives.py` | 44 | Behavioral, exercised entirely against duck-typed `FakeUC`/`FakePage` — the most extensive file by test count. `Element.to_dict`, bbox-shape parsing (3 rect formats), pattern→Element promotion, confidence-based arbitration, every discovery verb (search box, pagination, login wall, modal, feed container, chat input incl. ML-hit-over-pattern preference), every action verb (click/fill+submit/scroll incl. window vs container/dismiss-modal/wait-for-navigation incl. timeout→`False`), every extraction verb (text incl. failure→`""`, event-from-meta, screenshot incl. failure→`b""`). |
 | `test_weights.py` | `pipeline/weights.py` | 28 | Behavioral. Recency-score buckets, link-type scoring (event/tech/social/gif-skip/generic), link extraction+scoring+dedup-by-URL (keeps higher-scored duplicate), event-signal extraction (scheduling keywords, date/time capture, short-message skip), and an extensive parametrized sweep of `has_date_or_event_signal` regex coverage (ordinals, relative time, 24h time, ISO dates, ranges, timezones, year mentions, phrases, event-platform links) including a negative-case sweep. |
 
-**Totals:** 26 test files, 412 test functions (479 collected after parametrize expansion), spanning ~40 of the ~75 non-trivial (`>10` line) modules under `src/event_harvester/`.
+**Totals:** 31 test files, 472 test functions (542 collected after parametrize expansion), spanning ~45 of the ~75 non-trivial (`>10` line) modules under `src/event_harvester/`. *The per-file table below was compiled on 2026-07-29 and does not include the files added on 2026-07-30 — see the Verdict.*
 
 ---
 
@@ -120,7 +122,8 @@ The suite is thorough at the unit level but has almost no **fixed-input → fixe
 Run: `pixi run test`
 
 What to conclude from the output:
-- **`479 passed` and nothing else** (the measured baseline on 2026-07-29 — no skips, no xfails) → the suite is in the state this document describes; the coverage gaps above are real gaps, not tests silently failing to collect.
+- **`542 passed` and nothing else** (measured 2026-07-30 after fix pass 2 — no skips, no xfails) → the suite is in the state this document describes; the coverage gaps above are real gaps, not tests silently failing to collect.
+- **The run must also *exit*.** A hang after the last `[100%]` line is its own failure: on 2026-07-30 a `ThreadPoolExecutor` in `interlock._recv` left a non-daemon thread blocked on `readline`, and `atexit` joined it forever. Tests reported green and the process never returned.
 - **`test_tracing.py` fails to collect** (rather than fails/skips) → `opentelemetry` is missing from the active pixi env; see §3 fragility note — install it or the whole file is unusable, not just degraded.
 - **`test_harvest_async.py::test_wall_time_is_roughly_max_not_sum` fails intermittently** → CPU contention/cold thread pool, not a real regression in `harvest_messages`'s concurrency; rerun before treating it as a bug (see §3).
 - **Any failure outside those two named fragility points** should be treated as a genuine regression — the rest of the suite is deterministic, network-free, and credential-free by construction.

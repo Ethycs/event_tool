@@ -18,9 +18,10 @@ ENV/
 credentials.json
 token.json
 client_secret_*.json
-# ticktick-py's OAuth2 cache defaults to `.token-oauth` in the CWD and
-# outputs/ticktick.py never overrides cache_path, so the first successful
-# TickTick consent drops a live access token at the repo root.
+# ticktick-py's OAuth2 cache holds a live access token. outputs/ticktick.py now
+# pins it to data/.token-oauth, but the library default is `.token-oauth` in the
+# CWD, so a stale one may still exist at the repo root. No leading slash here:
+# this matches at any depth, which covers both.
 .token-oauth
 
 # IDE

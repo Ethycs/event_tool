@@ -126,5 +126,12 @@ Status legend: **WORKS** (passes auth_test or login flow), **PARTIAL** (some pha
 1. Pick the next `BC-NNN` ID.
 2. Add a row to the Summary Table.
 3. Add a Detail Notes section with **Goal**, **Method**, **Outcome**, **Lesson**.
-4. If automation-runnable, add a corresponding `BrowserConfig` preset to `scripts/browser_configs.py` with the same ID.
-5. Run `pixi run python scripts/browser_test.py --run BC-NNN` to record the result in `data/browser_test_results.jsonl`.
+4. `harness removed — record the attempt by hand.` Steps 4–5 used to be: add a `BrowserConfig`
+   preset to `scripts/browser_configs.py`, then run
+   `pixi run python scripts/browser_test.py --run BC-NNN` to append the result to
+   `data/browser_test_results.jsonl`. Neither script is in the repo any more —
+   `data/browser_test_results.jsonl` still is, so the harness existed and was removed or never
+   committed. Write the outcome into this file directly, and append to the JSONL by hand if you
+   want the machine-readable row.
+   · To restore the harness instead: `git log --diff-filter=D -- scripts/` will find the deletion
+   commit if it was ever tracked.
