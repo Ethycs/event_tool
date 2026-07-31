@@ -45,6 +45,7 @@ IS NOT covered: the message records each mode produces (see `EH-STD-MSG-v0` §3.
 | `"raw"` | `web_modes/raw.py:_do_raw` | fallback when none of the above match (`web_utils._detect_mode:212`) |
 | `"chat"` | `web_modes/chat.py:_do_chat` | never auto-detected — must be explicitly configured; dispatched before page-open in `web_fetch.py:187-193` since it needs no pre-opened page |
 | `"ics"` | `web_modes/ics.py:_do_ics` | shortcut auto-detected purely from the URL shape (`webcal://`, `webcals://`, or a `.ics`-suffixed path) — bypasses all browser-based signal detection (`web_utils._detect_mode:194-197`) and is dispatched before page-open in `web_fetch.py:196-203` |
+| `"steps"` | `web_modes/steps.py:_do_steps` | **never auto-detected** — must be explicitly configured, and requires a `steps` array (§3.2). **Added 2026-07-30.** Replays a recorded route through the L1 verbs. The other five browser modes are each one hardcoded walk; this one reads its walk from the config, which is what lets a site that matches none of them be added without a new module |
 | absent / `"auto"` | — | triggers the detection chain above, in the fixed order: ICS-shortcut → saved signature (`uc.load_signatures`) → calendar → search → feed → raw (`web_fetch.py:219-240`) |
 
 Once a mode succeeds with ≥1 message, `web_fetch.py:253-257` saves it as a per-page "signature" (`uc.save_signature(page, f"mode:{mode}")`) so future auto-mode runs against the same page skip re-detection.
@@ -66,9 +67,29 @@ Once a mode succeeds with ≥1 message, `web_fetch.py:253-257` saves it as a per
 | `max_pages` | int | no | `0` | `web_modes/calendar.py:198` | Calendar-mode pagination-follow limit. |
 | `timeout_s` | int | no | `45` (`chat`, `chat.py:42`); `20` (`ics`, `ics.py:69`) | `web_modes/chat.py:42`, `web_modes/ics.py:69` | Per-mode operation timeout; two independent defaults sharing one field name. |
 | `category` | str | no | — | **unread by code** (grep-verified, zero readers) | Free-text grouping tag (`"venues"` on 23/29 current entries). Inert. |
+| `steps` | list[dict] | **yes when `mode: "steps"`** | — | `web_modes/steps.py:_do_steps` → `web_steps.replay` | **Added 2026-07-30.** An ordered route. Each entry is `{"verb": …}` from the vocabulary in §3.5; `web_steps.validate_steps` is the normative checker and is browser-free, so a route can be validated at write time. This is the first non-scalar field in the schema, and the reason it exists: every other key can hold a *destination*, none could hold a *route*. |
+| `expect_min_events` | int | no | — | `web_modes/steps.py:_do_steps_inner` | **Added 2026-07-30.** Replay-rot tripwire. A route yielding fewer than this logs a warning, because a stale selector returning zero is otherwise indistinguishable from a quiet week. Warns only — it never fails the run. |
 | `source_page` | str | no | — | **unread by code** — written only, like `category` | **Added 2026-07-30.** The human-facing page a feed URL was discovered from, written by `web add`/`web probe --apply` when `feed_probe` resolves a page to a different feed URL. Provenance for a reader: without it, an entry whose `url` is `webcal://wp.sf-eagle.com/events/?ical=1` or a `tockify.com` path gives no hint which venue it belongs to. |
 
 Fields read at the `fetch_web_sources` orchestrator level but not per-source (global, from `WebConfig`/CLI, not from the JSON entry): `max_events` (int, default `30`, caps detail-page fetches per source), `timeout_ms` (int, default `30000`, Playwright navigation timeout), `parallel` (int, default `3`, `UCBrowser` worker count for non-`native_chrome` sources).
+
+### 3.2a `steps` entry vocabulary (`sources/web_steps.py`) — **Added 2026-07-30**
+
+Normative checker: `web_steps.validate_steps`. It rejects unknown verbs, missing required keys, **unexpected keys** (so a typo'd `"second"` fails loudly instead of being silently ignored at replay), unknown target roles, and out-of-bounds `repeat`/`seconds`. `MAX_STEPS = 40`, `MAX_REPEAT = 20`.
+
+| verb | required | optional | Effect |
+|---|---|---|---|
+| `goto` | `url` | `wait_ms` | Navigate. |
+| `dismiss` | — | — | Close cookie banners / modals. **Finding nothing is success** — a route keeps this step because the banner appears only sometimes. |
+| `fill` | `target`, `text` | `submit` (default `true`), `wait_ms`, `optional` | Type into a resolved element. |
+| `click` | `target` | `repeat`, `wait_ms`, `optional` | Click. With `repeat`, stops early when the target stops resolving — pagination running out is the end of the list, not an error. |
+| `scroll` | — | `seconds` (default 8), `target`, `step_ms` | Scroll window or container. |
+| `wait` | — | `ms` (default 2000) | Fixed pause. |
+| `extract` | — | `what` (`links` \| `text` \| `feed_items`, default `links`), `optional` | Collect. `links` dedupes by URL across repeated extracts. |
+
+**`target` MUST be a role, or the `selector:<css>` escape hatch.** Roles — `search`, `pagination`, `modal`, `feed`, `chat` — resolve through the matching `web_primitives.find_*` verb *at replay time*, so a site that moves its own furniture keeps working. `selector:` bypasses discovery entirely and is the brittle option by design: routes that use it are the ones that rot first.
+
+Any step MAY carry `"optional": true`, which lets it fail without ending the route. Every other failure stops the walk, because continuing past a step that did not happen produces results that look real and are not.
 
 ### 3.3 `WebConfig` (`config.py:125-147`) — env-var-driven, applies to the whole harvest run, not per-source
 

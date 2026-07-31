@@ -28,9 +28,13 @@ Web (Playwright × N) ──┘                                                 
 
 All three control surfaces call the same `Pipeline` class (`src/event_harvester/pipeline/orchestrator.py`); none of them re-implement stages.
 
-Six web modes — `calendar`, `feed`, `search`, `raw`, `ics`, `chat` — run in parallel browser instances, each per-source-tunable via `data/web_sources.json`. `ics` skips the browser entirely and parses the feed directly. Native-chrome mode is used for Cloudflare-gated sources and stays serial.
+Web modes — `calendar`, `feed`, `search`, `raw`, `ics`, `chat`, `steps` — run in parallel browser instances, each per-source-tunable via `data/web_sources.json`. `ics` skips the browser entirely and parses the feed directly. Native-chrome mode is used for Cloudflare-gated sources and stays serial.
 
-**Adding a venue**: `web add URL` probes for a published iCalendar feed *before* launching a browser — most venue sites run a platform (WordPress + The Events Calendar, Tockify, Squarespace, an embedded Google Calendar) that already exports one at a predictable URL. A hit becomes an `ics` source: no browser, no Cloudflare, no scraping. `web probe` runs the same check across every source you already have.
+**Adding a venue** — three routes, cheapest first:
+
+1. **`web add URL`** probes for a published iCalendar feed *before* launching a browser — most venue sites run a platform (WordPress + The Events Calendar, Tockify, Squarespace, an embedded Google Calendar) that already exports one at a predictable URL. A hit becomes an `ics` source: no browser, no Cloudflare, no scraping. `web probe` runs the same check across every source you already have.
+2. **No feed, simple page** — `web add` falls back to browser diagnostics and picks one of the hardcoded modes.
+3. **No feed, and the events are behind interaction** (Meetup, Eventbrite, Luma) — walk it once with the `web_explore_*` MCP tools and save the walk as a `steps` route. Replay after that is deterministic and never calls an LLM. `web replay NAME` shows each step; `web_diagnose URL` says what is blocking a page that returns nothing.
 
 ## Setup
 
@@ -135,14 +139,15 @@ Project-local registration for Claude Code lives in [.mcp.json](.mcp.json):
 }
 ```
 
-Twenty tools are registered, in two groups:
+Twenty-nine tools are registered, in three groups:
 
 | Group | Tools |
 |---|---|
 | Harvest / review (6) | `config_summary`, `harvest_events`, `list_latest_events`, `approve_event`, `decline_event`, `generate_latest_report` |
+| Site authoring (9) | `web_explore_open`, `web_explore_look`, `web_explore_act`, `web_explore_undo`, `web_explore_save`, `web_explore_close`, `web_explore_list`, `web_diagnose`, `web_validate_steps` |
 | Chat / Grok (14) | `chat`, `grok_send_message`, `grok_read_conversation`, `grok_list_conversations`, `grok_delete_conversation`, `grok_new_chat`, `grok_rename_conversation`, `grok_archive_conversation`, `grok_regenerate`, `grok_stop_generation`, `grok_get_models`, `grok_switch_model`, `list_chat_sessions`, `forget_chat_session` |
 
-The second group comes from `uc_browser.mcp.grok_tools` and is registered inside a `try`/`except` (`servers/mcp_server.py:517-522`). If that import fails the server still starts, logs a warning, and exposes only the first six — so a client seeing 6 tools instead of 20 means the `uc_browser` submodule is missing, not that the server is broken.
+The third group comes from `uc_browser.mcp.grok_tools` and is registered inside a `try`/`except`. If that import fails the server still starts, logs a warning, and exposes only the first fifteen — so a client seeing 15 tools instead of 29 means the `uc_browser` submodule is missing, not that the server is broken.
 
 Parameters and return shapes for each: [MCP Tool Reference](docs/04%20-%20Reference/MCP%20Tool%20Reference.md).
 
@@ -291,7 +296,7 @@ src/event_harvester/
 │   ├── web_fetch.py           # web source driver
 │   ├── web_session.py         # cookie/session state
 │   ├── web_utils.py
-│   └── web_modes/             # calendar, feed, search, raw, ics, chat
+│   └── web_modes/             # calendar, feed, search, raw, ics, chat, steps
 ├── outputs/                   # ticktick.py, report.py, obsidian.py
 ├── observability/             # navigation_trace, screenshot_capture, nav_quality, tracing
 ├── servers/mcp_server.py      # Model Context Protocol server

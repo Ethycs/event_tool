@@ -29,6 +29,7 @@ from event_harvester.sources.web_modes.feed import _do_feed
 from event_harvester.sources.web_modes.ics import _do_ics
 from event_harvester.sources.web_modes.raw import _do_raw
 from event_harvester.sources.web_modes.search import _do_search
+from event_harvester.sources.web_modes.steps import _do_steps
 
 # Back-compat re-exports — modules outside of sources/ continue to import
 # these from web_fetch. The canonical home is web_utils.
@@ -247,6 +248,11 @@ def fetch_web_sources(
                             msgs = _do_feed(uc, src, max_events, page=page, tracer=nav_tracer, capture=capture)
                         elif mode == "search":
                             msgs = _do_search(uc, src, timeout_ms, max_events, page=page, tracer=nav_tracer, capture=capture)
+                        elif mode == "steps":
+                            msgs = _do_steps(
+                                uc, src, timeout_ms, max_events,
+                                page=page, tracer=nav_tracer, capture=capture,
+                            )
                         else:
                             msgs = _do_raw(uc, src, page=page, tracer=nav_tracer, capture=capture)
 

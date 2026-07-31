@@ -1,8 +1,8 @@
 # MCP Tool Reference
 
-**Status:** CURRENT · **Date:** 2026-07-29 · **Applies to:** `src/event_harvester/servers/mcp_server.py`, `ext/universal_controller/uc_browser/mcp/grok_tools.py`, `.mcp.json`
+**Status:** CURRENT · **Date:** 2026-07-30 (added the 9 site-authoring tools) · **Applies to:** `src/event_harvester/servers/mcp_server.py`, `ext/universal_controller/uc_browser/mcp/grok_tools.py`, `.mcp.json`
 
-The `event-harvester` MCP server exposes 6 harvest/approve/decline tools plus 14 Grok/chat-session tools (registered from `uc_browser`), 2 resources, and 2 prompts. `README.md` currently documents only the first 6 — see the drift note at the end of this file. Index-based tools (`approve_event`, `decline_event`, `list_latest_events`) read `data/.mcp_events.json`; that cache is fully replaced on every `harvest_events` call, so indices from one harvest are only valid until the next.
+The `event-harvester` MCP server exposes **29 tools**: 6 harvest/approve/decline, **9 site-authoring** (added 2026-07-30), and 14 Grok/chat-session tools registered from `uc_browser` — plus 2 resources and 2 prompts. Index-based tools (`approve_event`, `decline_event`, `list_latest_events`) read `data/.mcp_events.json`; that cache is fully replaced on every `harvest_events` call, so indices from one harvest are only valid until the next.
 
 ## Harvest / review tools
 
@@ -78,6 +78,28 @@ No parameters.
 **Returns:** `{"ok": False, "error": "No cached events. Run harvest_events first."}` if the cache has no events, else `{ok: True, path, events: <count>}`.
 
 **Mutates state:** Yes — **`side-effecting`**. Writes a Markdown file to disk; does not modify `data/.mcp_events.json`.
+
+## Site-authoring tools — **added 2026-07-30**
+
+The authoring half of web scraping. These are the only tools here that keep a browser open between calls; the replay half (`mode: "steps"`) never touches an LLM. Sessions are capped at 3 and reaped after 15 minutes idle.
+
+| Tool | Parameters | Returns |
+|---|---|---|
+| `web_explore_open` | `url` (req), `native_chrome` | `session_id` + a first look: diagnosis, resolvable targets, visible event links |
+| `web_explore_look` | `session_id` (req), `use_vlm` (`auto`\|`yes`\|`no`) | Diagnosis, which of the 5 target roles resolve (with selector + confidence), `event_links_visible`, `steps_so_far` |
+| `web_explore_act` | `session_id`, `verb` (req); `target`, `text`, `url`, `what`, `seconds`, `ms`, `repeat`, `submit`, `optional` | Step result + a fresh look. **Records the step only if it succeeded** |
+| `web_explore_undo` | `session_id` (req) | Drops the last recorded step. Does **not** rewind the page — stated rather than pretended |
+| `web_explore_save` | `session_id`, `name` (req); `replace`, `category`, `scroll_seconds`, `expect_min_events`, `dry_run` | Crystallises into `data/web_sources.json`. Refuses to overwrite without `replace=true` |
+| `web_explore_close` | `session_id` (req) | Closes the browser, returns the final route |
+| `web_explore_list` | none | Open sessions; reaps idle ones as a side effect |
+| `web_diagnose` | `url` (req), `use_vlm`, `native_chrome` | One-shot triage: open, diagnose, close. For "why is this source returning nothing" without committing to a session |
+| `web_validate_steps` | `steps_json` (req) | Errors in a route, **without a browser**. Free and offline — use it on hand-edited `web_sources.json` entries |
+
+`verb` vocabulary: `goto`, `dismiss`, `fill`, `click`, `scroll`, `wait`, `extract`.
+`target` roles: `search`, `pagination`, `modal`, `feed`, `chat`, or `selector:<css>`.
+Full normative spec: `05 - Standards/EH-STD-WEBSRC-v0 §3.2a`.
+
+Typical authoring loop: `web_explore_open` → (`web_explore_look` → `web_explore_act`)* → `web_explore_save` → `web_explore_close`. Then `event-harvester web replay <name>` to confirm the saved route reproduces without the browser held open.
 
 ## Chat / Grok tools
 

@@ -255,6 +255,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_root_flags(web_probe)
 
+    web_replay = web_sub.add_parser(
+        "replay",
+        help="Replay a configured source's recorded route and report each step",
+    )
+    web_replay.add_argument("name", help="Name of a source in data/web_sources.json")
+    web_replay.add_argument(
+        "--diagnose", action="store_true",
+        help="On failure, screenshot the page and ask a vision model what is blocking it",
+    )
+    _add_root_flags(web_replay)
+
     web_login = web_sub.add_parser(
         "login",
         help="Open a browser to log into web sites and save session state",

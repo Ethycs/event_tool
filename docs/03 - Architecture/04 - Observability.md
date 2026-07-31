@@ -168,6 +168,29 @@ Only a **successful** VLM call increments the counter (`cls._images_sent_this_ru
 
 **Failure modes:** No trace file → `None` (caller skips). No key frames → `unknown` / "no key frames available", no LLM call. Budget exceeded → `unknown` / explicit message, no LLM call. LLM exception → caught broadly, `unknown` / `str(e)`, `nav_score` still computed from structural signals alone — the quality-check stage is designed to never fail the pipeline (`serve.py:131-136` also wraps the call in its own try/except). `quality.json` write failure → logged at WARNING, `SourceQuality` still returned to caller (UI badge just won't appear).
 
+## Module: `hints.py` — **added 2026-07-30**
+
+**Domain:** Live page diagnosis. The counterpart to `nav_quality.py`, and the distinction matters: `nav_quality` scores a **finished** run from a trace on disk; `hints` diagnoses an **open** page while there is still something to do about it. It reuses `nav_quality.parse_classification` rather than growing a second response parser, and carries the same lazy `vision_completion` shim for the same reason.
+
+**Two layers, deliberately ordered:**
+
+1. `collect_signals(page)` — **one** `page.evaluate`, returning text length + a 4k sample, link/visible-input/dialog/iframe/form counts, a password-field flag, search-input count, next-control count, and scroll geometry. Free. A dead page returns `{}` rather than raising.
+2. `rule_hints(signals)` — pure, ranked `Hint`s. Blocking conditions (challenge, login, consent, error, empty) first; structural *suggestions* (`needs_scroll`, `needs_search`, `needs_pagination`) beneath them; `content` at 0.75 when the page is plainly showing things and nothing is blocked.
+3. `vlm_hint(page, cfg_llm)` — screenshot to `data/.web_hints/`, one `vision_completion` call. Reached only when the top rule is at or below `VLM_ESCALATION_THRESHOLD = 0.6`, or `use_vlm=True`.
+
+Each `Hint` carries a `suggested_step` in the `web_steps` vocabulary where one exists — a diagnosis you cannot act on is just a log line. When the VLM and the rules disagree, the VLM's classification is inserted on top (the picture saw the rendered page; the rules only saw the DOM), but the rules' `suggested_step` is preserved, because that is the actionable half.
+
+| Thing | Value | Where |
+|---|---|---|
+| VLM escalation threshold | `0.6` | `hints.py:VLM_ESCALATION_THRESHOLD` |
+| "Page is showing content" floor | 400 chars **and** ≥10 links | `MIN_CONTENT_CHARS`, `HEALTHY_LINKS` |
+| Lazy-load suspicion | scrollHeight > 2 viewports with <10 links | `LAZY_LOAD_VIEWPORT_RATIO` |
+| Screenshots | `data/.web_hints/<ts>.png` | `HINTS_DIR` |
+
+**No image budget of its own** — unlike `NavQualityScorer`, `hints` has no process-wide counter. Its cost control is the escalation gate: a confident rule never reaches the vision call at all. That gate is load-bearing and was measurably wrong twice on first contact with a live page (see `07 - Status Reports/2026-07-30_routes-and-hints.md`): once a rule was *confidently* wrong, which suppresses the escalation that would have corrected it, and once a suggestion outranked `content`, which would have bought a vision call on every paginated page on the web. `cost-bearing`: `diagnose(..., use_vlm=True)` makes one real vision request with one image.
+
+`known rough edge`: the rules are regexes and thresholds over page text. Treat a verdict as a lead, not a fact.
+
 ## Module: `tracing.py`
 
 **Domain:** OpenTelemetry soft-dependency shim. If `opentelemetry` isn't importable, `_OTEL_OK = False` and every public function degrades to a no-op (`_NoOpSpan` / `_NoOpTracer`) — the pipeline runs identically either way.
@@ -269,6 +292,6 @@ Every `NavigationTracer.record()`/`record_with_screenshot()` call additionally a
 ## Verification
 
 ```
-pixi run -e dev pytest tests/test_navigation_trace.py tests/test_screenshot_capture.py tests/test_nav_quality.py tests/test_tracing.py -v
+pixi run -e dev pytest tests/test_navigation_trace.py tests/test_screenshot_capture.py tests/test_nav_quality.py tests/test_tracing.py tests/test_hints.py -v
 ```
 Proves: JSONL schema/step-numbering/chrome-extension filtering (`test_navigation_trace.py`), screenshot cap + circuit breaker + GIF assembly (`test_screenshot_capture.py`), `compute_score`/`pick_key_frames`/`parse_classification`/budget-guard behavior (`test_nav_quality.py`), and OTel no-op-vs-real idempotent init + span-event capture via `InMemorySpanExporter` (`test_tracing.py`). This document was produced by reading source only — the app was not run, so runtime behavior beyond what these tests assert is marked `unverified` above.

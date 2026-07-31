@@ -22,6 +22,8 @@ async def web_cmd(args, cfg) -> int:
             return _web_test(args, cfg)
         if sub == "probe":
             return _web_probe(args, cfg)
+        if sub == "replay":
+            return _web_replay(args, cfg)
         if sub == "login":
             return _web_login(args, cfg)
         span.set_attribute("error.message", f"unknown subcommand {sub}")
@@ -233,6 +235,68 @@ def _apply_feed_hits(hits, sources_by_url: dict[str, dict]) -> int:
         print(f"{DIM}{skipped} source(s) left unchanged — see above.{RESET}")
     print()
     return 0
+
+
+def _web_replay(args, cfg) -> int:
+    """Replay one configured source's route, printing every step as it runs.
+
+    The debugging surface for `mode: steps`. A harvest reports "meetup: 0
+    messages"; this reports which step stopped producing and what the page
+    looked like when it did.
+    """
+    from event_harvester.sources.uc_browser import UCBrowser
+    from event_harvester.sources.web_fetch import _load_web_sources
+    from event_harvester.sources.web_steps import replay, validate_steps
+
+    src = next((s for s in _load_web_sources() if s.get("name") == args.name), None)
+    if src is None:
+        print(f"{RED}No source named {args.name!r}.{RESET} See: event-harvester web list")
+        return 1
+
+    steps = src.get("steps") or []
+    if not steps:
+        print(f"{YELLOW}{args.name} has no steps{RESET} (mode={src.get('mode')!r}).")
+        print(f"{DIM}Record one with the web_explore_* MCP tools.{RESET}")
+        return 1
+
+    errors = validate_steps(steps)
+    if errors:
+        print(f"\n{RED}Route is invalid — not running it:{RESET}")
+        for err in errors:
+            print(f"  - {err}")
+        return 1
+
+    print(f"\n{BOLD}Replaying {args.name}{RESET} {DIM}({len(steps)} steps){RESET}\n")
+    cfg_llm = cfg.llm if getattr(args, "diagnose", False) else None
+
+    with UCBrowser(native_chrome=bool(src.get("native_chrome"))) as uc:
+        page = uc.open(src["url"], source_name=args.name)
+        result = replay(uc, page, steps, cfg_llm=cfg_llm)
+        for step_result in result.results:
+            mark = f"{GREEN}ok{RESET}" if step_result.ok else f"{RED}FAILED{RESET}"
+            print(f"  {step_result.index:>2}. {step_result.verb:<8} {mark}  "
+                  f"{DIM}{step_result.detail} ({step_result.elapsed_ms}ms){RESET}")
+        try:
+            page.close()
+        except Exception as e:
+            logger.debug("replay: page close failed: %s", e)
+
+    print(f"\n  {BOLD}{len(result.links)}{RESET} event link(s), "
+          f"{BOLD}{len(result.texts)}{RESET} text block(s)")
+
+    if result.diagnosis:
+        diag = result.diagnosis
+        print(f"\n  {YELLOW}Why it stopped:{RESET} {diag.get('kind')}")
+        for hint in diag.get("hints", [])[:3]:
+            step = hint.get("suggested_step")
+            suffix = f"  {DIM}→ try {step}{RESET}" if step else ""
+            print(f"    - {hint.get('kind')} ({hint.get('confidence', 0):.0%}): "
+                  f"{hint.get('evidence')}{suffix}")
+        if diag.get("screenshot"):
+            print(f"    {DIM}screenshot: {diag['screenshot']}{RESET}")
+
+    print()
+    return 0 if result.ok else 1
 
 
 def _web_login(args, cfg) -> int:

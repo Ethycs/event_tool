@@ -73,7 +73,7 @@ pixi run event-harvester watch --interval 60
 pixi run event-harvester watch --skip gmail,signal,web
 ```
 
-## `web {list, add, test, probe, login}`
+## `web {list, add, test, probe, replay, login}`
 
 Entry point: `commands/web.py:web_cmd`. Manages `data/web_sources.json`.
 
@@ -83,6 +83,7 @@ Entry point: `commands/web.py:web_cmd`. Manages `data/web_sources.json`.
 | `web add URL` | Probe for a feed, else diagnose `URL`, then append to `data/web_sources.json` | `url` (required); `--mode`, `--no-probe` |
 | `web test URL` | Same diagnosis without saving | `url` (required); `--no-probe` |
 | `web probe [URL…]` | **Added 2026-07-30.** Find iCalendar feeds without a browser. With no arguments, probes every configured source not already in `ics` mode | `urls` (optional, repeatable); `--apply`, `--timeout` |
+| `web replay NAME` | **Added 2026-07-30.** Replay a configured source's recorded route, printing every step with its result and timing. Exits `1` if the route fails. The debugging surface for `mode: steps` — a harvest says "0 messages", this says which step stopped producing | `name` (required); `--diagnose` |
 | `web login` | Open a browser to log into web sites and save session state | none |
 
 | Flag | Value | Default | Effect |
@@ -104,6 +105,8 @@ pixi run event-harvester web list
 pixi run event-harvester web probe                      # audit every configured source
 pixi run event-harvester web probe --apply              # ...and convert the hits to ics
 pixi run event-harvester web probe https://somebar.com  # one-off check
+pixi run event-harvester web replay meetup              # walk a saved route, step by step
+pixi run event-harvester web replay meetup --diagnose   # ...and screenshot it if it breaks
 pixi run event-harvester web test https://lu.ma/discover
 pixi run event-harvester web add https://cdn.dnalounge.com/events.ics
 ```

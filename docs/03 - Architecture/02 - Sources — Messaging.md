@@ -74,17 +74,42 @@ Four independent message sources — Discord, Telegram, Gmail, Signal — each e
 
 ### Internal structure
 
-- `_get_credentials()` — priority chain: (1) `GMAIL_TOKEN_JSON` env, base64→JSON→`Credentials.from_authorized_user_info`; (2) `token.json` file; if still invalid but has a refresh token, `creds.refresh(Request())` and persist back to `token_file` (note: refreshing an env-sourced token still gets written to the *file* path, not back to the env var — on a redeploy from env vars only, this refreshed token is lost unless something re-reads the file into the env); (3) fresh interactive OAuth via `GMAIL_CREDENTIALS_JSON` env (written to a temp file for `InstalledAppFlow`, deleted after) or `credentials.json` file, using `flow.run_local_server(port=0)` — opens a local browser, requires a display.
+- `_get_credentials()` — builds an ordered candidate list, (1) `GMAIL_TOKEN_JSON` env, base64→JSON→`Credentials.from_authorized_user_info`, then (2) the `token.json` file, and hands each to `_use_token()`, which returns usable credentials or `None` so the loop moves on. A refreshed token is persisted back to `token_file` (note: refreshing an env-sourced token still gets written to the *file* path, not back to the env var — on a redeploy from env vars only, this refreshed token is lost unless something re-reads the file into the env). Only when every stored token is dead does it reach (3) fresh interactive OAuth via `GMAIL_CREDENTIALS_JSON` env (written to a temp file for `InstalledAppFlow`, deleted after) or `credentials.json` file, using `flow.run_local_server(port=0)` — **gated on `_oauth_flow_allowed()`**, i.e. a TTY or `GMAIL_OAUTH_INTERACTIVE=1`.
+  **The loop is the point, and it is load-bearing.** Until 2026-07-30 the file was guarded by `if creds is None`, so an env token that merely *parsed* claimed the slot — and when its refresh failed, control skipped a working on-disk credential entirely. That combination (stale `.env` copy, live `token.json`) had Gmail silently returning nothing. Each candidate is now tried *to completion, refresh included*, before the next is considered.
 - `fetch_messages()` — builds query as `f"{cfg.query} after:{since:%Y/%m/%d}"`, paginates in batches of ≤100 up to `cfg.max_results`, and per message calls `messages().get(format="metadata")` (headers + snippet only, **not the full body**). `content` is `f"{subject}\n{snippet}"` — the snippet is Gmail's short preview text, not the full email.
 - `channel` is derived by picking the first label on the message that isn't a system prefix (`CATEGORY_`, `UNREAD`, `IMPORTANT`, `SENT`, `DRAFT`), falling back to `"INBOX"` — this is a Gmail *label*, semantically unlike every other source's `channel` (which means a chat/room name).
 - `filter_read_sent()` — module-level filter (not called inside `fetch_messages`; called separately by `pipeline/orchestrator.py` after all sources are merged) that drops Gmail messages with `is_sent=True` or `is_read=True`, and passes every non-Gmail message through untouched.
 - `fetch_full_bodies()` — separate on-demand call (`format="full"`) used by `cli/commands/recruiters.py`; recursively walks MIME parts, prefers `text/plain`, falls back to HTML-with-tags-stripped via regex.
 - `reply()`/`trash()`/`delete()`/`mark_read()`/`mark_unread()` — straightforward wrappers; `reply` threads via `In-Reply-To`/`References` headers pulled from the original message's metadata.
+  **Only `reply` and `trash` have callers**, both in the recruiter-triage lane (`outputs/obsidian.py:382,396`, `cli/commands/recruiters.py:85`). `delete`, `mark_read` and `mark_unread` are not re-exported from `sources/__init__.py` and are called by nothing — dead code, and `delete` is an irreversible `messages().delete`. Tracked as roadmap 2.12.
 
 ### Hard constraints / failure modes
 
 - No credentials at all → `_get_service` returns `None` → every function short-circuits to `[]`/`False`/`None`, all logged at `info`/`warning`, never raised.
-- **unverified:** whether a fully headless run (no `token.json`, no env token, `credentials.json` present) actually fails cleanly or hangs on `run_local_server` — the code will attempt to open a browser and bind a local port regardless of TTY availability; not exercised by any test in this repo.
+- A stored token that cannot be refreshed logs a warning and is skipped, not raised. `_get_service` is called **once per operation**, not once per run, so a stale-but-present token costs a failed network round-trip on every single Gmail call.
+- ~~**unverified:** whether a fully headless run … hangs on `run_local_server`~~ — **resolved 2026-07-30**: it would have. The flow is now gated on `_oauth_flow_allowed()` and a headless run logs an actionable error and returns `None` instead. Pinned by `tests/test_gmail_credentials.py`.
+
+### Against the first-party Claude Gmail MCP connector
+
+Worth knowing before anyone proposes replacing this module with the connector, or spinning it out into one. Compared 2026-07-30 against the connector's live tool schemas:
+
+| | This module | Claude Gmail MCP (16 tools) |
+|---|---|---|
+| Unit of work | Message | Thread |
+| Bulk read | ≤100/batch to `max_results` (default 200), normalized to `EH-STD-MSG-v0` | `search_threads`, 20/page, **max 50**, thread-shaped |
+| Query | `after:` + `GMAIL_QUERY` passthrough | Full documented operator set |
+| Bodies | `text/plain`, else regex-stripped HTML | `plaintextBody` **and** `htmlBody`, parsed |
+| Attachments | ✗ | ✓ metadata + retrieval |
+| Send | ✓ `reply()` really sends | ✗ **drafts only** |
+| Trash / delete | ✓ both | ✗ neither |
+| Labels | read-only + `UNREAD` toggle | full CRUD |
+| Unattended | ✓ own token, scheduled | ✗ needs a claude.ai session |
+
+**They are complementary, not competing.** The connector is the better interactive reader — real HTML bodies and attachments, which this module cannot see at all. But it **cannot send and cannot trash**, which is the entire recruiter-triage loop, so it cannot replace the write half. And it cannot run unattended, so it cannot replace the harvest half either.
+
+The connector's omissions are also a design signal: a first-party integration deliberately ships drafts-and-labels with no permanent delete. This module has one, unused and untested (2.12).
+
+`inferred` — this comparison is from the connector's tool schemas, not from running it.
 
 ## `signal.py`
 

@@ -515,6 +515,197 @@ def build_server(
         )
         return {"ok": True, "path": str(report_path), "events": len(events)}
 
+    # ── Site authoring: walk a site once, save the route ──────────────
+    #
+    # These are the authoring half of web scraping, and they are the only
+    # tools here that keep a browser open between calls. The replay half
+    # (`mode: steps` in web_sources.json) never touches an LLM; this half is
+    # meant to, because it runs once per site rather than once per harvest.
+
+    @server.tool()
+    @traced("mcp.tool.web_explore_open", tracer_name=_TRACER)
+    def web_explore_open(url: str, native_chrome: bool = False) -> dict[str, Any]:
+        """Open a browser on a URL and start recording a route.
+
+        Returns a session_id plus a first look at the page: what is blocking it,
+        which target roles resolve, and how many event links are already visible.
+        Set native_chrome=True for Cloudflare-protected sites.
+        """
+        from event_harvester.sources import web_explore
+
+        try:
+            return {"ok": True, **web_explore.open_session(url, native_chrome=native_chrome)}
+        except Exception as e:  # noqa: BLE001 — surfaced to the client, not raised
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    @server.tool()
+    @traced("mcp.tool.web_explore_look", tracer_name=_TRACER)
+    def web_explore_look(session_id: str, use_vlm: str = "auto") -> dict[str, Any]:
+        """Look at the current page: diagnosis, available targets, visible links.
+
+        use_vlm: "auto" screenshots only when the DOM rules are unsure, "yes"
+        always screenshots, "no" never does. Use "yes" when you are stuck and
+        want the page described as rendered rather than as markup.
+        """
+        from event_harvester.sources import web_explore
+
+        mode: bool | str = {"yes": True, "true": True, "no": False, "false": False}.get(
+            use_vlm.strip().lower(), "auto",
+        )
+        try:
+            return {"ok": True, **web_explore.describe(session_id, use_vlm=mode)}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    @server.tool()
+    @traced("mcp.tool.web_explore_act", tracer_name=_TRACER)
+    def web_explore_act(
+        session_id: str,
+        verb: str,
+        target: str | None = None,
+        text: str | None = None,
+        url: str | None = None,
+        what: str | None = None,
+        seconds: int | None = None,
+        ms: int | None = None,
+        repeat: int | None = None,
+        submit: bool = True,
+        optional: bool = False,
+    ) -> dict[str, Any]:
+        """Take one step on the page. Successful steps are recorded into the route.
+
+        verb: goto | dismiss | fill | click | scroll | wait | extract
+        target: search | pagination | modal | feed | chat | selector:<css>
+        what (extract only): links | text | feed_items
+
+        Roles are preferred over selectors: they re-resolve at replay time, so a
+        site that moves its search box keeps working. Only steps that actually
+        succeeded are kept, since replay cannot tell an attempt from an event.
+        """
+        from event_harvester.sources import web_explore
+
+        step: dict[str, Any] = {"verb": verb}
+        for key, value in (
+            ("target", target), ("text", text), ("url", url), ("what", what),
+            ("seconds", seconds), ("ms", ms), ("repeat", repeat),
+        ):
+            if value is not None:
+                step[key] = value
+        if verb == "fill":
+            step["submit"] = submit
+        if optional:
+            step["optional"] = True
+
+        try:
+            return web_explore.act(session_id, step)
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    @server.tool()
+    @traced("mcp.tool.web_explore_undo", tracer_name=_TRACER)
+    def web_explore_undo(session_id: str) -> dict[str, Any]:
+        """Drop the last recorded step. Does not rewind the page itself."""
+        from event_harvester.sources import web_explore
+
+        try:
+            return web_explore.undo(session_id)
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    @server.tool()
+    @traced("mcp.tool.web_explore_save", tracer_name=_TRACER)
+    def web_explore_save(
+        session_id: str,
+        name: str,
+        replace: bool = False,
+        category: str | None = None,
+        scroll_seconds: int | None = None,
+        expect_min_events: int | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Crystallise the recorded walk into data/web_sources.json.
+
+        dry_run=True returns the source entry without writing. Refuses to
+        overwrite an existing source unless replace=True.
+
+        expect_min_events arms the replay-rot tripwire: a route that later
+        yields fewer than this logs a warning, because a stale selector
+        returning zero is otherwise indistinguishable from a quiet week.
+        """
+        from event_harvester.sources import web_explore
+
+        overrides: dict[str, Any] = {}
+        if category is not None:
+            overrides["category"] = category
+        if scroll_seconds is not None:
+            overrides["scroll_seconds"] = scroll_seconds
+        if expect_min_events is not None:
+            overrides["expect_min_events"] = expect_min_events
+
+        try:
+            if dry_run:
+                return web_explore.crystallize(session_id, name, **overrides)
+            return web_explore.save_source(session_id, name, replace=replace, **overrides)
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    @server.tool()
+    @traced("mcp.tool.web_explore_close", tracer_name=_TRACER)
+    def web_explore_close(session_id: str) -> dict[str, Any]:
+        """Close an explore session and its browser."""
+        from event_harvester.sources import web_explore
+
+        return web_explore.close_session(session_id)
+
+    @server.tool()
+    @traced("mcp.tool.web_explore_list", tracer_name=_TRACER)
+    def web_explore_list() -> dict[str, Any]:
+        """List open explore sessions. Idle ones are reaped as a side effect."""
+        from event_harvester.sources import web_explore
+
+        return {"ok": True, "sessions": web_explore.list_sessions()}
+
+    @server.tool()
+    @traced("mcp.tool.web_diagnose", tracer_name=_TRACER)
+    def web_diagnose(url: str, use_vlm: str = "yes", native_chrome: bool = False) -> dict[str, Any]:
+        """Open a URL, say what is wrong with it, and close. One-shot triage.
+
+        For "why is this source returning nothing" without committing to a
+        session. Opens a browser, so it is not free.
+        """
+        from event_harvester.sources import web_explore
+
+        mode: bool | str = {"yes": True, "no": False}.get(use_vlm.strip().lower(), "auto")
+        session_id = None
+        try:
+            opened = web_explore.open_session(url, native_chrome=native_chrome)
+            session_id = opened["session_id"]
+            look = web_explore.describe(session_id, use_vlm=mode)
+            return {"ok": True, "url": url, **look}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        finally:
+            if session_id:
+                web_explore.close_session(session_id)
+
+    @server.tool()
+    @traced("mcp.tool.web_validate_steps", tracer_name=_TRACER)
+    def web_validate_steps(steps_json: str) -> dict[str, Any]:
+        """Check a route for errors without opening a browser.
+
+        Free and offline. Use it on hand-edited routes in web_sources.json
+        before a harvest finds the problem for you at 3am.
+        """
+        from event_harvester.sources.web_steps import validate_steps
+
+        try:
+            steps = json.loads(steps_json)
+        except (json.JSONDecodeError, ValueError) as e:
+            return {"ok": False, "error": f"steps_json is not valid JSON: {e}"}
+        errors = validate_steps(steps)
+        count = len(steps) if isinstance(steps, list) else 0
+        return {"ok": not errors, "errors": errors, "step_count": count}
+
     @server.prompt()
     def review_latest_events() -> str:
         """Prompt an MCP client to review the cached event candidates."""

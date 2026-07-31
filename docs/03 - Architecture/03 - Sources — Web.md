@@ -1,6 +1,6 @@
 # Sources — Web
 
-**Status:** CURRENT · **Date:** 2026-07-30 (added `feed_probe.py`) · **Applies to:** `src/event_harvester/sources/web_fetch.py`, `uc_browser.py`, `web_session.py`, `web_utils.py`, `feed_probe.py`, `src/event_harvester/sources/web_modes/{__init__,calendar,feed,search,raw,ics,chat}.py`, `src/event_harvester/web_primitives.py`, `data/web_sources.json`, `ext/helpers/extract_event_links.js` · **Depends on:** `docs/04 - Reference/Universal Controller Guide.md`
+**Status:** CURRENT · **Date:** 2026-07-30 (added `feed_probe.py`, then `web_steps.py`/`web_explore.py`) · **Applies to:** `src/event_harvester/sources/web_fetch.py`, `uc_browser.py`, `web_session.py`, `web_utils.py`, `feed_probe.py`, `web_steps.py`, `web_explore.py`, `src/event_harvester/sources/web_modes/{__init__,calendar,feed,search,raw,ics,chat,steps}.py`, `src/event_harvester/web_primitives.py`, `src/event_harvester/observability/hints.py`, `data/web_sources.json`, `ext/helpers/extract_event_links.js` · **Depends on:** `docs/04 - Reference/Universal Controller Guide.md`
 
 The web fetch path turns `data/web_sources.json` into a list of message dicts by driving one or more headed Chromium/Chrome instances through Universal Controller (UC), routing each source through a mode-specific handler in `web_modes/`. `web_fetch.fetch_web_sources` is the sole entry point: it splits sources into a parallel pool of "standard" browsers plus one serial pool for `native_chrome` (Cloudflare) sources, and retries Cloudflare-blocked standard sources through native Chrome afterward. Everything downstream (`pipeline/harvest.py`) treats the return value as a flat `list[dict]` of chat-shaped messages, regardless of which mode produced them.
 
@@ -51,9 +51,11 @@ Accepted cost: a venue whose only feed legitimately holds one upcoming event rea
 
 ## Modes
 
-**There are six web modes**, not five: `calendar`, `feed`, `search`, `raw`, `ics`, `chat`. `ics` is a full mode with its own file, OTel span, and dispatch branch in `fetch_web_sources`, and `web_modes/__init__.py` re-exports all six (`_do_calendar`, `_do_chat`, `_do_feed`, `_do_ics`, `_do_raw`, `_do_search`).
+**The modes are** `calendar`, `feed`, `search`, `raw`, `ics`, `chat`, and — since 2026-07-30 — `steps`. Each has its own file, OTel span, and dispatch branch in `fetch_web_sources`; `web_modes/__init__.py` re-exports them and `__all__` is the count.
 
-*Both places that said "five" were fixed 2026-07-29 — `README.md` now says six, and the `web_modes/__init__.py` docstring points at `__all__` instead of restating a count. That second change is the durable one: a number in prose next to the list it counts is drift waiting to happen.*
+*Two places once said "five" and were fixed 2026-07-29. The durable half of that fix was deleting the number from the `web_modes/__init__.py` docstring and pointing at `__all__` — this section is now on its third count, which is the argument.*
+
+**`steps` is the mode the other browser modes are special cases of.** `calendar`, `feed` and `search` each encode one fixed walk in Python; `steps` reads its walk from the source config (`web_steps.replay`), so a site matching none of the three no longer needs a new module — it needs a route. It is never auto-detected, and `web_utils._detect_mode` is unchanged: a route only runs when someone configured one.
 
 | Mode | Domain / what it does | When picked | Runs at | Key tunables |
 |---|---|---|---|---|
@@ -124,7 +126,11 @@ Also note: the live `data/web_sources.json` (31 entries) diverges from the in-co
 
 ## L1 primitive verbs (`web_primitives.py`)
 
-A typed vocabulary (`Element` dataclass + `find_*`/action/extract verb functions) wrapping UC's pattern detection and Playwright actions, intended so that mode handlers (and eventually a DSPy-composed LLM planner) never touch raw selectors directly. **`dead code?`** — a repo-wide grep for `web_primitives` shows the only importer is `tests/test_web_primitives.py`; none of the `web_modes/*.py` handlers actually call into it. The module's own docstring confirms this is by design for now: "A small, fixed vocabulary that every `_do_*` mode (and later, a DSPy-composed LLM planner) reaches into the page through" — i.e. it's scaffolding for a future refactor, not yet wired into the live dispatch path. It re-implements things the `_do_*` handlers already do inline (e.g. `find_pagination`'s next/prev-link heuristic duplicates the pagination JS inline in `calendar.py:_do_calendar_inner`).
+A typed vocabulary (`Element` dataclass + `find_*`/action/extract verb functions) wrapping UC's pattern detection and Playwright actions, so callers never touch raw selectors directly.
+
+~~**`dead code?`** — the only importer is `tests/test_web_primitives.py`~~ — **no longer true as of 2026-07-30.** `sources/web_steps.py` is the production caller its docstring always anticipated: `resolve_target` dispatches five `find_*` verbs by role name, and `_run_one` calls `fill_input`, `click`, `scroll`, `dismiss_modal`, `extract_links` and `extract_text`. The `_do_*` handlers still do not call it — they remain hardcoded walks — but `mode: "steps"` reaches the page *only* through this vocabulary.
+
+Still true: it re-implements things the `_do_*` handlers do inline (`find_pagination`'s heuristic duplicates the pagination JS in `calendar.py:_do_calendar_inner`). Collapsing the older modes onto routes would remove that duplication and is not scheduled.
 
 Verbs, by category:
 
@@ -133,6 +139,32 @@ Verbs, by category:
 | Discovery | `find_search_box`, `find_event_cards`, `find_pagination`, `find_login_wall`, `find_modal`, `find_feed_container`, `find_chat_input` | All return `Element \| None` (or `list[Element]` for cards); go through `_arbitrate` (currently just picks highest `confidence` — VLM-arbiter fallback is stubbed, `CONFIDENCE_THRESHOLD = 0.5` unused pending `event_harvester.llm.vision_completion` hookup per the `TODO(phase-2)` in `_arbitrate`). |
 | Action | `click`, `fill_input`, `scroll`, `dismiss_modal`, `wait_for_navigation` | Thin Playwright wrappers; all swallow exceptions and return bool/int rather than raising. |
 | Extraction | `extract_text`, `extract_event`, `extract_links`, `screenshot` | `extract_links`/`find_event_cards` both delegate to `_extract_event_links` (the same DOM-graph walker used by the live modes). |
+
+## Routes: authoring vs replay (`web_steps.py`, `web_explore.py`)
+
+Added 2026-07-30. The two halves of web scraping have opposite economics, so they get opposite mechanisms.
+
+| | Authoring (`web_explore.py`) | Replay (`web_steps.py`) |
+|---|---|---|
+| Runs | once per site | every harvest, every source |
+| Driver | an agent, over 9 MCP tools | `web_modes/steps.py` |
+| Browser | held open across calls | opened by the normal dispatch |
+| LLM | yes — that is the point | **no**, unless a step fails |
+| Output | a `steps` array | messages |
+
+`ExploreSession` keeps a `UCBrowser` entered manually (not via `with`) and reaped after `IDLE_TIMEOUT_S = 900`, capped at `MAX_SESSIONS = 3`. **Only successful steps are recorded** — replay cannot distinguish an attempt from an event, so a route made of attempts would be a liability. The opening `goto` is recorded as step 0, which means a walk with no further actions crystallises into exactly the pre-2026-07-30 schema shape: `{url, name, mode}`. That is the erobay case, and the reason erobay looked "crystallised" while Luma did not.
+
+`replay()` stops at the first non-`optional` failure and attaches a live diagnosis (below). Partial results are kept: a route that broke on its last step still returns the links the earlier steps found.
+
+## Live page diagnosis (`observability/hints.py`)
+
+Added 2026-07-30. Distinct from `nav_quality.py`, which scores a *finished* run from a trace on disk; this diagnoses an *open* page while there is still something to do about it.
+
+Two layers, deliberately ordered. `collect_signals` runs **one** `page.evaluate` returning text length, link/input/dialog/iframe counts, a password-field flag, next-control count, and scroll geometry; `rule_hints` turns that into ranked `Hint`s, each carrying a `suggested_step` in the `web_steps` vocabulary where one exists. Only when the top rule sits at or below `VLM_ESCALATION_THRESHOLD = 0.6` (or the caller passes `use_vlm=True`) is a screenshot taken and one `vision_completion` call made. A VLM call per page would be affordable while authoring and ruinous during a harvest.
+
+When the picture and the DOM disagree, the picture wins — that asymmetry is the reason for taking it — but the rules' `suggested_step` is kept underneath, because that is the actionable half.
+
+`known rough edge`: the rules are regex-and-threshold heuristics over page text, and two of them were wrong in ways only a live page revealed (see `07 - Status Reports/2026-07-30_routes-and-hints.md`). Treat a rule verdict as a lead, not a fact.
 
 ## Extracted content → message dicts
 
@@ -172,6 +204,9 @@ Feed mode has a third content path with no JSON-LD/text-extraction step at all: 
 | `web_modes/search.py` | Login wall detected (`uc.has_login_wall`) | Logged warning, page closed, `[]` returned immediately — no partial scrape attempted |
 | `web_modes/ics.py` | HTTP fetch fails (non-2xx, network error) or `Calendar.from_ical` raises | Logged, `[]` returned; **`anti-bot dependent`: N/A** — plain HTTP, no browser, so this mode is immune to Cloudflare/bot-detection failures that affect every other mode |
 | `web_modes/chat.py` | Login wall, or response `< 50` chars | `[]` returned with a warning; a *short but real* answer under 50 chars (e.g. "no events found") is indistinguishable from a failed/empty response — `fragile` |
+| `web_modes/steps.py` | `mode: "steps"` with no `steps` array | Warning, `[]` returned — never falls back to another mode, since guessing at a route is worse than declining to run one |
+| `web_modes/steps.py` | A step fails mid-route | Walk stops, partial links are still fetched and returned, and the failure is logged *with* a page diagnosis. `expect_min_events` (if set) warns separately when the yield drops |
+| `sources/web_explore.py` | Session cap reached | `RuntimeError` naming the open sessions — raised *before* a browser is launched |
 | `uc_browser` (`browser.py`) `_start_native_chrome` | `chrome.exe` not found, or CDP port never comes up after 15×1s retries | Falls back to Playwright `channel="chrome"` launch (if binary missing) or gives up and leaves `_context = None` (if CDP connect fails) — a `None` context will raise on first use downstream, `unverified` whether callers handle this gracefully |
 | `web_utils.py` `_fetch_event_detail(s)` | Any exception during a detail-page fetch (timeout, navigation error, etc.) | Caught broadly, page closed if possible, `None` returned for that link — link is silently dropped, not retried |
 | `web_utils.py` `_load_web_sources` | Missing/corrupt `data/web_sources.json` | **BUG** — see schema section above; returns `{}` instead of the documented `_DEFAULT_SOURCES` fallback |
