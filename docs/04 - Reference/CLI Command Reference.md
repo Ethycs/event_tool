@@ -36,7 +36,7 @@ Default subcommand. Entry point: `commands/harvest.py:harvest_cmd`.
 | `--web-source` | name | `None` | `undocumented`. Restrict web harvesting to a single named source (e.g. `luma`). |
 | `--no-cooldown` | flag | `False` | `undocumented`. Ignore per-source web cooldowns and force re-fetch. |
 | `--profile` | name | `None` | Apply a named profile from `data/profiles.json` before `--cap`/`--web-source` overrides are applied. |
-| `--report` | path, optional value (`nargs="?"`) | `None`; `"events_report.md"` if the bare flag is given with no value | `undocumented`. Generate a Markdown report at the given (or default) path. |
+| `--report` | path, optional value (`nargs="?"`) | `None`; `"events_report.html"` if the bare flag is given with no value | Generate a report. **Format follows the extension** — anything but `.md`/`.markdown` produces the self-contained mobile HTML view (inline CSS/JS, no network, safe to forward). A `.md` path selects the **deprecated** Markdown report and logs a warning. Default changed from `.md` to `.html` on 2026-07-30. |
 | `--obsidian` | flag | `False` | `undocumented`. Write an Obsidian-compatible report; requires `OBSIDIAN_EVENTS_DIR` (events) and/or `OBSIDIAN_RECRUITERS_DIR` (recruiters, only with `--grade-recruiters`) to be set — the flag alone does nothing. |
 | `--grade-recruiters` | flag | `False` | `undocumented`. Also runs Gmail recruiter grading as part of this harvest (chains into `commands/recruiters.py:_run_recruiter_grading`). |
 | `--auto-trash` | flag | `False` | `undocumented`. With `--grade-recruiters`, auto-trashes recruiter emails scoring below 20. |
@@ -49,7 +49,9 @@ Default subcommand. Entry point: `commands/harvest.py:harvest_cmd`.
 ```powershell
 pixi run event-harvester --days 14 --only discord,telegram
 pixi run event-harvester --dry-run --no-sync --show-rejects
-pixi run event-harvester harvest --profile tech-meetups --cap total=100 --report weekly.md
+pixi run event-harvester harvest --profile tech-meetups --cap total=100 --report weekly.html
+pixi run event-harvester harvest --report                # events_report.html, forwardable
+pixi run event-harvester harvest --report legacy.md      # deprecated Markdown path
 ```
 
 ## `watch`

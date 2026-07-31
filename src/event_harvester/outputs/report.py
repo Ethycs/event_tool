@@ -1,37 +1,25 @@
-"""Markdown report generator with TickTick deep links."""
+"""Markdown report generator with TickTick deep links.
 
+**DEPRECATED 2026-07-30.** Superseded by `outputs/html_report.py`, which is
+self-contained, mobile-first, and forwardable — this report renders as a wall
+of text on the device where it is actually read. `generate_report` still works
+and emits a `DeprecationWarning`; `--report FILE.md` still selects it.
+
+This does **not** deprecate `outputs/obsidian.py`. That writes Markdown into an
+Obsidian vault, where Markdown is the native format rather than a rendering
+choice.
+"""
+
+import warnings
 from datetime import datetime, timezone
-from urllib.parse import quote
 
 from event_harvester.observability.tracing import traced
 
+# Re-exported for back-compat; the canonical home is outputs/deeplinks.py, so
+# the replacement does not have to import from the module it replaces.
+from event_harvester.outputs.deeplinks import ticktick_deep_link  # noqa: F401
+
 _TRACER = "event_harvester.outputs.report"
-
-
-def ticktick_deep_link(
-    title: str,
-    start_date: str | None,
-    all_day: bool,
-    content: str,
-) -> str:
-    """Build a ticktick:// x-callback-url deep link."""
-    params = {
-        "title": title,
-        "content": content,
-    }
-
-    if start_date:
-        # Normalize to the format TickTick expects: 2026-03-21T14:00:00.000+0000
-        date_str = start_date
-        if len(date_str) == 10:  # YYYY-MM-DD only
-            date_str += "T00:00:00.000+0000"
-        elif "T" in date_str and "." not in date_str:
-            date_str += ":00.000+0000" if date_str.count(":") == 1 else ".000+0000"
-        params["startDate"] = date_str
-        params["allDay"] = "true" if all_day else "false"
-
-    query = "&".join(f"{k}={quote(v, safe='')}" for k, v in params.items())
-    return f"ticktick://x-callback-url/v1/add_task?{query}"
 
 
 @traced("report.generate", tracer_name=_TRACER)
@@ -47,7 +35,17 @@ def generate_report(
 
     Uses validated_events if available, otherwise falls back to raw_events.
     Returns the output file path.
+
+    .. deprecated:: 2026-07-30
+       Use :func:`event_harvester.outputs.html_report.generate_html_report`.
     """
+    warnings.warn(
+        "Markdown reports are deprecated; use outputs.html_report."
+        "generate_html_report (self-contained, mobile-first, forwardable). "
+        "Pass --report FILE.md to keep using this.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     sources = " + ".join(

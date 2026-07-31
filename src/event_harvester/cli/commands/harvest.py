@@ -142,14 +142,32 @@ async def harvest_cmd(args, cfg) -> int:
     validated_events = _events_for_report(result.events)
 
     if args.report:
-        report_path = generate_report(
-            validated_events=validated_events,
-            raw_events=[],
-            links=result.links,
-            source_counts=result.source_counts,
-            total_messages=len(result.all_messages),
-            output_path=args.report,
-        )
+        # Format follows the extension, so `--report out.md` keeps working for
+        # anyone who wants the deprecated Markdown and nobody has to learn a
+        # second flag. Default is HTML.
+        if str(args.report).lower().endswith((".md", ".markdown")):
+            logger.warning(
+                "Markdown reports are deprecated — use a .html path for the "
+                "self-contained mobile view.",
+            )
+            report_path = generate_report(
+                validated_events=validated_events,
+                raw_events=[],
+                links=result.links,
+                source_counts=result.source_counts,
+                total_messages=len(result.all_messages),
+                output_path=args.report,
+            )
+        else:
+            from event_harvester.outputs.html_report import generate_html_report
+
+            report_path = generate_html_report(
+                validated_events=validated_events,
+                raw_events=[],
+                source_counts=result.source_counts,
+                total_messages=len(result.all_messages),
+                output_path=args.report,
+            )
         print(f"\nReport saved -> {report_path}\n")
 
     if args.obsidian and cfg.obsidian_events_dir:

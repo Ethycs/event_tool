@@ -1,6 +1,6 @@
 # Output Sinks
 
-**Status:** CURRENT · **Date:** 2026-07-29 · **Applies to:** `src/event_harvester/outputs/__init__.py`, `src/event_harvester/outputs/report.py`, `src/event_harvester/outputs/ticktick.py`, `src/event_harvester/outputs/obsidian.py`, `src/event_harvester/ui/display.py`
+**Status:** CURRENT · **Date:** 2026-07-30 (HTML report added, Markdown deprecated) · **Applies to:** `src/event_harvester/outputs/__init__.py`, `src/event_harvester/outputs/html_report.py`, `src/event_harvester/outputs/deeplinks.py`, `src/event_harvester/outputs/report.py`, `src/event_harvester/outputs/ticktick.py`, `src/event_harvester/outputs/obsidian.py`, `src/event_harvester/ui/display.py`
 
 Four sinks turn harvested/validated events into something a human (or TickTick) consumes: a throwaway Markdown report, an Obsidian vault writer, a TickTick task sync, and ANSI terminal printers. Only `ticktick.py` mutates external state — `report.py`, `obsidian.py`, and `display.py` are local/idempotent and safe to re-run. `src/event_harvester/outputs/__init__.py` is a one-line docstring module with no exports to import from (`"""Sinks that write extracted events outward: TickTick, Markdown reports, Obsidian vault."""`) — callers import directly from the submodules.
 
@@ -11,7 +11,33 @@ Four sinks turn harvested/validated events into something a human (or TickTick) 
 
 ---
 
-## 1. `outputs/report.py` — Markdown report
+## 0. `outputs/html_report.py` — self-contained HTML report ⭐ **default since 2026-07-30**
+
+**Domain:** One `.html` file with no external resources — inline CSS and JS, no CDN, no fonts, no network. That combination is the design, not a nicety:
+
+- **Forwardable.** A single file can be emailed, AirDropped, dropped in a shared folder, or hosted anywhere. The Markdown report is forwardable too but renders as a wall of text on a phone; the Flet UI is interactive but is an *application*, not something you can send someone.
+- **Mobile-first.** The phone is where "what's on this weekend" is actually read, and where the two actions that matter — add to calendar, open the listing — are one tap. 40px tap targets, sticky search, `viewport-fit=cover`, light/dark via `prefers-color-scheme`.
+- **Offline.** A page that needs the network to render is a bookmark, not a document.
+
+**Inputs:** `generate_html_report(validated_events, raw_events=None, source_counts=None, total_messages=0, output_path="events_report.html", title="Events", today=None)`. Mirrors `generate_report`'s signature so it drops into the same call sites. `links` is deliberately absent — "Top Links" is a debugging aid and this file is meant to be sent to people.
+
+**Per event:** title, date/time, location, source, expandable details, plus three actions — *Add to calendar* (a `data:text/calendar` iCalendar URI built client-side, so it works with no server), *Open* (the source listing), and *TickTick* (the existing `ticktick://` deep link).
+
+**Interaction:** client-side search across title/location/details/source, per-platform filter chips, and date bucketing — `Today`, `Tomorrow`, `This week`, `This month`, `Later`, `Undated`, `Past`. `Undated` and `Past` sort **last** so a stale event never heads the page.
+
+### Two properties worth not breaking
+
+**Scraped text is never interpolated into markup.** Event titles and details come from arbitrary websites. The payload is embedded as JSON in a `<script type="application/json">` block and rendered through `textContent`, so an event titled `<img onerror=...>` renders as that literal string. `_safe_json` escapes `</` (an unescaped `</script` would close the block early and turn the rest of the payload into live markup) and U+2028/U+2029 (valid JSON, line terminators to a JS parser). Pinned by `tests/test_html_report.py::TestUntrustedContent`.
+
+**Dates are bucketed against the *local* date, not UTC.** Event dates are local wall-clock dates scraped from venue pages — a 9pm SF show is `2026-07-30`, not an instant. Bucketing them against `datetime.now(timezone.utc).date()` put every event happening tonight into `Past` from 5pm PDT onward, which is exactly when someone opens the page to decide what to do that evening. `today` is injectable for deterministic tests. This was found by rendering the page in a browser, not by a test — the tests computed both sides of the comparison the same way and agreed with each other.
+
+**Forwarding the file forwards the data.** It embeds every event and the source channel each came from. `_prepare` therefore whitelists display fields only; internals like `_status` never reach the file.
+
+## 1. `outputs/report.py` — Markdown report · **DEPRECATED 2026-07-30**
+
+> Superseded by `html_report.py`. `generate_report` still works and emits a `DeprecationWarning`; `--report FILE.md` still selects it. **This does not deprecate `obsidian.py`** — that writes Markdown into an Obsidian vault, where Markdown is the native format rather than a rendering choice.
+>
+> `ticktick_deep_link` moved to `outputs/deeplinks.py` and is re-exported here for back-compat, so the replacement does not import from the module it replaces.
 
 **Domain:** disposable, local Markdown summary of one harvest run, with clickable TickTick deep links (`ticktick://x-callback-url/...`) so a human can add tasks by hand without the OAuth path.
 

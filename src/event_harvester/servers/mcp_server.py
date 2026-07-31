@@ -498,22 +498,43 @@ def build_server(
 
     @server.tool()
     @traced("mcp.tool.generate_latest_report", tracer_name=_TRACER)
-    def generate_latest_report(output_path: str = "events_report.md") -> dict[str, Any]:
-        """Generate a Markdown report from the latest MCP harvest cache."""
+    def generate_latest_report(output_path: str = "events_report.html") -> dict[str, Any]:
+        """Generate a report from the latest MCP harvest cache.
+
+        Defaults to a self-contained mobile-friendly HTML file — one file, no
+        server, no network, safe to forward. Format follows the extension; a
+        .md path selects the deprecated Markdown report.
+        """
         data = _load_latest_events()
         events = data.get("events", [])
         if not events:
             return {"ok": False, "error": "No cached events. Run harvest_events first."}
 
-        report_path = generate_report(
-            validated_events=_events_for_report(events),
-            raw_events=[],
-            links=data.get("links", []),
-            source_counts=data.get("source_counts", {}),
-            total_messages=int(data.get("stats", {}).get("total_messages", 0)),
-            output_path=output_path,
-        )
-        return {"ok": True, "path": str(report_path), "events": len(events)}
+        source_counts = data.get("source_counts", {})
+        total_messages = int(data.get("stats", {}).get("total_messages", 0))
+
+        if output_path.lower().endswith((".md", ".markdown")):
+            report_path = generate_report(
+                validated_events=_events_for_report(events),
+                raw_events=[],
+                links=data.get("links", []),
+                source_counts=source_counts,
+                total_messages=total_messages,
+                output_path=output_path,
+            )
+            fmt = "markdown (deprecated)"
+        else:
+            from event_harvester.outputs.html_report import generate_html_report
+
+            report_path = generate_html_report(
+                validated_events=_events_for_report(events),
+                raw_events=[],
+                source_counts=source_counts,
+                total_messages=total_messages,
+                output_path=output_path,
+            )
+            fmt = "html"
+        return {"ok": True, "path": str(report_path), "events": len(events), "format": fmt}
 
     # ── Site authoring: walk a site once, save the route ──────────────
     #

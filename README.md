@@ -93,7 +93,8 @@ pixi run event-harvester --save messages.json  # snapshot raw messages
 pixi run event-harvester --load messages.json  # replay from snapshot
 pixi run event-harvester --cap discord=20,telegram=30 --cap total=100
 pixi run event-harvester --show-rejects        # per-stage reject counts + data/rejects.ini
-pixi run event-harvester --report weekly.md    # Markdown report
+pixi run event-harvester --report              # events_report.html — one file,
+                                               # mobile-friendly, no server, forwardable
 ```
 
 Subcommands:

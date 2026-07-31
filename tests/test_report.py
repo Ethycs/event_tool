@@ -1,9 +1,22 @@
-"""Tests for markdown report generation."""
+"""Tests for markdown report generation.
+
+The module under test is **deprecated** (2026-07-30, superseded by
+`outputs/html_report.py`). These stay as a regression guard for as long as
+`--report FILE.md` is still honoured — deprecated is not unsupported. The
+warning is filtered here rather than suppressed at the source, so the
+deprecation still reaches anyone who calls it from application code.
+"""
 
 import os
 import tempfile
 
+import pytest
+
 from event_harvester.outputs.report import generate_report, ticktick_deep_link
+
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:Markdown reports are deprecated:DeprecationWarning"
+)
 
 
 class TestTickTickDeepLink:

@@ -124,9 +124,11 @@ def _add_harvest_args(p: argparse.ArgumentParser) -> None:
     _add_profile_flag(p)
 
     p.add_argument(
-        "--report", nargs="?", const="events_report.md", default=None,
+        "--report", nargs="?", const="events_report.html", default=None,
         metavar="FILE",
-        help="Generate markdown report (default file: events_report.md)",
+        help="Generate a report (default: events_report.html — self-contained, "
+             "mobile-friendly, forwardable). Format follows the extension; "
+             "a .md path selects the deprecated Markdown report",
     )
     p.add_argument(
         "--obsidian", action="store_true",
