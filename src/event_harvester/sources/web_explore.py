@@ -28,7 +28,13 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from event_harvester.observability.tracing import set_span_attrs, traced
+from event_harvester.observability.metrics import add_to_gauge, count, record
+from event_harvester.observability.tracing import (
+    current_span_event,
+    fail_current_span,
+    set_span_attrs,
+    traced,
+)
 from event_harvester.sources import web_steps
 from event_harvester.utils import data_path
 
@@ -60,14 +66,28 @@ class ExploreSession:
         self.last_used = time.time()
 
     def close(self) -> None:
-        for closer in (
-            lambda: self.page.close(),
-            lambda: self.uc.__exit__(None, None, None),
+        for what, closer in (
+            ("page", lambda: self.page.close()),
+            ("browser", lambda: self.uc.__exit__(None, None, None)),
         ):
             try:
                 closer()
             except Exception as e:  # noqa: BLE001 — teardown is best-effort
                 logger.debug("explore: teardown step failed: %s", e)
+                # A browser that would not close is a leaked process. Best-effort
+                # teardown is right, silent best-effort teardown is not.
+                current_span_event("explore.teardown_failed", {
+                    "explore.session": self.session_id, "explore.stage": what,
+                    "error.message": str(e)[:200],
+                })
+                count("explore.teardown_failures", stage=what,
+                      description="Explore sessions whose teardown raised")
+        add_to_gauge("explore.sessions.open", -1,
+                     description="Explore sessions currently holding a browser")
+        record("explore.session.duration", int(time.time() - self.created_at), unit="s",
+               description="Lifetime of one explore session")
+        record("explore.session.steps", len(self.steps), unit="{step}",
+               description="Steps recorded into a route by one session")
 
 
 _SESSIONS: dict[str, ExploreSession] = {}
@@ -85,6 +105,9 @@ def _reap_idle() -> list[str]:
             closed.append(sid)
     if closed:
         logger.info("explore: reaped %d idle session(s): %s", len(closed), ", ".join(closed))
+        current_span_event("explore.reaped_idle", {"explore.reaped": len(closed)})
+        count("explore.sessions.reaped", len(closed),
+              description="Explore sessions closed for being idle")
     return closed
 
 
@@ -125,6 +148,8 @@ def open_session(url: str, *, native_chrome: bool = False, wait_ms: int = 2500) 
     with _LOCK:
         _reap_idle()
         if len(_SESSIONS) >= MAX_SESSIONS:
+            count("explore.sessions.rejected", reason="cap",
+                  description="Session opens refused")
             raise RuntimeError(
                 f"{len(_SESSIONS)} explore session(s) already open (max {MAX_SESSIONS}). "
                 f"Close one first: {', '.join(_SESSIONS)}"
@@ -150,7 +175,15 @@ def open_session(url: str, *, native_chrome: bool = False, wait_ms: int = 2500) 
         )
         _SESSIONS[session_id] = session
 
-    set_span_attrs(**{"explore.session": session_id, "explore.url": url})
+    set_span_attrs(**{
+        "explore.session": session_id,
+        "url.full": url[:200],
+        "explore.native_chrome": native_chrome,
+    })
+    add_to_gauge("explore.sessions.open", 1,
+                 description="Explore sessions currently holding a browser")
+    count("explore.sessions.opened", native_chrome=native_chrome,
+          description="Explore sessions opened")
     return {"session_id": session_id, "url": url, **describe(session_id)}
 
 
@@ -204,22 +237,38 @@ def describe(session_id: str, *, use_vlm: bool | str = "auto") -> dict[str, Any]
 
 
 @traced("web.explore.act", tracer_name=_TRACER)
-def act(session_id: str, step: dict[str, Any], *, record: bool = True,
+def act(session_id: str, step: dict[str, Any], *, record_step: bool = True,
         describe_after: bool = True) -> dict[str, Any]:
     """Run one step against the live page, and record it if it worked.
 
     Only successful steps are recorded. A route made of things that happened is
     the point; a route made of things that were attempted is a liability, since
     replay has no way to know which was which.
+
+    (``record_step`` rather than ``record`` because this module now imports
+    ``metrics.record``. Shadowing it here would have made the metric silently
+    unrecordable in exactly the function that needs it most.)
     """
     session = _get(session_id)
 
+    set_span_attrs(**{
+        "explore.session": session_id,
+        "step.verb": str(step.get("verb")),
+        "step.target": step.get("target"),
+    })
+
     errors = web_steps.validate_steps([step])
     if errors:
+        fail_current_span(errors[0], error_type="invalid_step")
+        count("explore.acts", ok=False, verb=str(step.get("verb")), reason="invalid",
+              description="Explore steps attempted")
         return {"ok": False, "error": "; ".join(errors), "recorded": False}
 
     scratch = web_steps.ReplayResult(ok=True)
     t0 = time.monotonic()
+    # NOTE: `_run_one` is called directly rather than through `replay`, so this
+    # step gets the explore span rather than a `web.step.*` child. Deliberate —
+    # authoring steps are one-at-a-time interactions, not a route being walked.
     try:
         ok, detail = web_steps._run_one(session.uc, session.page, step, scratch)
     except Exception as e:  # noqa: BLE001
@@ -229,9 +278,20 @@ def act(session_id: str, step: dict[str, Any], *, record: bool = True,
     entry = {"step": dict(step), "ok": ok, "detail": detail, "elapsed_ms": elapsed}
     session.history.append(entry)
     recorded = False
-    if ok and record:
+    if ok and record_step:
         session.steps.append(dict(step))
         recorded = True
+
+    set_span_attrs(**{
+        "step.ok": ok, "step.detail": detail[:200], "step.recorded": recorded,
+        "explore.route_length": len(session.steps),
+    })
+    if not ok:
+        fail_current_span(detail[:200], error_type=f"step_{step.get('verb')}")
+    count("explore.acts", ok=ok, verb=str(step.get("verb")), recorded=recorded,
+          description="Explore steps attempted")
+    record("explore.act.duration", elapsed, unit="ms", verb=str(step.get("verb")),
+           description="Wall-clock duration of one explore step")
 
     result: dict[str, Any] = {
         "ok": ok, "detail": detail, "elapsed_ms": elapsed, "recorded": recorded,
@@ -308,6 +368,9 @@ def save_source(session_id: str, name: str, *, replace: bool = False,
 
     existing = next((i for i, s in enumerate(sources) if s.get("name") == name), None)
     if existing is not None and not replace:
+        fail_current_span(f"source {name!r} already exists", error_type="would_overwrite")
+        count("explore.saves", ok=False, reason="would_overwrite",
+              description="Route saves into web_sources.json")
         return {
             "ok": False,
             "error": f"source {name!r} already exists; pass replace=true to overwrite",
@@ -325,6 +388,18 @@ def save_source(session_id: str, name: str, *, replace: bool = False,
     save_json(WEB_SOURCES_PATH, sources)
     logger.info("explore: %s source %r (%d total)",
                 "replaced" if previous else "added", name, len(sources))
+    # A route reaching web_sources.json is the outcome the whole authoring
+    # surface exists for, so it is the one worth being able to count.
+    current_span_event("explore.route_saved", {
+        "source.name": name,
+        "route.length": len(built["source"].get("steps", [])),
+        "explore.replaced": bool(previous),
+    })
+    count("explore.saves", ok=True, replaced=bool(previous),
+          description="Route saves into web_sources.json")
+    record("explore.saved_route.length", len(built["source"].get("steps", [])),
+           unit="{step}", description="Length of a route as saved")
+    set_span_attrs(**{"source.name": name, "explore.total_sources": len(sources)})
     return {"ok": True, "source": built["source"], "replaced": previous,
             "total_sources": len(sources), "path": str(WEB_SOURCES_PATH)}
 

@@ -45,6 +45,7 @@ try:
         ConsoleSpanExporter,
         SimpleSpanProcessor,
     )
+    from opentelemetry.trace import Status, StatusCode
 
     _OTEL_OK = True
 except Exception as e:  # pragma: no cover - exercised only without otel installed
@@ -62,6 +63,9 @@ class _NoOpSpan:
         pass
 
     def record_exception(self, *a, **kw) -> None:
+        pass
+
+    def set_status(self, *a, **kw) -> None:
         pass
 
     def is_recording(self) -> bool:
@@ -164,6 +168,51 @@ def set_span_attrs(**attrs: Any) -> None:
         logger.debug("set_span_attrs failed: %s", e)
 
 
+def _mark_error(span, exc: BaseException) -> None:
+    """Record an exception on ``span`` **and** set the span's status to ERROR.
+
+    Recording alone is not enough. A span that raised but whose status stays
+    ``UNSET`` reads as successful to every backend — error rates, alerts and
+    the red highlighting in a trace viewer all key off status, not off the
+    presence of an exception event. This was the gap in the package-wide
+    instrumentation pass: exceptions were recorded everywhere and no span was
+    ever marked failed.
+    """
+    try:
+        span.set_attribute("error.message", str(exc))
+        span.set_attribute("error.type", type(exc).__name__)
+        span.record_exception(exc)
+        if _OTEL_OK:
+            span.set_status(Status(StatusCode.ERROR, str(exc)))
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug("_mark_error failed: %s", e)
+
+
+def fail_current_span(message: str, *, error_type: str = "handled") -> None:
+    """Mark the current span as failed **without** an exception.
+
+    For the failures this codebase handles rather than raises — a step that
+    could not resolve its target, a route that stopped early, a token that
+    would not refresh. Those return a value and keep going, so nothing would
+    otherwise mark the span, and a trace of an unsuccessful run would look
+    entirely green.
+    """
+    if not _OTEL_OK:
+        return
+    try:
+        span = trace.get_current_span()
+        if span is None:
+            return
+        is_rec = getattr(span, "is_recording", None)
+        if callable(is_rec) and not is_rec():
+            return
+        span.set_attribute("error.message", message)
+        span.set_attribute("error.type", error_type)
+        span.set_status(Status(StatusCode.ERROR, message))
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug("fail_current_span failed: %s", e)
+
+
 def traced(
     name: str | None = None,
     *,
@@ -208,8 +257,7 @@ def traced(
                     try:
                         return await fn(*a, **kw)
                     except Exception as e:
-                        span.set_attribute("error.message", str(e))
-                        span.record_exception(e)
+                        _mark_error(span, e)
                         raise
 
             return async_wrapper
@@ -226,8 +274,7 @@ def traced(
                     try:
                         yield from fn(*a, **kw)
                     except Exception as e:
-                        span.set_attribute("error.message", str(e))
-                        span.record_exception(e)
+                        _mark_error(span, e)
                         raise
 
             return gen_wrapper
@@ -242,8 +289,7 @@ def traced(
                 try:
                     return fn(*a, **kw)
                 except Exception as e:
-                    span.set_attribute("error.message", str(e))
-                    span.record_exception(e)
+                    _mark_error(span, e)
                     raise
 
         return sync_wrapper

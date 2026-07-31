@@ -168,6 +168,40 @@ Only a **successful** VLM call increments the counter (`cls._images_sent_this_ru
 
 **Failure modes:** No trace file → `None` (caller skips). No key frames → `unknown` / "no key frames available", no LLM call. Budget exceeded → `unknown` / explicit message, no LLM call. LLM exception → caught broadly, `unknown` / `str(e)`, `nav_score` still computed from structural signals alone — the quality-check stage is designed to never fail the pipeline (`serve.py:131-136` also wraps the call in its own try/except). `quality.json` write failure → logged at WARNING, `SourceQuality` still returned to caller (UI badge just won't appear).
 
+## Module: `metrics.py` — **added 2026-07-30**
+
+**Domain:** The other half of `tracing.py`, and the same soft-dependency contract: if `opentelemetry` is missing or the SDK fails to start, every instrument becomes a no-op and the pipeline runs unchanged.
+
+**Why both signals.** Spans answer *what happened in this run*; metrics answer *what is happening across runs*. Almost every operational question this project actually has is the second kind — did the meetup route stop yielding, are we paying for more vision calls than last week, which step verb fails most. A trace can only answer those one run at a time.
+
+Public surface: `init_metrics`, `count`, `record`, `add_to_gauge`, `shutdown_metrics`, `get_meter`. Instruments are created lazily and cached by `kind:name`, so a module can call `count("web.steps")` without import-order coupling to `init_metrics`.
+
+| Instrument | Kind | Dimensions | Answers |
+|---|---|---|---|
+| `cli.invocations` | counter | `command` | What is this tool used for |
+| `pipeline.stages` / `pipeline.stage.duration` | counter / histogram | `stage`, `ok` | Which stage is slow, which fails |
+| `llm.requests` / `llm.tokens` | counter | `model`, `finish_reason` / `direction` | **Spend.** Previously only on a span, so unsummable without a backend query |
+| `ticktick.tasks` | counter | `outcome`, `dry_run` | Did the only external write actually work |
+| `web.steps.executed` / `web.step.duration` | counter / histogram | `verb`, `ok`, `source` | Which route step breaks, and where time goes |
+| `web.route.replays` / `web.route.yield` | counter / histogram | `source`, `ok`, `reason` | **Replay rot.** One zero is a quiet week; a step change in the yield distribution is a broken route |
+| `web.route.rot_suspected` | counter | `source` | `expect_min_events` tripped |
+| `hints.diagnoses` / `hints.escalations` / `hints.vlm_calls` | counter | `kind`, `escalated`, `classification` | Is the escalation gate holding — every `vlm_calls` increment is a real vision request |
+| `hints.vlm_overrides` | counter | `rule_kind`, `vlm_kind` | Which DOM rules the screenshot keeps contradicting |
+| `explore.sessions.open` | **up-down** counter | — | How many browsers are open *right now* — a plain counter can only say how many were opened |
+
+**Cardinality discipline** mirrors the tracing side: dimensions are things you group by (verb, source, outcome) and nothing unbounded. `source` is safe because names come from `web_sources.json`, not from URLs. A metric keyed by URL would be a cardinality bomb.
+
+`hard constraint` — **a MeterProvider cannot be replaced once set.** The SDK logs `Overriding of current MeterProvider is not allowed` and keeps the original, and readers bind at provider construction, so a second `init_metrics` with new readers would silently orphan them. `init_metrics` detects this and warns rather than pretending. This also shapes the tests: `tests/test_metrics.py` installs one provider per module and its assertions are accumulation-safe.
+
+`hard constraint` — metrics export on a **timer**, unlike spans. A CLI that exits in seconds would flush nothing, so `cli/dispatch.py` calls `shutdown_metrics()` in a `finally`.
+
+## Span status — **changed 2026-07-30**
+
+`traced` recorded exceptions but never set span status, which meant **no span in this codebase was ever marked failed**. Error rates, alerting and the red highlighting in a trace viewer all key off `Status`, not off the presence of an exception event — so a trace of a broken run rendered entirely green.
+
+- `_mark_error(span, exc)` — used by `traced`; records the exception, sets `error.type`, sets `StatusCode.ERROR`.
+- `fail_current_span(message, error_type=...)` — for the failures this codebase *handles rather than raises*, which is most of them: a step that could not resolve its target, a route that stopped early, a token that would not refresh, a partial TickTick failure. These functions return a value and keep going, so nothing else would ever mark the span.
+
 ## Module: `hints.py` — **added 2026-07-30**
 
 **Domain:** Live page diagnosis. The counterpart to `nav_quality.py`, and the distinction matters: `nav_quality` scores a **finished** run from a trace on disk; `hints` diagnoses an **open** page while there is still something to do about it. It reuses `nav_quality.parse_classification` rather than growing a second response parser, and carries the same lazy `vision_completion` shim for the same reason.
@@ -292,6 +326,6 @@ Every `NavigationTracer.record()`/`record_with_screenshot()` call additionally a
 ## Verification
 
 ```
-pixi run -e dev pytest tests/test_navigation_trace.py tests/test_screenshot_capture.py tests/test_nav_quality.py tests/test_tracing.py tests/test_hints.py -v
+pixi run -e dev pytest tests/test_navigation_trace.py tests/test_screenshot_capture.py tests/test_nav_quality.py tests/test_tracing.py tests/test_hints.py tests/test_metrics.py -v
 ```
 Proves: JSONL schema/step-numbering/chrome-extension filtering (`test_navigation_trace.py`), screenshot cap + circuit breaker + GIF assembly (`test_screenshot_capture.py`), `compute_score`/`pick_key_frames`/`parse_classification`/budget-guard behavior (`test_nav_quality.py`), and OTel no-op-vs-real idempotent init + span-event capture via `InMemorySpanExporter` (`test_tracing.py`). This document was produced by reading source only — the app was not run, so runtime behavior beyond what these tests assert is marked `unverified` above.

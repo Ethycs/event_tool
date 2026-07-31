@@ -16,7 +16,8 @@ import logging
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
-from event_harvester.observability.tracing import get_tracer
+from event_harvester.observability.metrics import count, record
+from event_harvester.observability.tracing import current_span_event, get_tracer
 from event_harvester.sources.web_steps import replay
 from event_harvester.sources.web_utils import (
     _fetch_event_details_parallel,
@@ -40,6 +41,9 @@ def _do_steps(uc, src: dict, timeout_ms: int, max_events: int,
                 uc, src, timeout_ms, max_events, page=page, tracer=tracer, capture=capture,
             )
             span.set_attribute("message.count", len(messages))
+            record("web.source.messages", len(messages), unit="{message}",
+                   source=name, mode="steps",
+                   description="Messages produced by one source run")
             return messages
         except Exception as e:
             span.set_attribute("error.message", str(e))
@@ -67,7 +71,7 @@ def _do_steps_inner(uc, src: dict, timeout_ms: int, max_events: int,
     except Exception as e:  # noqa: BLE001 — diagnosis is optional, the run is not
         logger.debug("%s: could not load llm config for diagnosis: %s", name, e)
 
-    result = replay(uc, page, steps, cfg_llm=cfg_llm)
+    result = replay(uc, page, steps, cfg_llm=cfg_llm, source=name)
 
     if not result.ok:
         failed = result.failed_step
@@ -129,10 +133,19 @@ def _do_steps_inner(uc, src: dict, timeout_ms: int, max_events: int,
     expected = src.get("expect_min_events")
     if expected is not None and len(messages) < int(expected):
         # Replay-rot tripwire: a stale selector yields zero, which reads exactly
-        # like a quiet week. Only the source's own history can tell them apart.
+        # like a quiet week. Only the source's own history can tell them apart —
+        # which is why this also lands as a span event and a counter, not just a
+        # log line nobody greps.
         logger.warning(
             "%s: route yielded %d message(s), below expect_min_events=%s — "
             "the route may have rotted", name, len(messages), expected,
         )
+        current_span_event("route.rot_suspected", {
+            "source.name": name,
+            "route.yield": len(messages),
+            "route.expected_min": int(expected),
+        })
+        count("web.route.rot_suspected", source=name,
+              description="Routes yielding below their expect_min_events floor")
 
     return messages

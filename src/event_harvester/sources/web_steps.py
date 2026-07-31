@@ -31,7 +31,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from event_harvester import web_primitives as W
-from event_harvester.observability.tracing import set_span_attrs, traced
+from event_harvester.observability.metrics import count, record
+from event_harvester.observability.tracing import (
+    current_span_event,
+    fail_current_span,
+    get_tracer,
+    set_span_attrs,
+    traced,
+)
 
 logger = logging.getLogger("event_harvester.web_steps")
 _TRACER = "event_harvester.sources.web_steps"
@@ -271,9 +278,9 @@ def _run_one(uc, page, step: dict[str, Any], out: ReplayResult) -> tuple[bool, s
     return False, f"unhandled verb {verb!r}"
 
 
-@traced("web.steps.replay", tracer_name=_TRACER)
+@traced("web.route.replay", tracer_name=_TRACER)
 def replay(uc, page, steps: list[dict[str, Any]], *, cfg_llm=None,
-           diagnose_on_failure: bool = True) -> ReplayResult:
+           diagnose_on_failure: bool = True, source: str = "") -> ReplayResult:
     """Walk ``steps`` against an open page. No LLM in the loop unless it breaks.
 
     A step marked ``"optional": true`` may fail without ending the run — that is
@@ -286,43 +293,102 @@ def replay(uc, page, steps: list[dict[str, Any]], *, cfg_llm=None,
     spot (:mod:`event_harvester.observability.hints`). That is the difference
     between "meetup returned 0 events" and "meetup returned 0 events because a
     consent dialog was covering the results".
+
+    ``source`` is only used as a metric/span dimension. It is a low-cardinality
+    label by construction — source names come from `web_sources.json`, not from
+    URLs — which is what keeps `web.route.yield` groupable.
     """
     out = ReplayResult(ok=True)
+    set_span_attrs(**{"route.source": source, "route.length": len(steps)})
+
     errors = validate_steps(steps)
     if errors:
         out.ok = False
         out.results.append(StepResult(-1, "validate", False, "; ".join(errors[:5])))
+        fail_current_span(f"invalid route: {errors[0]}", error_type="invalid_route")
+        count("web.route.replays", ok=False, source=source, reason="invalid_route",
+              description="Route replays attempted")
         return out
 
+    tracer = get_tracer(_TRACER)
     for i, step in enumerate(steps):
         verb = step["verb"]
-        t0 = time.monotonic()
-        try:
-            ok, detail = _run_one(uc, page, step, out)
-        except Exception as e:  # noqa: BLE001 — one bad step must not lose the run
-            ok, detail = False, f"{type(e).__name__}: {e}"
-        elapsed = int((time.monotonic() - t0) * 1000)
+        target = step.get("target")
+        # One span per step. Without this a route is a single flat span and the
+        # only observable fact is that it took nine seconds -- with it, a route
+        # is a waterfall and the slow or broken step names itself.
+        with tracer.start_as_current_span(f"web.step.{verb}") as span:
+            span.set_attribute("step.index", i)
+            span.set_attribute("step.verb", verb)
+            if target:
+                span.set_attribute("step.target", target)
+                span.set_attribute("step.target_kind",
+                                   "selector" if target.startswith("selector:") else "role")
+            if step.get("optional"):
+                span.set_attribute("step.optional", True)
+
+            t0 = time.monotonic()
+            try:
+                ok, detail = _run_one(uc, page, step, out)
+            except Exception as e:  # noqa: BLE001 — one bad step must not lose the run
+                ok, detail = False, f"{type(e).__name__}: {e}"
+            elapsed = int((time.monotonic() - t0) * 1000)
+
+            span.set_attribute("step.ok", ok)
+            span.set_attribute("step.detail", detail[:200])
+            span.set_attribute("step.links_total", len(out.links))
+            if not ok:
+                # A handled failure still has to mark the span, or an
+                # unsuccessful route renders entirely green.
+                fail_current_span(detail[:200], error_type=f"step_{verb}")
+
         out.results.append(StepResult(i, verb, ok, detail, elapsed))
+        record("web.step.duration", elapsed, unit="ms", verb=verb, ok=ok,
+               description="Wall-clock duration of one route step")
+        count("web.steps.executed", verb=verb, ok=ok, source=source,
+              description="Route steps executed")
         logger.info("step %d %s: %s (%s, %dms)", i, verb, "ok" if ok else "FAILED", detail, elapsed)
 
         if not ok:
             if step.get("optional"):
+                current_span_event("step.optional_failure_skipped",
+                                   {"step.index": i, "step.verb": verb})
                 continue
             out.ok = False
             if diagnose_on_failure:
                 try:
                     from event_harvester.observability.hints import diagnose as _diagnose
-                    out.diagnosis = _diagnose(
-                        page, cfg_llm, use_vlm="auto" if cfg_llm else False,
-                    ).to_dict()
+                    diag = _diagnose(page, cfg_llm, use_vlm="auto" if cfg_llm else False)
+                    out.diagnosis = diag.to_dict()
+                    current_span_event("route.diagnosed", {
+                        "hint.kind": diag.kind,
+                        "hint.vlm_used": diag.vlm_used,
+                        "hint.summary": diag.summary()[:200],
+                    })
                 except Exception as e:  # noqa: BLE001
                     logger.debug("replay: diagnosis failed: %s", e)
             break
 
+    failed = out.failed_step
     set_span_attrs(**{
-        "steps.count": len(steps),
-        "steps.ok": out.ok,
-        "steps.links": len(out.links),
-        "steps.failed_index": out.failed_step.index if out.failed_step else -1,
+        "route.ok": out.ok,
+        "route.steps_run": len(out.results),
+        "route.links": len(out.links),
+        "route.texts": len(out.texts),
+        "route.failed_index": failed.index if failed else -1,
+        "route.failed_verb": failed.verb if failed else None,
+        "route.diagnosis": (out.diagnosis or {}).get("kind"),
     })
+    if not out.ok:
+        fail_current_span(
+            f"route stopped at step {failed.index} ({failed.verb})" if failed else "route failed",
+            error_type="route_incomplete",
+        )
+    count("web.route.replays", ok=out.ok, source=source,
+          reason=(failed.verb if failed else None),
+          description="Route replays attempted")
+    # The yield histogram is what makes replay-rot detectable across runs: one
+    # zero is a quiet week, a step change in the distribution is a broken route.
+    record("web.route.yield", len(out.links), unit="{link}", source=source, ok=out.ok,
+           description="Event links produced by one route replay")
     return out

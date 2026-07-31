@@ -5,7 +5,8 @@ from pathlib import Path
 from typing import Optional
 
 from event_harvester.config import TickTickConfig
-from event_harvester.observability.tracing import set_span_attrs, traced
+from event_harvester.observability.metrics import count
+from event_harvester.observability.tracing import fail_current_span, set_span_attrs, traced
 from event_harvester.pipeline.analysis import PRIORITY_LABEL
 from event_harvester.pipeline.event_match import save_fingerprint
 from event_harvester.ui.display import BOLD, DIM, GREEN, RED, RESET
@@ -266,4 +267,18 @@ def create_ticktick_tasks(
         "ticktick.skipped": len(result["skipped"]),
         "ticktick.failed": len(result["failed"]),
     })
+    # The only stage that writes outside this machine, so it is the one worth
+    # being able to alert on. A per-task failure is caught and printed inside
+    # the loop, which means without this counter a run that created nothing
+    # and failed everything is indistinguishable from a quiet night.
+    for outcome in ("created", "updated", "skipped", "failed"):
+        if result[outcome]:
+            count("ticktick.tasks", len(result[outcome]), outcome=outcome,
+                  dry_run=bool(dry_run),
+                  description="TickTick task operations by outcome")
+    if result["failed"]:
+        fail_current_span(
+            f"{len(result['failed'])} TickTick task(s) failed to create",
+            error_type="ticktick_partial_failure",
+        )
     return result

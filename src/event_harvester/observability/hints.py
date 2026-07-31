@@ -34,8 +34,14 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from event_harvester.observability.metrics import count, record
 from event_harvester.observability.nav_quality import parse_classification
-from event_harvester.observability.tracing import set_span_attrs, traced
+from event_harvester.observability.tracing import (
+    current_span_event,
+    fail_current_span,
+    set_span_attrs,
+    traced,
+)
 from event_harvester.utils import data_path
 
 logger = logging.getLogger(__name__)
@@ -223,8 +229,19 @@ def collect_signals(page) -> dict[str, Any]:
         signals = page.evaluate(_SIGNALS_JS) or {}
     except Exception as e:  # noqa: BLE001 — page is duck-typed and may be dead
         logger.debug("collect_signals failed: %s", e)
+        # Swallowed exceptions are invisible to a trace unless something says
+        # so. This one matters: no signals means every downstream verdict is
+        # "unknown", and the reason would otherwise be lost.
+        fail_current_span(f"page.evaluate failed: {e}", error_type="page_unreadable")
+        count("hints.signal_failures", description="Pages that could not be read at all")
         return {}
-    return dict(signals)
+    signals = dict(signals)
+    set_span_attrs(**{
+        "page.text_len": int(signals.get("text_len") or 0),
+        "page.links": int(signals.get("links") or 0),
+        "url.full": str(signals.get("url") or "")[:200],
+    })
+    return signals
 
 
 def rule_hints(signals: dict[str, Any]) -> list[Hint]:
@@ -372,13 +389,30 @@ def vlm_hint(page, cfg_llm, *, screenshot_path: Path | None = None) -> tuple[str
         logger.debug("vlm_hint: could not save screenshot: %s", e)
         return ("unknown", f"could not save screenshot: {e}", None)
 
+    t0 = time.monotonic()
     try:
         response = vision_completion(_VLM_PROMPT, [path], cfg_llm, max_tokens=300)
     except Exception as e:  # noqa: BLE001 — vision is best-effort
         logger.warning("vlm_hint: vision call failed: %s", e)
+        fail_current_span(str(e), error_type="vision_call_failed")
+        count("hints.vlm_calls", ok=False,
+              description="Vision calls made to diagnose a page (cost-bearing)")
         return ("unknown", str(e), str(path))
 
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
     classification, full = parse_classification(response)
+    # This counter is the cost signal for the whole hint system. Every increment
+    # is a real vision request; a step change here means the escalation gate has
+    # stopped doing its job.
+    count("hints.vlm_calls", ok=True, classification=classification,
+          description="Vision calls made to diagnose a page (cost-bearing)")
+    record("hints.vlm_duration", elapsed_ms, unit="ms",
+           description="Latency of one page-diagnosis vision call")
+    set_span_attrs(**{
+        "hint.vlm.classification": classification,
+        "hint.vlm.duration_ms": elapsed_ms,
+        "hint.vlm.screenshot": str(path),
+    })
     return (classification, full, str(path))
 
 
@@ -404,8 +438,24 @@ def diagnose(page, cfg_llm=None, *, use_vlm: bool | str = "auto",
         signals=signals,
     )
 
+    rule_kind = hints[0].kind if hints else "unknown"
     top_conf = hints[0].confidence if hints else 0.0
     wants_vlm = use_vlm is True or (use_vlm == "auto" and top_conf <= VLM_ESCALATION_THRESHOLD)
+
+    # The escalation decision is the cost lever, so it is recorded as an event
+    # whichever way it goes — "why did this page not get a screenshot" is as
+    # much an operational question as "why did it".
+    current_span_event("hint.escalation_decision", {
+        "hint.rule_kind": rule_kind,
+        "hint.rule_confidence": round(float(top_conf), 3),
+        "hint.mode": str(use_vlm),
+        "hint.escalated": bool(wants_vlm and cfg_llm is not None),
+        "hint.threshold": VLM_ESCALATION_THRESHOLD,
+    })
+    count("hints.escalations", escalated=bool(wants_vlm and cfg_llm is not None),
+          mode=str(use_vlm), rule_kind=rule_kind,
+          description="Diagnosis calls, split by whether they paid for vision")
+
     if wants_vlm and cfg_llm is not None:
         classification, explanation, shot = vlm_hint(page, cfg_llm, screenshot_path=screenshot_path)
         diag.vlm_used = True
@@ -422,13 +472,27 @@ def diagnose(page, cfg_llm=None, *, use_vlm: bool | str = "auto",
                 f"vision: {explanation.strip().splitlines()[-1][:200] if explanation else ''}",
                 existing.suggested_step if existing else None,
             ))
+            if classification != rule_kind:
+                # Disagreement is the interesting case and the one worth tuning
+                # on: it is either a rule that needs fixing or a page the DOM
+                # genuinely cannot describe.
+                current_span_event("hint.vlm_overrode_rules", {
+                    "hint.rule_kind": rule_kind,
+                    "hint.vlm_kind": classification,
+                })
+                count("hints.vlm_overrides", rule_kind=rule_kind, vlm_kind=classification,
+                      description="Times the screenshot disagreed with the DOM rules")
 
     set_span_attrs(**{
         "hint.kind": diag.kind,
+        "hint.rule_kind": rule_kind,
         "hint.count": len(diag.hints),
         "hint.vlm_used": diag.vlm_used,
         "hint.confidence": round(float(diag.hints[0].confidence), 3) if diag.hints else 0.0,
+        "hint.suggested_verb": (diag.top.suggested_step or {}).get("verb") if diag.top else None,
     })
+    count("hints.diagnoses", kind=diag.kind, vlm_used=diag.vlm_used,
+          description="Page diagnoses produced")
     return diag
 
 

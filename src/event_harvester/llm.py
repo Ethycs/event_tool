@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from event_harvester.config import LLMConfig
+from event_harvester.observability.metrics import count
 from event_harvester.observability.tracing import set_span_attrs, traced
 
 _TRACER = "event_harvester.llm"
@@ -139,12 +140,26 @@ def _complete_litellm(
     # otherwise invisible -- litellm logs nothing by default and the pipeline
     # discards the response object. Put them on the span.
     usage = getattr(resp, "usage", None)
+    prompt_tokens = getattr(usage, "prompt_tokens", None) if usage else None
+    completion_tokens = getattr(usage, "completion_tokens", None) if usage else None
     set_span_attrs(**{
         "llm.finish_reason": finish_reason,
-        "llm.prompt_tokens": getattr(usage, "prompt_tokens", None) if usage else None,
-        "llm.completion_tokens": getattr(usage, "completion_tokens", None) if usage else None,
+        "llm.prompt_tokens": prompt_tokens,
+        "llm.completion_tokens": completion_tokens,
         "llm.total_tokens": getattr(usage, "total_tokens", None) if usage else None,
     })
+    # ...and as counters, because "what did this run cost" is a span question
+    # while "what are we spending" is not. A span tells you about one call; you
+    # cannot sum spans without a backend query, and the number that matters is
+    # a sum.
+    count("llm.requests", model=model, finish_reason=finish_reason,
+          description="LLM completion requests")
+    if prompt_tokens is not None:
+        count("llm.tokens", int(prompt_tokens), unit="{token}", model=model,
+              direction="prompt", description="LLM tokens billed")
+    if completion_tokens is not None:
+        count("llm.tokens", int(completion_tokens), unit="{token}", model=model,
+              direction="completion", description="LLM tokens billed")
 
     # Reasoning models (GPT-5, o1, o3) may exhaust tokens on reasoning
     # with empty content. Log a warning so the caller knows.

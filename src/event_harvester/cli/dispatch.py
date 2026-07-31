@@ -95,28 +95,46 @@ async def main() -> int:
 
     _setup_logging(args.verbose, args.quiet)
 
-    # Initialize OpenTelemetry tracing for commands that opt in via
-    # --debug-otel, or globally if OTEL_EXPORTER_OTLP_ENDPOINT is set.
-    # This must run before any harvest/analysis/serve code so the root
-    # spans get exported.
+    # Initialize OpenTelemetry for commands that opt in via --debug-otel, or
+    # globally if OTEL_EXPORTER_OTLP_ENDPOINT is set. This must run before any
+    # harvest/analysis/serve code so the root spans get exported.
+    #
+    # Metrics are installed alongside traces, not instead of them: spans answer
+    # "what happened in this run", metrics answer "what is happening across
+    # runs" — and replay-rot, vision spend and step failure rates are all the
+    # second kind of question.
     try:
         import os
 
+        from event_harvester.observability.metrics import init_metrics
         from event_harvester.observability.tracing import init_tracing
-        init_tracing(
-            debug=getattr(args, "debug_otel", False),
-            otlp_endpoint=os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT"),
-        )
+        _otel_debug = getattr(args, "debug_otel", False)
+        _otlp = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+        init_tracing(debug=_otel_debug, otlp_endpoint=_otlp)
+        init_metrics(debug=_otel_debug, otlp_endpoint=_otlp)
     except Exception as e:
-        logger.warning("init_tracing failed: %s", e)
+        logger.warning("OpenTelemetry init failed: %s", e)
 
     # One root span per invocation. Without it every span the run produces is
     # its own orphan trace -- `harvest.discord` and the `llm.chat` calls it
     # caused end up unrelated in the backend, so you cannot ask "what did this
     # run do" or "how long did the whole thing take", only "what happened".
+    from event_harvester.observability.metrics import count as _count
+    from event_harvester.observability.metrics import shutdown_metrics
     from event_harvester.observability.tracing import get_tracer
 
     tracer = get_tracer("event_harvester.cli")
+    try:
+        return await _run_command(args, tracer)
+    finally:
+        # A CLI usually exits well inside the periodic reader's export interval,
+        # so without an explicit flush the run's metrics are simply lost.
+        _count("cli.invocations", command=str(args.command),
+               description="CLI invocations by command")
+        shutdown_metrics()
+
+
+async def _run_command(args, tracer) -> int:
     with tracer.start_as_current_span(f"cli.{args.command}") as root:
         root.set_attribute("cli.command", args.command)
         for attr in ("web_command", "recruiters_command", "classifier_command"):

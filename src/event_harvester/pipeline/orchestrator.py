@@ -26,6 +26,8 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from event_harvester.config import AppConfig, validate_config
+from event_harvester.observability.metrics import count as _count
+from event_harvester.observability.metrics import record as _record
 from event_harvester.observability.tracing import get_tracer
 from event_harvester.pipeline.analysis import REJECT_BUCKETS, extract_events_llm
 from event_harvester.pipeline.event_match import find_acted_fingerprint
@@ -279,16 +281,34 @@ class Pipeline:
 
     @contextlib.contextmanager
     def _stage(self, stage_id: str, label: str | None = None):
-        """Enter a pipeline stage: tell the reporter and open a span.
+        """Enter a pipeline stage: tell the reporter, open a span, time it.
 
         These were already the same event expressed twice -- the UI got
         ``_update_stage`` and the trace got nothing. Binding them here means a
-        stage cannot be added to one and forgotten in the other.
+        stage cannot be added to one and forgotten in the other, and the same
+        argument extends to the stage-duration metric: "which stage is slow"
+        is a question about the distribution across runs, not about one span.
         """
+        import time as _time
+
         self._update_stage(stage_id, label)
+        t0 = _time.monotonic()
+        failed = False
         with tracer.start_as_current_span(f"pipeline.{stage_id}") as span:
             span.set_attribute("pipeline.stage", stage_id)
-            yield span
+            try:
+                yield span
+            except Exception:
+                failed = True
+                raise
+            finally:
+                elapsed_ms = int((_time.monotonic() - t0) * 1000)
+                span.set_attribute("pipeline.stage_duration_ms", elapsed_ms)
+                _record("pipeline.stage.duration", elapsed_ms, unit="ms",
+                        stage=stage_id, ok=not failed,
+                        description="Wall-clock duration of one pipeline stage")
+                _count("pipeline.stages", stage=stage_id, ok=not failed,
+                       description="Pipeline stages entered")
 
     def _log(self, line: str) -> None:
         if self.reporter is not None:
