@@ -57,7 +57,7 @@ Both signals were checked against in-memory exporters rather than eyeballed on a
 | Roadmap | 4.11 closed |
 | Git | Branch `fix/tier0-tier1-and-feed-probe`; this is the 6th commit on `ed3a4ee` |
 
-**First action next session**: `pixi run test` (expect 636). The outstanding work is unchanged and still the interesting part — **author a route through the MCP tools and replay it from config**, which remains the one seam nothing has exercised end to end.
+~~**First action next session**: `pixi run test` (expect 636).~~ — **superseded** by [2026-07-30_site-service-and-ticktick.md](2026-07-30_site-service-and-ticktick.md), later the same day (expect **755**). The recommendation still stands: **author a route through the MCP tools and replay it from config** remains the one seam nothing has exercised end to end. Numbers in this report are a snapshot and are intentionally left as they were.
 
 ## Verification
 

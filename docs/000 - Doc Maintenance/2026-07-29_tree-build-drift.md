@@ -113,3 +113,17 @@ Appended, not rewritten, per the cadence rule above.
 **New files this pass** (not drift, recorded so the tree diagram above is known-stale): `03 - Architecture` gained no docs but ~6 were reconciled; `07 - Status Reports` went 1 → 4; `05 - Standards` gained a `source_page` and `queries` field; `docs/` totals ~42.
 
 **Observation worth keeping.** Every defect closed on 2026-07-30 was *documented before it was fixed* — the doc build found them, the roadmap tiered them, and the fixing was mechanical afterwards. The expensive part was reading the code once, carefully. That is the argument for the tree, and it is now evidenced rather than asserted.
+
+## Third resolution log — 2026-07-30 (end of day)
+
+Appended, not rewritten.
+
+| Gap | State | Note |
+|---|---|---|
+| 4 — `01 - Design` / `00 - Theory` thin | 🟡 **Both grew** | `00 - Theory` 1 → 2 (`01 - Site Navigation as a Planning Problem`, filed DRAFT because nothing in it is implemented). `01 - Design` 1 → 2 (`01 - Link Extraction Provenance`). The docstrings-as-design-lane question is still undecided |
+| 5 — `05 - Standards` derived, not ratified | 🟡 Unchanged in status, extended in content | `EH-STD-WEBSRC-v0` gained §3.2a (the `steps` verb vocabulary) and two fields. Still Normative-in-name |
+| 6 — transcript only partly decomposed | 🔲 Still open | Nobody has read the remaining ~2,900 turns |
+
+**Counter-observation, and it cuts against the one above.** The doc-driven method worked for the defects a careful *read* can find. Every serious bug on 2026-07-30 after the Tier 1 pass was found by **running** something: the region key that gave one region per link, two timezone bugs that put events in the wrong bucket and the wrong hour, and a `uvicorn.run()` inside a running loop that meant `event-harvester site` had never once started. Reading found the first tier; only execution found the second. The tree's value is real and it is not a substitute for running the thing.
+
+**Tree is stale again**: `docs/` is 48 files across 11 numbered folders as of 2026-07-30 end of day; the diagram at the top of this note says 39. Treat it as a snapshot, as its own note already warns.
