@@ -97,6 +97,7 @@ pixi run event-harvester --report              # events_report.html — one file
                                                # mobile-friendly, no server, forwardable
 pixi run event-harvester site                  # serve it at http://127.0.0.1:8800
                                                # and re-harvest every 24h
+pixi run event-harvester service install       # ...as a Windows service (NSSM, elevated)
 ```
 
 Subcommands:

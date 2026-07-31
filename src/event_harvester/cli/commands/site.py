@@ -35,7 +35,7 @@ async def site_cmd(args, cfg) -> int:
                   f"proxy in front.{RESET}")
         print()
 
-        return run_site(
+        return await run_site(
             cfg,
             host=args.host,
             port=args.port,

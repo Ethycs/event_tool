@@ -293,6 +293,42 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Build the page and exit without serving")
     _add_root_flags(p_site)
 
+    # ── service ──
+    p_svc = sub.add_parser(
+        "service",
+        help="Run the events site as a Windows service (NSSM)",
+    )
+    svc_sub = p_svc.add_subparsers(
+        dest="service_command", required=True, metavar="SERVICE_COMMAND",
+    )
+
+    def _svc_common(sp):
+        sp.add_argument("--name", default="EventHarvesterSite",
+                        help="Service name (default: EventHarvesterSite)")
+        _add_root_flags(sp)
+
+    svc_install = svc_sub.add_parser(
+        "install", help="Install the service (elevated). Does not start it",
+    )
+    svc_install.add_argument("--host", default="127.0.0.1", help="Bind address")
+    svc_install.add_argument("--port", type=int, default=8800, help="Port")
+    svc_install.add_argument("--interval-hours", type=float, default=24.0, metavar="H",
+                             help="Hours between scheduled harvests (default: 24)")
+    _svc_common(svc_install)
+
+    for action, blurb in (
+        ("uninstall", "Stop and remove the service (elevated)"),
+        ("start", "Start the service (elevated)"),
+        ("stop", "Stop the service (elevated)"),
+        ("restart", "Restart the service (elevated)"),
+        ("status", "Show state, account, and configuration"),
+    ):
+        _svc_common(svc_sub.add_parser(action, help=blurb))
+
+    svc_logs = svc_sub.add_parser("logs", help="Tail the service's stdout/stderr logs")
+    svc_logs.add_argument("--lines", type=int, default=40, help="Lines per stream")
+    _svc_common(svc_logs)
+
     # ── recruiters ──
     p_rec = sub.add_parser(
         "recruiters",

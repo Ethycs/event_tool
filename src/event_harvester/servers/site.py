@@ -251,10 +251,20 @@ def build_app(cfg, *, interval_hours: float = DEFAULT_INTERVAL_HOURS,
     return app
 
 
-def run_site(cfg, *, host: str = "127.0.0.1", port: int = 8800,
-             interval_hours: float = DEFAULT_INTERVAL_HOURS,
-             harvest_on_start: bool = True, schedule: bool = True) -> int:
-    """Serve the site until interrupted. Returns an exit code."""
+async def run_site(cfg, *, host: str = "127.0.0.1", port: int = 8800,
+                   interval_hours: float = DEFAULT_INTERVAL_HOURS,
+                   harvest_on_start: bool = True, schedule: bool = True) -> int:
+    """Serve the site until interrupted. Returns an exit code.
+
+    A coroutine, not a sync function, and `uvicorn.Server.serve()` rather than
+    `uvicorn.run()`. The latter calls `asyncio.run()` internally, and the CLI
+    dispatcher already runs every command inside a loop — so `uvicorn.run()`
+    raised *"asyncio.run() cannot be called from a running event loop"* and the
+    process exited immediately. Under NSSM that surfaced as `SERVICE_PAUSED`
+    with nothing listening; from a terminal it would have been an instant
+    traceback. It was invisible to the tests because they exercised the app
+    object through `TestClient` and never the entry point.
+    """
     import uvicorn
 
     app = build_app(cfg, interval_hours=interval_hours,
@@ -265,7 +275,8 @@ def run_site(cfg, *, host: str = "127.0.0.1", port: int = 8800,
             "no authentication. Put a reverse proxy with auth in front.", host,
         )
     logger.info("site: http://%s:%d", host, port)
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="warning"))
+    await server.serve()
     return 0
 
 

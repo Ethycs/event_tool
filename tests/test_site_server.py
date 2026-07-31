@@ -161,6 +161,71 @@ class TestRefreshIsSurvivable:
         assert "From cache" in site_mod.SITE_JSON.read_text(encoding="utf-8")
 
 
+class TestTheEntryPointActuallyStarts:
+    """The tests above drive `build_app`; this drives the command.
+
+    That gap let a fatal bug ship: `run_site` called `uvicorn.run()`, which
+    calls `asyncio.run()` internally, while the CLI dispatcher already had a
+    loop running. The process died instantly with "asyncio.run() cannot be
+    called from a running event loop" — visible as SERVICE_PAUSED under NSSM,
+    and as an immediate traceback from a terminal. Nothing in the suite noticed
+    because nothing in the suite ran the command.
+    """
+
+    def test_run_site_is_awaitable(self):
+        import inspect
+
+        assert inspect.iscoroutinefunction(site_mod.run_site)
+
+    def test_the_command_awaits_the_server_rather_than_calling_uvicorn_run(self):
+        from types import SimpleNamespace
+
+        from event_harvester.cli.commands.site import site_cmd
+
+        served = {"count": 0}
+
+        class FakeServer:
+            def __init__(self, config):
+                self.config = config
+
+            async def serve(self):
+                served["count"] += 1
+
+        fake_uvicorn = SimpleNamespace(
+            Server=FakeServer,
+            Config=lambda app, **kw: SimpleNamespace(app=app, **kw),
+            run=lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("uvicorn.run() cannot be used inside the CLI's loop")
+            ),
+        )
+
+        args = SimpleNamespace(
+            host="127.0.0.1", port=8800, interval_hours=24.0,
+            no_schedule=True, no_harvest_on_start=True, build_only=False,
+        )
+
+        with patch.dict("sys.modules", {"uvicorn": fake_uvicorn}), \
+             patch.object(site_mod, "_collect", side_effect=_collect_ok):
+            code = asyncio.run(site_cmd(args, object()))
+
+        assert code == 0
+        assert served["count"] == 1, "the server was never actually served"
+
+    def test_build_only_writes_the_page_and_exits(self):
+        from types import SimpleNamespace
+
+        from event_harvester.cli.commands.site import site_cmd
+
+        args = SimpleNamespace(
+            host="127.0.0.1", port=8800, interval_hours=24.0,
+            no_schedule=True, no_harvest_on_start=False, build_only=True,
+        )
+        with patch.object(site_mod, "_collect", side_effect=_collect_ok):
+            code = asyncio.run(site_cmd(args, object()))
+        assert code == 0
+        assert site_mod.SITE_HTML.exists()
+
+
 class TestScheduling:
     def test_the_interval_has_a_floor(self):
         """A typo'd tiny interval would otherwise harvest in a hot loop."""

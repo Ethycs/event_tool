@@ -146,6 +146,50 @@ pixi run event-harvester site --interval-hours 6
 pixi run event-harvester site --no-harvest-on-start # serve the last harvest immediately
 ```
 
+## `service {install, uninstall, start, stop, restart, status, logs}` — **added 2026-07-30**
+
+Entry point: `commands/service.py` → `servers/service.py`. Runs `site` as a Windows service via **NSSM**, which supervises it as a plain console process — auto-start, restart-on-crash, log rotation — without the app needing to know it is a service.
+
+All subcommands take `--name` (default `EventHarvesterSite`). `install` also takes `--host`, `--port`, `--interval-hours`. `logs` takes `--lines`.
+
+Install/uninstall/start/stop **require an elevated shell**; `status` and `logs` do not.
+
+### The account is the thing that will bite you
+
+NSSM defaults a new service to **LocalSystem**, and almost every credential here is scoped to *your* user: Discord's cache under `%APPDATA%\discord`, Signal's DB under `%APPDATA%\Signal`, `token.json` and `harvest_session.session` at the repo root, and the browser profile the web sources log into. Under LocalSystem `%APPDATA%` resolves elsewhere, so **those sources go quiet rather than failing loudly** — a harvest that "succeeded" with four fewer sources.
+
+`install` therefore does not pretend it handled this. It prints the command, which takes a password and so is yours to run:
+
+```powershell
+nssm set EventHarvesterSite ObjectName "DOMAIN\you" "<your-password>"
+```
+
+`service status` flags it in red until you do.
+
+**Session 0**: a service cannot show a window. Headless Playwright is fine; the native-Chrome Cloudflare path is not. `/healthz` and per-source counts are how you tell which sources survived.
+
+### Configuration written by `install`
+
+| Setting | Value | Why |
+|---|---|---|
+| `Application` | the `pixi` executable | Everything goes through `pixi run`, services included |
+| `AppDirectory` | repo root | `.env`, `data/`, `token.json` and the source list all resolve from it |
+| `Start` | `SERVICE_AUTO_START` | |
+| `AppStopMethodConsole` | 15 s | Ctrl-C first, so uvicorn's lifespan runs and the refresh tasks are cancelled |
+| `AppStdout`/`AppStderr` | `data/.service/site.*.log` | Rotated online at 10 MB |
+| `AppExit Default` | `Restart`, 30 s delay, 10 s throttle | A service crashing on a bad credential must not spin at full speed |
+
+**`install` does not start the service.** The first start runs a harvest — browsers, every configured source, LLM tokens — and that is a standing commitment that should begin when you say so.
+
+```powershell
+pixi run event-harvester service install     # elevated
+nssm set EventHarvesterSite ObjectName "$env:USERDOMAIN\$env:USERNAME" "<password>"
+pixi run event-harvester service start
+pixi run event-harvester service status
+pixi run event-harvester service logs --lines 60
+pixi run event-harvester service uninstall
+```
+
 ## `recruiters {grade, reparse}`
 
 Entry point: `commands/recruiters.py:recruiters_cmd`.
