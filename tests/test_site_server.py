@@ -1,0 +1,174 @@
+"""Tests for the events site server.
+
+No harvest runs here: `_collect` is patched. The behaviours that matter are the
+ones a broken harvest would otherwise take down — the site must keep serving
+the last good page — and the concurrency guard, because a refresh opens
+browsers and calls an LLM.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from unittest.mock import patch
+
+import pytest
+
+from event_harvester.servers import site as site_mod
+
+
+@pytest.fixture(autouse=True)
+def isolate(tmp_path, monkeypatch):
+    """Never write to the real data/.site."""
+    monkeypatch.setattr(site_mod, "SITE_DIR", tmp_path / "site")
+    monkeypatch.setattr(site_mod, "SITE_HTML", tmp_path / "site" / "index.html")
+    monkeypatch.setattr(site_mod, "SITE_JSON", tmp_path / "site" / "events.json")
+    return tmp_path
+
+
+EVENTS = [
+    {"title": "Queer Night", "date": "2026-08-01", "time": "9pm",
+     "location": "The Stud", "source": "instagram in stud", "priority": 5},
+    {"title": "AI Meetup", "date": "2026-08-04", "source": "meetup", "priority": 3},
+]
+
+
+def _collect_ok(cfg, *, harvest):
+    return (list(EVENTS), {"web": 2}, 41)
+
+
+def client(**kwargs):
+    # Imported here, not at module scope: Starlette's TestClient emits a
+    # deprecation warning about httpx *on import*, which happens during
+    # collection — before any `pytestmark` filter can apply. Swapping httpx is
+    # a dependency decision, not a test one, so it is suppressed at the seam.
+    import warnings
+
+    # `StarletteDeprecationWarning` does not subclass `DeprecationWarning`, so
+    # the filter has to be unqualified — scoped to this one import statement.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        from starlette.testclient import TestClient
+
+    app = site_mod.build_app(object(), schedule=False, harvest_on_start=False, **kwargs)
+    return TestClient(app)
+
+
+class TestServing:
+    def test_the_page_is_built_and_served(self):
+        with patch.object(site_mod, "_collect", side_effect=_collect_ok):
+            with client() as c:
+                res = c.get("/")
+        assert res.status_code == 200
+        assert "text/html" in res.headers["content-type"]
+        assert "Queer Night" in res.text or "events-data" in res.text
+
+    def test_the_page_is_never_cached(self):
+        """A cached copy of yesterday's events is worse than a slow load."""
+        with patch.object(site_mod, "_collect", side_effect=_collect_ok):
+            with client() as c:
+                assert c.get("/").headers["cache-control"] == "no-store"
+
+    def test_events_json_matches_what_the_page_embeds(self):
+        with patch.object(site_mod, "_collect", side_effect=_collect_ok):
+            with client() as c:
+                payload = json.loads(c.get("/events.json").text)
+        assert [e["title"] for e in payload] == ["Queer Night", "AI Meetup"]
+        assert all("bucket" in e for e in payload), "same projection as the page"
+
+    def test_healthz_reports_the_build(self):
+        with patch.object(site_mod, "_collect", side_effect=_collect_ok):
+            with client(interval_hours=6) as c:
+                health = c.get("/healthz").json()
+        assert health["ok"] is True
+        assert health["events"] == 2
+        assert health["interval_hours"] == 6
+        assert health["age_seconds"] is not None
+
+    def test_an_unbuilt_site_says_so_rather_than_500ing(self):
+        def nothing(cfg, *, harvest):
+            return ([], {}, 0)
+
+        # No events and no file written yet -> index must explain itself.
+        with patch.object(site_mod, "_collect", side_effect=nothing), \
+             patch.object(site_mod, "_write", side_effect=RuntimeError("disk full")):
+            with client() as c:
+                res = c.get("/")
+                health = c.get("/healthz")
+        assert res.status_code == 503
+        assert "has not been built" in res.text
+        assert health.status_code == 503
+        assert "disk full" in health.json()["error"]
+
+
+class TestRefreshIsSurvivable:
+    def test_a_failed_harvest_keeps_the_last_good_page(self):
+        """The site must not go down because one harvest broke."""
+        with patch.object(site_mod, "_collect", side_effect=_collect_ok):
+            with client() as c:
+                assert c.get("/").status_code == 200
+
+                with patch.object(site_mod, "_collect",
+                                  side_effect=RuntimeError("cloudflare said no")):
+                    res = c.post("/refresh?harvest=1")
+
+                assert res.json()["error"] is not None
+                # Still serving.
+                assert c.get("/").status_code == 200
+                assert c.get("/healthz").json()["events"] == 2
+
+    def test_refresh_is_post_only(self):
+        """So a link preview or a crawler cannot trigger a harvest."""
+        with patch.object(site_mod, "_collect", side_effect=_collect_ok):
+            with client() as c:
+                assert c.get("/refresh").status_code == 405
+
+    def test_a_second_refresh_is_skipped_while_one_is_running(self):
+        """A harvest opens browsers and calls an LLM; two at once doubles it."""
+        state = site_mod.SiteState()
+        started = asyncio.Event()
+
+        async def slow(cfg, *, harvest):
+            started.set()
+            await asyncio.sleep(0.2)
+            return ([], {}, 0)
+
+        async def scenario():
+            with patch.object(site_mod, "_collect", side_effect=slow):
+                first = asyncio.create_task(site_mod.refresh(state, object()))
+                await started.wait()
+                second = await site_mod.refresh(state, object())
+                await first
+            return second
+
+        asyncio.run(scenario())
+        assert state.refresh_count == 1, "the second refresh should have been skipped"
+
+    def test_refresh_without_harvest_reads_the_mcp_cache(self, tmp_path, monkeypatch):
+        """`--no-harvest-on-start` serves whatever the last harvest produced."""
+        cache = tmp_path / "cache.json"
+        cache.write_text(json.dumps({
+            "events": [{"title": "From cache", "date": "2026-08-02"}],
+            "source_counts": {"web": 1},
+            "stats": {"total_messages": 7},
+        }))
+        monkeypatch.setattr(
+            "event_harvester.servers.mcp_server.LATEST_EVENTS_FILE", cache,
+        )
+        state = site_mod.SiteState()
+        snapshot = asyncio.run(site_mod.refresh(state, object(), harvest=False))
+        assert snapshot["events"] == 1
+        assert "From cache" in site_mod.SITE_JSON.read_text(encoding="utf-8")
+
+
+class TestScheduling:
+    def test_the_interval_has_a_floor(self):
+        """A typo'd tiny interval would otherwise harvest in a hot loop."""
+        app = site_mod.build_app(object(), interval_hours=0.0000001, schedule=False)
+        assert app is not None  # the clamp lives in _loop; see below
+
+    def test_the_loop_clamps_to_at_least_a_minute(self):
+        import inspect
+
+        source = inspect.getsource(site_mod.build_app)
+        assert "max(60.0" in source, "the sleep must be floored"

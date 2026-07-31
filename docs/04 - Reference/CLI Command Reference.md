@@ -113,6 +113,39 @@ pixi run event-harvester web test https://lu.ma/discover
 pixi run event-harvester web add https://cdn.dnalounge.com/events.ics
 ```
 
+## `site` — **added 2026-07-30**
+
+Entry point: `commands/site.py:site_cmd` → `servers/site.py`. Serves the events site and keeps it fresh.
+
+**Zero new dependencies** — `mcp`/`fastmcp` already bring Starlette and uvicorn, so the server is built on what was installed rather than on a framework added for the purpose.
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--host` | `127.0.0.1` | Bind address. **Loopback by default because this server has no authentication** and the events are personal |
+| `--port` | `8800` | |
+| `--interval-hours` | `24` | Hours between scheduled harvests. Floored at 60s so a typo cannot produce a hot loop |
+| `--no-schedule` | off | Serve without the background refresh loop |
+| `--no-harvest-on-start` | off | Serve the cached events; do not harvest at startup |
+| `--build-only` | off | Build `data/.site/index.html` and exit without serving |
+
+| Route | Purpose |
+|---|---|
+| `GET /` | The page. `Cache-Control: no-store` — a cached copy of yesterday's events is worse than a slow load. `503` with an explanation if it has not been built |
+| `GET /events.json` | The same projection the page embeds, so a client cannot see a different set of events than a browser does |
+| `GET /healthz` | Build age, event count, last error, whether a refresh is in flight. `503` when the last build failed |
+| `POST /refresh` | Manual rebuild. **POST-only** so a link preview or crawler cannot trigger a harvest. `?harvest=0` rebuilds from cache |
+
+**Startup order matters**: it builds from the cached events *first* so the URL answers immediately, then harvests in the background. A cold start that waited for a full harvest would serve `503` for minutes.
+
+A failed harvest never takes the site down — the last good page keeps being served and the error surfaces on `/healthz`. Refreshes are serialised by a lock, because a harvest opens browsers and calls an LLM and two at once would double the cost.
+
+```powershell
+pixi run event-harvester site                       # http://127.0.0.1:8800, daily refresh
+pixi run event-harvester site --build-only          # just write data/.site/index.html
+pixi run event-harvester site --interval-hours 6
+pixi run event-harvester site --no-harvest-on-start # serve the last harvest immediately
+```
+
 ## `recruiters {grade, reparse}`
 
 Entry point: `commands/recruiters.py:recruiters_cmd`.

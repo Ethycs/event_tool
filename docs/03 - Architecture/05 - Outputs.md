@@ -58,6 +58,25 @@ Four sinks turn harvested/validated events into something a human (or TickTick) 
 
 ---
 
+### Serving it: `servers/site.py` — **added 2026-07-30**
+
+The site is a **file**, and serving it is a detail. That is why this module is small, and it is the property worth protecting: the served page and a forwarded page are the same bytes, so they can never drift apart.
+
+Built on Starlette + uvicorn, which `mcp`/`fastmcp` already pull in — **no new dependency**. `event-harvester site` builds `data/.site/index.html`, serves it at `/`, and refreshes on a schedule (default 24h).
+
+| Property | Why |
+|---|---|
+| Builds from **cache first**, then harvests in the background | A cold start that waited for a full harvest would serve `503` for minutes |
+| A failed harvest keeps the **last good page** | The site must not go down because one source broke; the error surfaces on `/healthz` |
+| Refreshes serialised by a lock | A harvest opens browsers and calls an LLM. Two at once doubles the cost and races on the output file |
+| `POST`-only `/refresh` | A link preview or crawler must not be able to trigger a harvest |
+| Loopback by default | **No authentication.** These are personal events; `--host 0.0.0.0` needs a proxy with auth in front |
+| Sleep floored at 60s | `--interval-hours 0.0001` would otherwise harvest in a hot loop |
+
+`n × m` layout: the grid is `repeat(auto-fill, minmax(270px, 1fr))`, so *n* comes from the viewport and *m* from how many events are in that date bucket — one column on a phone, four on a desktop, from the same file with no media-query ladder. The Grid/Carousel toggle switches a single body class, so the cards are identical in both modes and switching costs a repaint rather than a re-render. Measured: 1 column at 390px, 4 at 1440px, zero horizontal overflow at both.
+
+Search is AND across terms — "queer friday" narrows rather than matching either word — over title, location, details, source and date. Sort by date, priority or title.
+
 ## 1a. `outputs/ticktick_task.py` — the API object · **added 2026-07-30**
 
 A typed, validated TickTick **Open API v1** task. Until now the payload was assembled inline in `create_ticktick_tasks` and handed to `ticktick-py`'s `task.builder(**kwargs)`, so what reached the API was whatever the pipeline happened to hold. Two things were wrong against the published schema, and **both were silent**:

@@ -151,15 +151,41 @@ input[type=search] {
   min-height: 34px;
 }
 .chip[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
-main { padding: 0 16px 48px; max-width: 720px; margin: 0 auto; }
+main { padding: 0 16px 48px; max-width: 1400px; margin: 0 auto; }
 h2.bucket {
   font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
   color: var(--muted); margin: 24px 0 10px;
 }
+
+/* n x m: n comes from the viewport, m from how many events are in the bucket.
+   auto-fill rather than a fixed column count so the same file is one column on
+   a phone and five on a desktop without a media-query ladder. */
+.shelf {
+  display: grid; gap: 10px;
+  grid-template-columns: repeat(auto-fill, minmax(270px, 1fr));
+}
+/* Carousel: one horizontally-snapping row per bucket. Same cards, same DOM —
+   only the container changes, so nothing re-renders when you toggle. */
+body.carousel .shelf {
+  display: flex; overflow-x: auto; scroll-snap-type: x mandatory;
+  padding-bottom: 6px; scrollbar-width: thin;
+}
+body.carousel .shelf .card {
+  flex: 0 0 min(86%, 300px); scroll-snap-align: start; margin-bottom: 0;
+}
 .card {
   background: var(--card); border: 1px solid var(--line); border-radius: 12px;
-  padding: 14px; margin-bottom: 10px; box-shadow: var(--shadow);
+  padding: 14px; box-shadow: var(--shadow);
+  display: flex; flex-direction: column;
 }
+.card .actions { margin-top: auto; }
+.toolbar { display: flex; gap: 8px; align-items: center; padding-top: 10px; flex-wrap: wrap; }
+.toolbar select, .toolbar button {
+  padding: 7px 11px; min-height: 34px; font-size: 13px; color: var(--fg);
+  background: var(--chip); border: 1px solid var(--line); border-radius: 8px;
+  cursor: pointer;
+}
+.count { color: var(--muted); font-size: 13px; margin-left: auto; }
 .card h3 { margin: 0 0 6px; font-size: 16px; line-height: 1.35; }
 .when { color: var(--accent); font-weight: 600; font-size: 14px; }
 .where, .src { color: var(--muted); font-size: 13px; }
@@ -283,15 +309,34 @@ function card(ev) {
   return el;
 }
 
-function render() {
+const sortBy = document.getElementById('sort');
+const layoutBtn = document.getElementById('layout');
+const countEl = document.getElementById('count');
+
+const SORTS = {
+  date: (a, b) => (a.date || '9999').localeCompare(b.date || '9999'),
+  priority: (a, b) => (b.priority || 0) - (a.priority || 0),
+  title: (a, b) => a.title.localeCompare(b.title),
+};
+
+function matching() {
   const q = search.value.trim().toLowerCase();
-  main.textContent = '';
-  const matches = DATA.filter(ev => {
+  // Every term must appear somewhere, so "queer friday" narrows instead of
+  // matching either word.
+  const terms = q ? q.split(/\s+/) : [];
+  return DATA.filter(ev => {
     if (activeSource && ev.platform !== activeSource) return false;
-    if (!q) return true;
-    return (ev.title + ' ' + ev.location + ' ' + ev.details + ' ' + ev.source)
-      .toLowerCase().includes(q);
+    if (!terms.length) return true;
+    const hay = (ev.title + ' ' + ev.location + ' ' + ev.details + ' ' +
+                 ev.source + ' ' + ev.date).toLowerCase();
+    return terms.every(t => hay.includes(t));
   });
+}
+
+function render() {
+  main.textContent = '';
+  const matches = matching().sort(SORTS[sortBy.value] || SORTS.date);
+  countEl.textContent = matches.length + ' of ' + DATA.length;
 
   if (!matches.length) {
     const p = document.createElement('p');
@@ -308,7 +353,10 @@ function render() {
     h.className = 'bucket';
     h.textContent = bucket + ' · ' + inBucket.length;
     main.appendChild(h);
-    for (const ev of inBucket) main.appendChild(card(ev));
+    const shelf = document.createElement('div');
+    shelf.className = 'shelf';
+    for (const ev of inBucket) shelf.appendChild(card(ev));
+    main.appendChild(shelf);
   }
 }
 
@@ -321,7 +369,22 @@ document.querySelectorAll('.chip').forEach(chip => {
     render();
   };
 });
+
+// Layout is a body class, so switching it costs a repaint rather than a
+// re-render — the cards themselves are identical in both modes.
+function setLayout(mode) {
+  document.body.classList.toggle('carousel', mode === 'carousel');
+  layoutBtn.textContent = mode === 'carousel' ? 'Carousel' : 'Grid';
+  layoutBtn.dataset.mode = mode;
+  try { localStorage.setItem('eh-layout', mode); } catch (e) { /* file:// */ }
+}
+layoutBtn.onclick = () => setLayout(layoutBtn.dataset.mode === 'carousel' ? 'grid' : 'carousel');
+let saved = 'grid';
+try { saved = localStorage.getItem('eh-layout') || 'grid'; } catch (e) { /* file:// */ }
+setLayout(saved);
+
 search.oninput = render;
+sortBy.onchange = render;
 render();
 """
 
@@ -386,6 +449,17 @@ def generate_html_report(
   <input id="q" type="search" placeholder="Search events" autocomplete="off"
          aria-label="Search events">
   <div class="chips">{chips}</div>
+  <div class="toolbar">
+    <label for="sort" class="meta">Sort</label>
+    <select id="sort" aria-label="Sort events">
+      <option value="date">Date</option>
+      <option value="priority">Priority</option>
+      <option value="title">Title</option>
+    </select>
+    <button id="layout" type="button" data-mode="grid"
+            aria-label="Toggle grid or carousel layout">Grid</button>
+    <span class="count" id="count"></span>
+  </div>
 </div>
 <main id="list"></main>
 <footer>Generated by event-harvester. This file contains the event data —

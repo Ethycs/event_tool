@@ -95,6 +95,8 @@ pixi run event-harvester --cap discord=20,telegram=30 --cap total=100
 pixi run event-harvester --show-rejects        # per-stage reject counts + data/rejects.ini
 pixi run event-harvester --report              # events_report.html — one file,
                                                # mobile-friendly, no server, forwardable
+pixi run event-harvester site                  # serve it at http://127.0.0.1:8800
+                                               # and re-harvest every 24h
 ```
 
 Subcommands:

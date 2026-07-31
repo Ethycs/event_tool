@@ -274,6 +274,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_root_flags(web_login)
 
+    # ── site ──
+    p_site = sub.add_parser(
+        "site",
+        help="Serve the events site and refresh it on a schedule",
+    )
+    p_site.add_argument("--host", default="127.0.0.1",
+                        help="Bind address (default: 127.0.0.1 — loopback only, "
+                             "because this server has no authentication)")
+    p_site.add_argument("--port", type=int, default=8800, help="Port (default: 8800)")
+    p_site.add_argument("--interval-hours", type=float, default=24.0, metavar="H",
+                        help="Hours between scheduled harvests (default: 24)")
+    p_site.add_argument("--no-schedule", action="store_true",
+                        help="Serve without the background refresh loop")
+    p_site.add_argument("--no-harvest-on-start", action="store_true",
+                        help="Serve the cached events; do not harvest at startup")
+    p_site.add_argument("--build-only", action="store_true",
+                        help="Build the page and exit without serving")
+    _add_root_flags(p_site)
+
     # ── recruiters ──
     p_rec = sub.add_parser(
         "recruiters",
