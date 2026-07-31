@@ -18,7 +18,7 @@ Every folder is a prerequisite for the ones after it: theory grounds design, des
 | Folder | Purpose | Freeze policy |
 |---|---|---|
 | `000 - Doc Maintenance` | Drift / tree-health notes | Append-only; action or explicitly defer |
-| `00 - Theory` | The scoring, gating, and identity model | Stable; corrections only |
+| `00 - Theory` | The scoring/gating/identity model, and the navigation model | Stable; corrections only. A `DRAFT` here is an argument, not a plan — see the freeze note below |
 | `01 - Design` | Why the system is shaped this way | Archive when superseded |
 | `02 - Implementation` | Setup, credentials, deploy, dev loop | Versioned with the code |
 | `03 - Architecture` | The as-built system map — one doc per subsystem | Keep current; single trusted map |
@@ -40,6 +40,7 @@ Every folder is a prerequisite for the ones after it: theory grounds design, des
 | changing a data shape | `05 - Standards/` — the record schemas are the contract |
 | picking up work cold | the newest file in `07 - Status Reports/`, then `06 - Roadmaps/` |
 | debugging the web path | `03 - Architecture/03 - Sources — Web.md`, `04 - Observability.md`, `08 - Analysis/00 - Browser Configuration Attempt Log.md` |
+| changing how sites are navigated | `00 - Theory/01 - Site Navigation as a Planning Problem.md` + `05 - Standards/EH-STD-WEBSRC-v0 §3.2a` |
 
 ## Adding a doc
 

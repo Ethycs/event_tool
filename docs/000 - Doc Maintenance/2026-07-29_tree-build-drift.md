@@ -106,7 +106,7 @@ Appended, not rewritten, per the cadence rule above.
 
 | Gap | State | Note |
 |---|---|---|
-| 4 — `01 - Design` / `00 - Theory` thin | 🔲 Still open | No decision yet on whether docstrings are the design lane. `pipeline/orchestrator.py`'s header and the new `ExtractionResult` docstring are both design documents living in code |
+| 4 — `01 - Design` / `00 - Theory` thin | 🟡 **Half addressed** | `00 - Theory` went 1 → 2 docs: `01 - Site Navigation as a Planning Problem.md` (GOAP/POMDP over the route engine). It is filed as `DRAFT` deliberately — nothing in it is implemented, and a theory folder whose freeze policy is "stable, corrections only" must not imply that an argument is an as-built description. `01 - Design` is unchanged, and the docstring-as-design-lane question is still undecided: `pipeline/orchestrator.py`'s header and the `ExtractionResult` docstring remain design documents living in code |
 | 5 — `05 - Standards` derived, not ratified | 🟡 **Progress, not closed** | Two §4 non-conformances were resolved *in favour of the spec* rather than amended away: `BUG-MSG-1` (feed mode's `platform` tag) and `BUG-WEBSRC-1` (the `no-web` profile). That is two decisions made out of the set; the folder is still Normative-in-name until the rest are ruled on |
 | 6 — transcript only partly decomposed | 🔲 Still open | Nobody has read the remaining ~2,900 turns |
 
