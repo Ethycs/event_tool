@@ -201,6 +201,14 @@ a.btn, button.btn {
 }
 a.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 .empty { color: var(--muted); padding: 40px 0; text-align: center; }
+#toast {
+  position: fixed; left: 50%; bottom: 20px; transform: translate(-50%, 80px);
+  background: var(--accent); color: #fff; padding: 10px 16px; border-radius: 999px;
+  font-size: 14px; opacity: 0; pointer-events: none; transition: transform .25s, opacity .25s;
+  max-width: 90vw; text-align: center;
+}
+#toast.show { transform: translate(-50%, 0); opacity: 1; }
+@media (prefers-reduced-motion: reduce) { #toast { transition: none; } }
 footer { color: var(--muted); font-size: 12px; padding: 24px 16px; text-align: center; }
 """
 
@@ -386,6 +394,66 @@ setLayout(saved);
 search.oninput = render;
 sortBy.onchange = render;
 render();
+
+// ── Live update ────────────────────────────────────────────────────
+// Only when served. The identical file opened from disk has no server to ask,
+// and polling from file:// would fail on CORS and log an error every minute
+// for no reason — the page has to stay useful as an email attachment.
+const LIVE = location.protocol === 'http:' || location.protocol === 'https:';
+const POLL_MS = 60000;
+let lastStamp = null;
+
+function toast(message) {
+  let el = document.getElementById('toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'toast';
+    document.body.appendChild(el);
+  }
+  el.textContent = message;
+  el.classList.add('show');
+  setTimeout(() => el.classList.remove('show'), 4000);
+}
+
+async function poll() {
+  try {
+    const res = await fetch('healthz', {cache: 'no-store'});
+    if (!res.ok) return;
+    const health = await res.json();
+    const stamp = health.last_refresh_epoch;
+    if (!stamp) return;
+    if (lastStamp === null) { lastStamp = stamp; return; }
+    if (stamp === lastStamp) return;
+
+    const fresh = await fetch('events.json', {cache: 'no-store'});
+    if (!fresh.ok) return;
+    const events = await fresh.json();
+    lastStamp = stamp;
+
+    // Replace in place and re-render rather than reloading the page: a reload
+    // would throw away the search term, the active filter and the scroll
+    // position, which is exactly the state someone browsing has built up.
+    DATA.length = 0;
+    for (const ev of events) DATA.push(ev);
+    render();
+
+    const meta = document.getElementById('generated');
+    if (meta) meta.textContent = new Date(stamp * 1000).toLocaleString();
+    toast(events.length + ' event(s) — just updated');
+  } catch (e) {
+    // Offline, server restarting, or mid-deploy. Try again next tick.
+  }
+}
+
+if (LIVE) {
+  poll();
+  setInterval(poll, POLL_MS);
+  // Catch up immediately when a phone comes back from sleep, rather than
+  // waiting out the rest of the interval.
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) poll();
+  });
+}
 """
 
 
@@ -442,7 +510,8 @@ def generate_html_report(
 <body>
 <header>
   <h1>{title}</h1>
-  <div class="meta">{len(prepared)} event(s) · generated {generated}</div>
+  <div class="meta">{len(prepared)} event(s) · generated
+    <span id="generated">{generated}</span></div>
   <div class="meta">{summary} · {total_messages} message(s) scanned</div>
 </header>
 <div class="controls">

@@ -226,6 +226,60 @@ class TestTheEntryPointActuallyStarts:
         assert site_mod.SITE_HTML.exists()
 
 
+class TestReloadMode:
+    """`--reload` is a dev affordance and must not become a harvest loop."""
+
+    def test_the_factory_defaults_to_not_harvesting(self, monkeypatch):
+        """A save every few seconds would otherwise start a harvest each time."""
+        for var in ("EH_SITE_HARVEST_ON_START", "EH_SITE_SCHEDULE"):
+            monkeypatch.delenv(var, raising=False)
+        seen = {}
+
+        def fake_build(cfg, **kwargs):
+            seen.update(kwargs)
+            return object()
+
+        with patch.object(site_mod, "build_app", side_effect=fake_build), \
+             patch("event_harvester.config.load_config", return_value=object()):
+            site_mod.make_app()
+        assert seen["harvest_on_start"] is False
+        assert seen["schedule"] is False
+
+    def test_the_factory_honours_the_environment(self, monkeypatch):
+        monkeypatch.setenv("EH_SITE_HARVEST_ON_START", "1")
+        monkeypatch.setenv("EH_SITE_SCHEDULE", "yes")
+        monkeypatch.setenv("EH_SITE_INTERVAL_HOURS", "3")
+        seen = {}
+
+        with patch.object(site_mod, "build_app",
+                          side_effect=lambda cfg, **kw: seen.update(kw) or object()), \
+             patch("event_harvester.config.load_config", return_value=object()):
+            site_mod.make_app()
+        assert seen["harvest_on_start"] is True
+        assert seen["schedule"] is True
+        assert seen["interval_hours"] == 3.0
+
+    def test_reload_shells_out_to_uvicorn_with_the_factory(self):
+        """uvicorn reloads by supervising children, which cannot be driven
+        from inside the CLI's already-running loop."""
+        captured = {}
+
+        def fake_call(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["env"] = kwargs.get("env", {})
+            return 0
+
+        with patch("subprocess.call", side_effect=fake_call):
+            assert site_mod.run_site_reload(port=9001) == 0
+
+        cmd = captured["cmd"]
+        assert "uvicorn" in cmd
+        assert "event_harvester.servers.site:make_app" in cmd
+        assert "--factory" in cmd and "--reload" in cmd
+        assert cmd[cmd.index("--port") + 1] == "9001"
+        assert captured["env"]["EH_SITE_HARVEST_ON_START"] == "0"
+
+
 class TestScheduling:
     def test_the_interval_has_a_floor(self):
         """A typo'd tiny interval would otherwise harvest in a hot loop."""

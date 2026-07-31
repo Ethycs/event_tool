@@ -68,6 +68,29 @@ class TestSelfContained:
         assert 'rel="noopener noreferrer"' in report or "noopener" in report
 
 
+class TestLiveUpdate:
+    """The page refreshes itself when served, and stays inert as a file."""
+
+    def test_polling_is_gated_on_being_served(self, report):
+        """file:// has no server; polling there fails CORS and logs forever."""
+        assert "location.protocol === 'http:'" in report
+        assert "if (LIVE)" in report
+
+    def test_it_re_renders_rather_than_reloading(self, report):
+        """A reload throws away the search term, filter and scroll position."""
+        assert "location.reload" not in report
+        assert "DATA.length = 0" in report
+
+    def test_it_catches_up_when_a_phone_wakes(self, report):
+        assert "visibilitychange" in report
+
+    def test_it_asks_for_the_relative_endpoints(self, report):
+        """So the page works behind a path prefix or a tunnel."""
+        assert "fetch('healthz'" in report
+        assert "fetch('events.json'" in report
+        assert "fetch('/healthz'" not in report
+
+
 class TestUntrustedContent:
     """Event text is scraped from arbitrary websites."""
 

@@ -127,6 +127,8 @@ Entry point: `commands/site.py:site_cmd` → `servers/site.py`. Serves the event
 | `--no-schedule` | off | Serve without the background refresh loop |
 | `--no-harvest-on-start` | off | Serve the cached events; do not harvest at startup |
 | `--build-only` | off | Build `data/.site/index.html` and exit without serving |
+| `--reload` | off | **Dev.** Restart on source changes. Serves cached events and **does not harvest per restart** — a save every few seconds would otherwise open browsers and spend tokens every few seconds |
+| `--harvest-on-reload` | off | With `--reload`, allow harvesting/scheduling anyway |
 
 | Route | Purpose |
 |---|---|
@@ -136,6 +138,8 @@ Entry point: `commands/site.py:site_cmd` → `servers/site.py`. Serves the event
 | `POST /refresh` | Manual rebuild. **POST-only** so a link preview or crawler cannot trigger a harvest. `?harvest=0` rebuilds from cache |
 
 **Startup order matters**: it builds from the cached events *first* so the URL answers immediately, then harvests in the background. A cold start that waited for a full harvest would serve `503` for minutes.
+
+**The page updates itself.** When served over http(s) it polls `/healthz` every 60s (and on `visibilitychange`, so a phone catches up on wake). If the build stamp moved it fetches `/events.json` and **re-renders in place** rather than reloading — a reload would throw away the search term, the active filter and the scroll position, which is exactly the state someone browsing has built up. Verified: with `night` typed in the search box, a rebuild took the counter from `1 of 2` to `1 of 3` without the box or the filtered view changing. Polling is gated on `location.protocol` being http(s), so the identical file opened from disk stays inert instead of failing CORS once a minute.
 
 A failed harvest never takes the site down — the last good page keeps being served and the error surfaces on `/healthz`. Refreshes are serialised by a lock, because a harvest opens browsers and calls an LLM and two at once would double the cost.
 

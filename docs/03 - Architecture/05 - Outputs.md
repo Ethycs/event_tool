@@ -72,6 +72,9 @@ Built on Starlette + uvicorn, which `mcp`/`fastmcp` already pull in — **no new
 | `POST`-only `/refresh` | A link preview or crawler must not be able to trigger a harvest |
 | Loopback by default | **No authentication.** These are personal events; `--host 0.0.0.0` needs a proxy with auth in front |
 | Sleep floored at 60s | `--interval-hours 0.0001` would otherwise harvest in a hot loop |
+| The page **re-renders**, it does not reload | A reload discards the search term, active filter and scroll position — the state a browsing session has built up |
+| Live polling gated on `location.protocol` | The same file opened from disk has no server; polling from `file://` fails CORS and would log an error a minute, forever |
+| `--reload` does **not** harvest per restart | A file save every few seconds would otherwise open browsers and spend tokens every few seconds. It shells out to `python -m uvicorn --factory --reload`, because uvicorn reloads by supervising child processes and cannot be driven from inside the CLI's loop |
 
 `n × m` layout: the grid is `repeat(auto-fill, minmax(270px, 1fr))`, so *n* comes from the viewport and *m* from how many events are in that date bucket — one column on a phone, four on a desktop, from the same file with no media-query ladder. The Grid/Carousel toggle switches a single body class, so the cards are identical in both modes and switching costs a repaint rather than a re-render. Measured: 1 column at 390px, 4 at 1440px, zero horizontal overflow at both.
 

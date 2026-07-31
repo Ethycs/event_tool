@@ -11,7 +11,13 @@ tracer = get_tracer("event_harvester.cli.commands.site")
 
 async def site_cmd(args, cfg) -> int:
     """Build the events site, then serve it unless --build-only."""
-    from event_harvester.servers.site import SITE_HTML, SiteState, refresh, run_site
+    from event_harvester.servers.site import (
+        SITE_HTML,
+        SiteState,
+        refresh,
+        run_site,
+        run_site_reload,
+    )
 
     with tracer.start_as_current_span("cli.site") as span:
         span.set_attribute("site.host", args.host)
@@ -34,6 +40,19 @@ async def site_cmd(args, cfg) -> int:
             print(f"  {YELLOW}No authentication — do not expose this without a "
                   f"proxy in front.{RESET}")
         print()
+
+        if getattr(args, "reload", False):
+            # Dev affordance: restarts on source change, and does *not* harvest
+            # per restart unless asked — a save every few seconds would
+            # otherwise open browsers and spend tokens every few seconds.
+            print(f"  {DIM}reload: watching src/ · serving cached events{RESET}\n")
+            return run_site_reload(
+                host=args.host,
+                port=args.port,
+                interval_hours=args.interval_hours,
+                harvest_on_start=not args.no_harvest_on_start and args.harvest_on_reload,
+                schedule=not args.no_schedule and args.harvest_on_reload,
+            )
 
         return await run_site(
             cfg,

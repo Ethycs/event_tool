@@ -291,6 +291,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Serve the cached events; do not harvest at startup")
     p_site.add_argument("--build-only", action="store_true",
                         help="Build the page and exit without serving")
+    p_site.add_argument("--reload", action="store_true",
+                        help="Dev: restart on source changes (uvicorn --reload). "
+                             "Serves cached events and does not harvest per restart")
+    p_site.add_argument("--harvest-on-reload", action="store_true",
+                        help="With --reload, allow harvesting and scheduling anyway "
+                             "(every file save will start a harvest)")
     _add_root_flags(p_site)
 
     # ── service ──

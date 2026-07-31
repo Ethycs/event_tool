@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -34,7 +35,7 @@ from typing import Any
 
 from event_harvester.observability.metrics import count, record
 from event_harvester.observability.tracing import get_tracer, set_span_attrs, traced
-from event_harvester.utils import data_path
+from event_harvester.utils import REPO_ROOT, data_path
 
 logger = logging.getLogger("event_harvester.site")
 _TRACER = "event_harvester.servers.site"
@@ -249,6 +250,64 @@ def build_app(cfg, *, interval_hours: float = DEFAULT_INTERVAL_HOURS,
     )
     app.state.site = state
     return app
+
+
+def make_app():
+    """App factory for `uvicorn --factory`, used by `--reload`.
+
+    uvicorn's reloader restarts the process on every file change, so it needs
+    an import string rather than an app object. Config comes through the
+    environment because the reloaded child does not inherit our arguments.
+
+    **Harvesting and scheduling default to off here.** With `--reload` a saved
+    file restarts the server, and a harvest per keystroke-save would open
+    browsers and spend tokens every few seconds. Reload mode serves the cached
+    events; set `EH_SITE_HARVEST_ON_START=1` if you really mean it.
+    """
+    from event_harvester.config import load_config
+
+    def _flag(name: str) -> bool:
+        return os.environ.get(name, "").lower() in ("1", "true", "yes")
+
+    return build_app(
+        load_config(),
+        interval_hours=float(os.environ.get("EH_SITE_INTERVAL_HOURS", DEFAULT_INTERVAL_HOURS)),
+        harvest_on_start=_flag("EH_SITE_HARVEST_ON_START"),
+        schedule=_flag("EH_SITE_SCHEDULE"),
+    )
+
+
+def run_site_reload(*, host: str = "127.0.0.1", port: int = 8800,
+                    interval_hours: float = DEFAULT_INTERVAL_HOURS,
+                    harvest_on_start: bool = False, schedule: bool = False) -> int:
+    """Serve with uvicorn's auto-reloader, in a subprocess.
+
+    A subprocess rather than in-process because uvicorn implements reload by
+    supervising *child* processes, which cannot be driven from inside the CLI's
+    already-running event loop. Handing the whole thing to `python -m uvicorn`
+    keeps the real reloader and sidesteps the loop entirely.
+    """
+    import subprocess
+    import sys
+
+    env = dict(os.environ)
+    env["EH_SITE_INTERVAL_HOURS"] = str(interval_hours)
+    env["EH_SITE_HARVEST_ON_START"] = "1" if harvest_on_start else "0"
+    env["EH_SITE_SCHEDULE"] = "1" if schedule else "0"
+
+    cmd = [
+        sys.executable, "-m", "uvicorn",
+        "event_harvester.servers.site:make_app", "--factory",
+        "--reload",
+        "--reload-dir", str(REPO_ROOT / "src"),
+        "--host", host, "--port", str(port),
+        "--log-level", "warning",
+    ]
+    logger.info("site: reload mode — http://%s:%d", host, port)
+    try:
+        return subprocess.call(cmd, env=env, cwd=str(REPO_ROOT))
+    except KeyboardInterrupt:
+        return 130
 
 
 async def run_site(cfg, *, host: str = "127.0.0.1", port: int = 8800,
