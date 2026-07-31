@@ -286,13 +286,57 @@ _JS_DIR = Path(__file__).resolve().parent.parent.parent.parent / "ext" / "helper
 _EVENT_LINKS_JS = (_JS_DIR / "extract_event_links.js").read_text(encoding="utf-8")
 
 
+#: The five extraction strategies, ordered most to least trustworthy. The order
+#: is the point: `js-embedded` reads the date and id out of the href itself,
+#: while `near-date-fallback` may accept a link whose only qualification is that
+#: a date appeared within five ancestors. Merging their output into one flat
+#: list without saying which fired is what made a promo carousel
+#: indistinguishable from a search result downstream.
+LINK_STRATEGIES: tuple[str, ...] = (
+    "js-embedded",
+    "dated-card",
+    "dated-card-image",
+    "repeated-child",
+    "near-date-fallback",
+)
+
+
+def region_key(link: dict) -> str:
+    """Canonical key for the page region a link came from. ``""`` if unknown.
+
+    Canonical *at mint time*, deliberately — the alternative is clustering
+    regions after the fact, which inherits the order-dependence already recorded
+    against ``events_match`` (roadmap 2.6). For events that is a nuisance; for
+    regions it would merge a carousel with a results list and silently poison
+    everything learned from either.
+
+    Heading first, because class names on Meetup and Eventbrite are build-hashed
+    and change on every deploy — a key built from them rots silently and looks
+    exactly like a region that stopped producing.
+    """
+    region = link.get("region") or {}
+    heading = (region.get("heading") or "").strip().lower()
+    if heading:
+        return f"h:{heading[:60]}"
+    landmark = (region.get("landmark") or "").strip().lower()
+    path = (region.get("path") or "").strip().lower()
+    if landmark and path:
+        return f"l:{landmark}|{path[:80]}"
+    return f"p:{path[:80]}" if path else ""
+
+
 def _extract_event_links(page) -> list[dict]:
     """Extract event links by associating dates with links via DOM locality.
 
     The JavaScript logic lives in ext/helpers/extract_event_links.js for proper
     syntax highlighting and independent testability.
 
-    Returns list of {url, text, date_hint} — links co-located with dates.
+    Returns list of ``{url, text, date_hint, strategy, region}`` — links
+    co-located with dates. ``strategy`` names which of :data:`LINK_STRATEGIES`
+    produced the link; ``region`` locates it on the page (``heading``,
+    ``landmark``, ``depth``, ``path``). Both are provenance added 2026-07-30,
+    and both may be absent on links produced by older code paths — treat them as
+    optional and use :func:`region_key` rather than reading ``region`` directly.
     """
     raw = page.evaluate(_EVENT_LINKS_JS)
     return raw or []

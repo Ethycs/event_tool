@@ -9,7 +9,23 @@
  *   Step 4b: JavaScript links with embedded event data
  *   Step 5: Last resort — links near dates (walk up 5 ancestors)
  *
- * Returns: [{url, text, date_hint, time?, venue?, inline?}]
+ * Returns: [{url, text, date_hint, strategy, region, time?, venue?, inline?}]
+ *
+ * `strategy` and `region` are provenance, added 2026-07-30. Five strategies of
+ * very different reliability used to merge into one flat list that recorded
+ * neither which one fired nor where on the page the link came from — so
+ * downstream there was nothing to learn on, and a Meetup promo carousel was
+ * indistinguishable from a search result. It still is *structurally*: under
+ * `findCard` a carousel card is a repeated sibling with a date and a link,
+ * which is exactly what an event card is. The difference is which region of
+ * the page it sits in, and that is what `region` records.
+ *
+ * `region.heading` is the load-bearing field. Class names on Meetup and
+ * Eventbrite are build-hashed (`css-1x2y3z`) and change on every deploy, so a
+ * signature keyed on them rots silently and looks exactly like decay. The
+ * nearest preceding heading — "Search results", "Popular near you", "Browse by
+ * category" — is human-authored, stable across deploys, and is precisely the
+ * distinction being learned.
  */
 () => {
     const DATE_RE = /(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2}(?:st|nd|rd|th)?|\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*|\d{4}-\d{2}-\d{2}|(?:mon|tue|wed|thu|fri|sat|sun)(?:day)?(?:\s*,)?\s*(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2}/i;
@@ -31,6 +47,81 @@
                 hasTime: TIME_RE.test(text),
             });
         }
+    }
+
+    // ── Region signature ────────────────────────────────────────────
+    // Identifies *where on the page* a link came from, stably enough to be
+    // compared across page loads and across runs. Deliberately avoids class
+    // names: see the header note about build-hashed classes.
+    function regionOf(el) {
+        if (!el) return { heading: '', depth: 0, path: '', landmark: '' };
+
+        // Nearest *preceding* heading: previous siblings, then up a level and
+        // repeat. Never look inside `el` itself — an event card's own title is
+        // an <h3>, so searching the card returned the card's title as its
+        // "region" and every link landed in a region of one. Measured on
+        // eventbrite.com/d/ca--san-francisco: 27 links, 27 regions, no grouping.
+        let heading = '';
+        let cur = el;
+        outer:
+        while (cur && cur !== document.body) {
+            let sib = cur.previousElementSibling;
+            while (sib) {
+                // Skip peers. A previous sibling with the same tag is another
+                // card in the same list, and it contains its own <h3> title --
+                // so without this, card two adopts card one's title as its
+                // region and the whole list fragments one card at a time.
+                if (sib.tagName === cur.tagName) { sib = sib.previousElementSibling; continue; }
+
+                if (/^H[1-6]$/.test(sib.tagName) || sib.getAttribute('role') === 'heading') {
+                    heading = (sib.innerText || '').trim().substring(0, 60);
+                    if (heading) break outer;
+                }
+                // A heading that is a *direct* child of the sibling is a section
+                // label; one buried deeper belongs to something inside it.
+                const own = sib.querySelector && sib.querySelector(':scope > h1, :scope > h2, :scope > h3, :scope > h4, :scope > h5, :scope > h6');
+                if (own) {
+                    heading = (own.innerText || '').trim().substring(0, 60);
+                    if (heading) break outer;
+                }
+                sib = sib.previousElementSibling;
+            }
+            cur = cur.parentElement;
+        }
+
+        // Nearest semantic landmark, and a class-free structural path. Both are
+        // weaker than the heading but survive pages that have none.
+        const landmarkEl = el.closest('main, [role="main"], nav, header, footer, aside, section, article');
+        let landmark = '';
+        if (landmarkEl) {
+            landmark = (landmarkEl.getAttribute('role')
+                || landmarkEl.getAttribute('aria-label')
+                || landmarkEl.tagName.toLowerCase()).substring(0, 40);
+        }
+
+        const parts = [];
+        let node = el;
+        let depth = 0;
+        while (node && node !== document.body && depth < 6) {
+            const parent = node.parentElement;
+            let index = 0;
+            if (parent) {
+                for (const c of parent.children) {
+                    if (c === node) break;
+                    if (c.tagName === node.tagName) index++;
+                }
+            }
+            parts.unshift(node.tagName.toLowerCase() + (index ? ':' + index : ''));
+            node = parent;
+            depth++;
+        }
+
+        return {
+            heading: heading,
+            landmark: landmark,
+            depth: depth,
+            path: parts.join('>'),
+        };
     }
 
     // ── Step 2: For each date node, walk up to find its "card" ──────
@@ -92,6 +183,8 @@
                 url: bestLink.href,
                 text: bestLink.innerText.trim().substring(0, 200) || card.innerText.trim().substring(0, 200),
                 date_hint: dn.dateMatch,
+                strategy: 'dated-card',
+                region: regionOf(card),
             });
         } else if (bestLink && bestLen < 5) {
             // Image-wrapped link — use card text as the title
@@ -102,6 +195,8 @@
                     url: bestLink.href,
                     text: cardTitle.substring(0, 200),
                     date_hint: dn.dateMatch,
+                    strategy: 'dated-card-image',
+                    region: regionOf(card),
                 });
             }
         }
@@ -143,6 +238,11 @@
                         url: best.href,
                         text: best.innerText.trim().substring(0, 200),
                         date_hint: dateMatch ? dateMatch[0] : '',
+                        // Fires only when Steps 1-3 found fewer than 3 links, and
+                        // it takes the *largest repeated container* on the page —
+                        // which on a listing site is as likely to be nav as results.
+                        strategy: 'repeated-child',
+                        region: regionOf(item),
                     });
                 }
             }
@@ -207,6 +307,10 @@
                 date_hint: dateStr,
                 time: time,
                 venue: venue,
+                // The most reliable of the five: the date and id are read out of
+                // the href itself, not inferred from DOM proximity.
+                strategy: 'js-embedded',
+                region: regionOf(container || a),
                 // Keep time/venue as hints but always fetch detail pages for full descriptions
             });
         }
@@ -245,6 +349,11 @@
                 url: a.href,
                 text: text.substring(0, 200),
                 date_hint: dateMatch,
+                // Weakest of the five: accepts a link whose only qualification
+                // may be that a date appeared within five ancestors, or that the
+                // URL merely *looks* like a detail page.
+                strategy: 'near-date-fallback',
+                region: regionOf(a),
             });
         }
     }
