@@ -81,6 +81,15 @@ Not in the original as-built read. Found on 2026-07-30 by asking "is the Gmail c
 
 | 2.14 | **Presenting events somewhere you can actually read and forward them.** The Markdown report is a wall of text on a phone; the Flet UI is an application, not something you can send someone | 🟡 **Half done 2026-07-30.** `outputs/html_report.py` — one self-contained file, inline CSS/JS, no network, mobile-first, with client-side search/filter/date-bucketing and per-event *Add to calendar* (`data:` iCalendar), *Open*, *TickTick*. Now the `--report` default; Markdown deprecated with a `DeprecationWarning` (Obsidian is **not** deprecated — Markdown is native there). **Open:** hosting. There is no server that serves it, so "forward" today means sending the file. `ui/server.py` is still dead code (2.4) and is the obvious place if a hosted URL is wanted |
 
+## Tier 1c — TickTick API compliance (found 2026-07-30 by writing the object down)
+
+| # | Gap | Status |
+|---|---|---|
+| 1c.1 | **Priority was a scale where the API has an enum.** TickTick accepts `0\|1\|3\|5`; the LLM emits 0–5, and 2 and 4 were forwarded verbatim by the inline builder. **[V]** | ✅ Fixed 2026-07-30 — `coerce_priority`, rounding up. Pinned by a parametrised test over every pipeline value |
+| 1c.2 | **Every due date claimed UTC.** `strftime("%Y-%m-%dT%H:%M:%S+0000")` on a *naive* datetime parsed from a venue page: a 9pm SF show was sent as `21:00Z`, i.e. **2pm local — seven hours early, on every single sync**, and nothing in the pipeline would notice. Same root cause as the HTML report's bucket bug found the same day: local wall-clock dates treated as instants. **[V]** | ✅ Fixed 2026-07-30 — `format_api_datetime` attaches the real local offset |
+| 1c.3 | A dated event with no time was sent as a **timed** task at midnight rather than all-day; `startDate` and `timeZone` were never sent; `date` and `time` were parsed separately so `"9pm"` was discarded | ✅ Fixed 2026-07-30 — `isAllDay` inferred, both dates set, `timeZone` from the system zone |
+| 1c.4 | Verify against the live API | 🔲 **Open — needs credentials.** No TickTick credentials in this checkout, so no request has been made with the new object. The schema is from the published Open API v1 reference and the sync path is covered by fakes |
+
 ## Tier 3 — Feature backlog (unchanged from `TODO.md`)
 
 1. Tighter web targeting per source (per-site selectors, search-bar hints) — partial via UC, still mode-dependent.

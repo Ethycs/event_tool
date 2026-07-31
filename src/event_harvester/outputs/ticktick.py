@@ -7,6 +7,7 @@ from typing import Optional
 from event_harvester.config import TickTickConfig
 from event_harvester.observability.metrics import count
 from event_harvester.observability.tracing import fail_current_span, set_span_attrs, traced
+from event_harvester.outputs.ticktick_task import TickTickTask, local_tz_name
 from event_harvester.pipeline.analysis import PRIORITY_LABEL
 from event_harvester.pipeline.event_match import save_fingerprint
 from event_harvester.ui.display import BOLD, DIM, GREEN, RED, RESET
@@ -210,22 +211,26 @@ def create_ticktick_tasks(
             result["skipped"].append(title)
 
     # Handle creates
+    tz_name = local_tz_name()
     for event in to_create:
-        title = event.get("title", "Untitled")[:80]
-        notes = event.get("notes", "")
-        priority = event.get("priority", 0)
+        # One API-compliant object, built and validated in one place, instead of
+        # a dict assembled inline. See outputs/ticktick_task.py for the two
+        # things that were wrong: a priority scale where the API has an enum,
+        # and a naive local datetime stamped +0000.
+        task = TickTickTask.from_event(
+            event, project_id=project_id or tt.inbox_id, tz_name=tz_name,
+        )
+        title = task.title[:80]
+        notes = task.content or ""
+        prio_label = PRIORITY_LABEL.get(int(task.priority), "none")
 
-        # Build due date from event date field
-        due_date = None
-        if event.get("date"):
-            try:
-                from dateutil import parser as dateutil_parser
-                dt = dateutil_parser.parse(event["date"])
-                due_date = dt.strftime("%Y-%m-%dT%H:%M:%S+0000")
-            except (ValueError, OverflowError):
-                pass
-
-        prio_label = PRIORITY_LABEL.get(priority, "none")
+        problems = task.validate()
+        if problems:
+            # Refuse rather than let the API reject it later with less context.
+            result["failed"].append(title)
+            logger.warning("TickTick: %r is not API-compliant: %s", title, "; ".join(problems))
+            print(f"  {RED}x {title}: {problems[0]}{RESET}")
+            continue
 
         if dry_run:
             print(
@@ -236,13 +241,7 @@ def create_ticktick_tasks(
             continue
 
         try:
-            task_obj = tt.task.builder(
-                title=title,
-                projectId=project_id or tt.inbox_id,
-                content=notes,
-                priority=priority,
-                dueDate=due_date,
-            )
+            task_obj = tt.task.builder(**task.to_api())
             created_task = tt.task.create(task_obj)
             # status="approved", not the "auto" default. Creating a TickTick
             # task *is* the approval — but `find_acted_fingerprint` only

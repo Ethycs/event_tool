@@ -58,6 +58,27 @@ Four sinks turn harvested/validated events into something a human (or TickTick) 
 
 ---
 
+## 1a. `outputs/ticktick_task.py` — the API object · **added 2026-07-30**
+
+A typed, validated TickTick **Open API v1** task. Until now the payload was assembled inline in `create_ticktick_tasks` and handed to `ticktick-py`'s `task.builder(**kwargs)`, so what reached the API was whatever the pipeline happened to hold. Two things were wrong against the published schema, and **both were silent**:
+
+| Defect | Effect |
+|---|---|
+| `priority` forwarded verbatim | The API accepts `0 \| 1 \| 3 \| 5`. The LLM emits 0–5, so **2 and 4 were sent as-is**. `coerce_priority` now rounds *up* — under-prioritising a real event costs more than the reverse |
+| `dt.strftime("...%S+0000")` on a **naive** datetime | Every due date claimed UTC. A 9pm San Francisco show became `21:00Z` — **2pm local, seven hours early, on every sync**. `format_api_datetime` attaches the real local offset instead |
+
+Also newly correct: `isAllDay` is inferred (a dated event with no time was previously a *timed* task at midnight), `startDate` is set alongside `dueDate`, `timeZone` is populated from the system zone when it can be determined, and `date` + `time` are parsed **together** so `"2026-07-30"` + `"9pm"` becomes 21:00 rather than midnight.
+
+| Piece | Purpose |
+|---|---|
+| `Priority` / `TaskStatus` / `ItemStatus` | `IntEnum`s. `TaskStatus.COMPLETED == 2` but `ItemStatus.COMPLETE == 1` — the two vocabularies differ and are easy to conflate |
+| `TickTickTask` | Field names are the **API's**, in the API's casing. This object is the wire contract; snake_case would put a translation layer between the schema and the thing that must match it |
+| `.validate()` | Returns problems as strings. `create_ticktick_tasks` refuses a non-compliant task *before* the API call, so the failure names the field rather than arriving as a 400 |
+| `.to_api()` / `.to_update_api()` | `POST /open/v1/task` and `POST /open/v1/task/{taskId}`. Unset fields are **omitted, not nulled** — an explicit null means "clear this" on update. The update body always carries `id` and `projectId`, without which it silently targets nothing |
+| `.from_event()` | The pipeline-event → task path |
+
+`unverified` — no request has been made against the live API with this object; there are no TickTick credentials in this checkout. The schema is taken from the published Open API v1 reference, and the sync path is covered by fakes in `tests/test_ticktick_task.py::TestIntegrationWithTheSyncPath`.
+
 ## 2. `outputs/ticktick.py` — TickTick OAuth + task sync
 
 **Domain:** the only sink that mutates external state. Authenticates against TickTick's (unofficial, reverse-engineered) API via the third-party `ticktick-py` package, deduplicates events against existing tasks, and creates/updates/skips TickTick tasks.
