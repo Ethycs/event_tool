@@ -209,5 +209,12 @@
     "mode": "raw",
     "category": "venues",
     "cooldown_hours": 6
+  },
+  {
+    "url": "https://www.thebitterendsf.com/calendar",
+    "name": "the-bitter-end",
+    "mode": "raw",
+    "category": "venues",
+    "cooldown_hours": 6
   }
 ]
