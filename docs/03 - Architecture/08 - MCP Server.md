@@ -1,8 +1,36 @@
 # MCP Server
 
-**Status:** CURRENT · **Date:** 2026-07-29 · **Applies to:** `src/event_harvester/servers/mcp_server.py`, `src/event_harvester/servers/__init__.py`, `src/event_harvester/cli/commands/mcp.py`, `gateway.py`, `scripts/mcp_probe.py`, `.mcp.json`, `ext/universal_controller/uc_browser/mcp/grok_tools.py`
+**Status:** CURRENT · **Date:** 2026-07-31 · **Applies to:** `src/event_harvester/servers/mcp_server.py`, `src/event_harvester/servers/gateway.py`, `src/event_harvester/servers/service.py`, `src/event_harvester/servers/__init__.py`, `src/event_harvester/cli/commands/mcp.py`, `gateway.py`, `scripts/mcp_probe.py`, `.mcp.json`, `ext/universal_controller/uc_browser/mcp/grok_tools.py`
 
-`event-harvester mcp` exposes the harvest/approve/decline workflow (and a set of browser-driven Grok chat tools) as a FastMCP server over stdio or streamable HTTP. Harvest results are cached to a JSON file on disk; `approve_event`/`decline_event` index into that same file by position, so the cache must not be regenerated between a `harvest_events` call and the approve/decline calls that follow it. A separate `gateway.py` at the repo root fronts this server (and any others) behind one proxied endpoint for editors that only want to register a single MCP URL.
+`event-harvester mcp` exposes the harvest/approve/decline workflow (and a set of browser-driven Grok chat tools) as a FastMCP server over stdio or streamable HTTP. Harvest results are cached to a JSON file on disk; `approve_event`/`decline_event` index into that same file by position, so the cache must not be regenerated between a `harvest_events` call and the approve/decline calls that follow it. `servers/gateway.py` fronts this server (and any others) behind one proxied endpoint — for editors that want to register a single MCP URL, and for remote clients, where "one URL" is not a convenience but the whole interface.
+
+## The two-process shape
+
+```
+        Claude / editor / any MCP client
+                    │  one URL
+                    ▼
+   ┌────────────────────────────────────┐
+   │ gateway  :9000/mcp   servers/gateway.py
+   │   • auth lives here (EH_GATEWAY_AUTH)
+   │   • refuses non-loopback bind when auth=none
+   └────────────────┬───────────────────┘
+                    │  streamable-http, loopback
+                    ▼
+   ┌────────────────────────────────────┐
+   │ mcp backend :8765/mcp   mcp_server.py
+   │   • the warm pipeline process
+   │   • no auth of its own
+   └────────────────────────────────────┘
+```
+
+Two processes rather than one because the economics differ. The backend holds a warm `Pipeline`, the classifier and the reranker, and is expensive to start; the gateway is cheap, stateless, and is the piece that changes when exposure changes. Splitting them means the auth/exposure decision never restarts the expensive process.
+
+**The backend has no authentication of its own.** That is deliberate *given* it binds loopback — but it means the backend's bind address is a security control, not a preference. `--host 0.0.0.0` on the backend puts every tool on every interface with nothing in front of it, bypassing the gateway entirely. `known rough edge`: nothing in the code enforces this; only the gateway refuses to expose itself unauthenticated.
+
+`verified 2026-07-31` — with a single backend, FastMCP 3.4.5 proxies tool names through **unprefixed** (`harvest_events`, not `event-harvester_harvest_events`). Adding a second backend without re-checking is where a name collision would surface.
+
+Both run as Windows services; see `servers/service.py` and `docs/04 - Reference/CLI Command Reference.md`. `EventHarvesterGateway` declares `DependOnService EventHarvesterMCP`.
 
 ## Domain
 
@@ -20,7 +48,8 @@ The Grok registration is wrapped in `try/except Exception` (`mcp_server.py:517-5
 - **stdio** (default): `pixi run event-harvester mcp`. Spawned per-client as a subprocess (this is what `.mcp.json` and `scripts/mcp_probe.py` use). No network exposure; lifetime = the client session.
 - **streamable-http**: `pixi run event-harvester mcp --transport streamable-http --port 8765` (or any `--host`/`--port`/`--path`). Runs as a long-lived service; `json_response=True` and `stateless_http=True` are set on the `FastMCP(...)` constructor (`mcp_server.py:327-340`), so each HTTP call is independent — there is no MCP-level session state held across requests (the on-disk cache is what actually carries state, see below).
 - Transport is selected by `run_server_async(transport=...)` (`mcp_server.py:527-549`), which dispatches to `server.run_stdio_async()` or `server.run_streamable_http_async()`; any other value raises `ValueError`.
-- `--allow-any-host` (CLI flag, `cli/parser.py:351-359`) disables FastMCP's DNS-rebinding `TransportSecuritySettings` check (`mcp_server.py:320-325`) — needed behind a reverse proxy/tunnel where the inbound `Host` header won't be loopback, otherwise FastMCP returns 421.
+- `--allow-any-host` (CLI flag) disables FastMCP's DNS-rebinding `TransportSecuritySettings` check (`mcp_server.py:320-325`) — needed behind a reverse proxy/tunnel where the inbound `Host` header won't be loopback, otherwise FastMCP returns 421. It disables a *check*, not an exposure: pairing it with `--host 0.0.0.0` is what actually opens the backend.
+- **gateway**: `pixi run gateway`, or `event-harvester service install --service gateway`. Configured entirely by environment (`EH_GATEWAY_*`, `GATEWAY_HOST/PORT`, `EH_MCP_URL`); reads `.env` with `override=False` so service-manager wiring wins over the file. Serves `/healthz` unauthenticated for liveness probes and `/mcp` behind whatever `EH_GATEWAY_AUTH` selects.
 
 ## Inputs
 

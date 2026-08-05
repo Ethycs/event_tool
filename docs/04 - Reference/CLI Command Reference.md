@@ -150,13 +150,33 @@ pixi run event-harvester site --interval-hours 6
 pixi run event-harvester site --no-harvest-on-start # serve the last harvest immediately
 ```
 
-## `service {install, uninstall, start, stop, restart, status, logs}` — **added 2026-07-30**
+## `service {install, uninstall, start, stop, restart, status, logs}` — **added 2026-07-30**, extended 2026-07-31
 
-Entry point: `commands/service.py` → `servers/service.py`. Runs `site` as a Windows service via **NSSM**, which supervises it as a plain console process — auto-start, restart-on-crash, log rotation — without the app needing to know it is a service.
+Entry point: `commands/service.py` → `servers/service.py`. Runs a long-lived process as a Windows service via **NSSM**, which supervises it as a plain console process — auto-start, restart-on-crash, log rotation — without the app needing to know it is a service.
 
-All subcommands take `--name` (default `EventHarvesterSite`). `install` also takes `--host`, `--port`, `--interval-hours`. `logs` takes `--lines`.
+### Three services
+
+`--service` selects which (default `site`, so the pre-2026-07-31 invocations are unchanged):
+
+| `--service` | Windows name | Port | Process | Exposed? |
+|---|---|---|---|---|
+| `site` | `EventHarvesterSite` | 8800 | `event-harvester site` | loopback |
+| `mcp` | `EventHarvesterMCP` | 8765 | `event-harvester mcp --transport streamable-http` | loopback — reached *through* the gateway |
+| `gateway` | `EventHarvesterGateway` | 9000 | `pixi run gateway` | **this is the one that faces outward** |
+
+`gateway` declares `DependOnService EventHarvesterMCP`, so the service manager starts them in order and a reboot does not race.
+
+`--all` acts on every service in dependency order — reversed for `stop` and `uninstall`, so a gateway is never left proxying a backend that is going away underneath it. `--all` with `--name` is refused: one name cannot rename three services.
+
+All subcommands take `--service` and `--name` (default: per service). `install` also takes `--host`, `--port` (defaults per service), `--interval-hours` (site), `--path` and `--allow-any-host` (mcp), `--backend-url` (gateway). `logs` takes `--lines` and has no `--all`.
 
 Install/uninstall/start/stop **require an elevated shell**; `status` and `logs` do not.
+
+### The gateway is the dispatch endpoint
+
+A Claude custom connector takes exactly **one URL**, so whatever is at that URL is the entire surface Claude gets. `install --service gateway` prints the exposure notice; the rules live in `servers/gateway.py` and the operator procedure in `docs/02 - Implementation/02 - Deploy Playbook.md` §5c.
+
+The one hard guard: **`run_gateway` refuses to bind a non-loopback address while `EH_GATEWAY_AUTH=none`**, exiting 2 rather than warning. Behind it sit `harvest_events`, `approve_event`, `chat` and the `grok_*` family — tools that spend LLM tokens, write to TickTick, and drive a logged-in browser session.
 
 ### The account is the thing that will bite you
 
@@ -180,18 +200,27 @@ nssm set EventHarvesterSite ObjectName "DOMAIN\you" "<your-password>"
 | `AppDirectory` | repo root | `.env`, `data/`, `token.json` and the source list all resolve from it |
 | `Start` | `SERVICE_AUTO_START` | |
 | `AppStopMethodConsole` | 15 s | Ctrl-C first, so uvicorn's lifespan runs and the refresh tasks are cancelled |
-| `AppStdout`/`AppStderr` | `data/.service/site.*.log` | Rotated online at 10 MB |
+| `AppStdout`/`AppStderr` | `data/.service/<service>.*.log` | One pair per service, rotated online at 10 MB |
 | `AppExit Default` | `Restart`, 30 s delay, 10 s throttle | A service crashing on a bad credential must not spin at full speed |
+| `AppEnvironmentExtra` | gateway only: `GATEWAY_HOST/PORT`, `EH_GATEWAY_PATH`, `EH_MCP_URL` | Non-secret wiring only — this lands in the registry in plaintext, so tokens and OAuth secrets go in `.env` |
+| `DependOnService` | gateway → `EventHarvesterMCP` | Start ordering across a reboot |
 
-**`install` does not start the service.** The first start runs a harvest — browsers, every configured source, LLM tokens — and that is a standing commitment that should begin when you say so.
+**`install` does not start the service.** The first start of `site` or `mcp` runs a harvest — browsers, every configured source, LLM tokens — and that is a standing commitment that should begin when you say so.
+
+The account warning is skipped for `gateway`: it is a pure proxy and reads no user-scoped credential of its own. `site` and `mcp` both need the account set.
 
 ```powershell
-pixi run event-harvester service install     # elevated
+pixi run event-harvester service install                      # elevated; site
 nssm set EventHarvesterSite ObjectName "$env:USERDOMAIN\$env:USERNAME" "<password>"
 pixi run event-harvester service start
 pixi run event-harvester service status
-pixi run event-harvester service logs --lines 60
+pixi run event-harvester service logs --lines 60 --service mcp
 pixi run event-harvester service uninstall
+
+# the dispatch pair, in dependency order
+pixi run event-harvester service install --service mcp
+pixi run event-harvester service install --service gateway
+pixi run event-harvester service start --all
 ```
 
 ## `recruiters {grade, reparse}`

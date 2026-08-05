@@ -74,6 +74,108 @@ class TestInstallCommands:
             svc.build_install_commands()
 
 
+class TestTheServiceRegistry:
+    """Three services, and the differences between them are the whole point."""
+
+    def test_every_service_in_the_order_has_a_spec(self):
+        assert set(svc.SERVICE_ORDER) == set(svc.SERVICES)
+
+    def test_the_backend_is_installed_before_the_gateway_that_depends_on_it(self):
+        order = list(svc.SERVICE_ORDER)
+        assert order.index("mcp") < order.index("gateway")
+
+    def test_an_unknown_service_is_refused_by_name(self):
+        with pytest.raises(svc.ServiceError, match="unknown service"):
+            svc.spec_for("dispatch")
+
+    def test_the_three_services_do_not_share_a_port(self):
+        ports = [s.default_port for s in svc.SERVICES.values()]
+        assert len(set(ports)) == len(ports)
+
+    def test_the_three_services_do_not_share_a_name(self):
+        names = [s.default_name for s in svc.SERVICES.values()]
+        assert len(set(names)) == len(names)
+
+    def test_the_mcp_service_runs_streamable_http(self):
+        """stdio is the default transport and would exit immediately as a service."""
+        args = svc.build_install_commands(service="mcp")[0]
+        assert args[4:7] == ["run", "event-harvester", "mcp"]
+        assert args[args.index("--transport") + 1] == "streamable-http"
+
+    def test_the_mcp_service_defaults_to_its_own_port(self):
+        args = svc.build_install_commands(service="mcp")[0]
+        assert args[args.index("--port") + 1] == "8765"
+
+    def test_allow_any_host_is_off_unless_asked_for(self):
+        assert "--allow-any-host" not in svc.build_install_commands(service="mcp")[0]
+        assert "--allow-any-host" in svc.build_install_commands(
+            service="mcp", allow_any_host=True)[0]
+
+    def test_the_gateway_runs_the_pixi_task(self):
+        args = svc.build_install_commands(service="gateway")[0]
+        assert args[4:] == ["run", "gateway"]
+
+    def test_the_gateway_is_configured_by_environment(self):
+        line = next(c for c in svc.build_install_commands(service="gateway")
+                    if "AppEnvironmentExtra" in c)
+        env = dict(pair.split("=", 1) for pair in line[5:])
+        assert env["GATEWAY_PORT"] == "9000"
+        assert env["EH_MCP_URL"] == "http://127.0.0.1:8765/mcp"
+
+    def test_the_gateway_backend_is_overridable(self):
+        line = next(c for c in svc.build_install_commands(
+            service="gateway", backend_url="http://127.0.0.1:7000/mcp")
+            if "AppEnvironmentExtra" in c)
+        assert "EH_MCP_URL=http://127.0.0.1:7000/mcp" in line
+
+    def test_no_secret_is_written_into_the_service_config(self):
+        """`AppEnvironmentExtra` lands in the registry in plaintext.
+
+        Tokens and OAuth client secrets belong in `.env`, which the process
+        reads from its working directory instead.
+        """
+        env = svc.build_service_env(
+            svc.spec_for("gateway"), host="127.0.0.1", port=9000)
+        assert not any(
+            k.endswith(("TOKEN", "SECRET", "PASSWORD", "KEY")) for k in env
+        ), env
+
+    def test_the_gateway_starts_after_the_backend(self):
+        line = next(c for c in svc.build_install_commands(service="gateway")
+                    if "DependOnService" in c)
+        assert line[-1] == svc.SERVICES["mcp"].default_name
+
+    def test_services_without_dependencies_do_not_declare_any(self):
+        for key in ("site", "mcp"):
+            cmds = svc.build_install_commands(service=key)
+            assert not any("DependOnService" in c for c in cmds), key
+
+    def test_each_service_logs_to_its_own_file(self, tmp_path):
+        stems = set()
+        for key in svc.SERVICE_ORDER:
+            line = next(c for c in svc.build_install_commands(service=key, log_dir=tmp_path)
+                        if "AppStdout" in c)
+            stems.add(Path(line[-1]).name)
+        assert len(stems) == 3, f"log files collide: {stems}"
+
+    def test_only_the_gateway_is_exempt_from_the_account_warning(self):
+        """It proxies; it reads no user-scoped credential of its own."""
+        assert svc.spec_for("gateway").needs_user_account is False
+        assert svc.spec_for("site").needs_user_account is True
+        assert svc.spec_for("mcp").needs_user_account is True
+
+    def test_an_explicit_name_overrides_the_default(self):
+        assert svc.service_name("mcp", "Custom") == "Custom"
+        assert svc.service_name("mcp") == "EventHarvesterMCP"
+
+    @pytest.mark.parametrize("key", ["site", "mcp", "gateway"])
+    def test_every_service_gets_the_shared_operational_wiring(self, key):
+        flat = _flat(svc.build_install_commands(service=key))
+        for setting in ("AppDirectory", "AppStdout", "AppStderr", "AppRotateFiles",
+                        "SERVICE_AUTO_START", "AppExit", "AppThrottle"):
+            assert any(setting in c for c in flat), f"{key} missing {setting}"
+
+
 class TestGuards:
     def test_install_requires_elevation(self):
         with patch.object(svc, "is_admin", return_value=False):
@@ -149,6 +251,74 @@ class TestAccountIsTheImportantPart:
             info = svc.status()
         assert info["installed"] is False
         assert "not found" in info["error"]
+
+
+class TestTheCliActuallyRoutes:
+    """Through the real parser and the real command, not a hand-built namespace.
+
+    A service command that parses fine and then acts on the wrong service is
+    the failure this catches — and the one an object-level test would miss.
+    """
+
+    @staticmethod
+    def _parse(argv):
+        from event_harvester.cli.parser import build_parser
+
+        return build_parser().parse_args(argv)
+
+    def test_the_default_service_is_still_the_site(self):
+        assert self._parse(["service", "status"]).service == "site"
+
+    def test_a_service_can_be_named(self):
+        assert self._parse(["service", "start", "--service", "gateway"]).service == "gateway"
+
+    def test_all_installs_backend_first(self):
+        from event_harvester.cli.commands import service as cmd
+
+        args = self._parse(["service", "install", "--all"])
+        assert cmd._targets(args, svc) == ["mcp", "gateway", "site"]
+
+    @pytest.mark.parametrize("action", ["stop", "uninstall"])
+    def test_a_dependent_is_taken_down_before_what_it_depends_on(self, action):
+        """Stopping the backend under a live gateway leaves it proxying nothing.
+
+        The assertion is the ordering relation, not a position: `site` has no
+        dependencies and may sit anywhere in the sequence.
+        """
+        from event_harvester.cli.commands import service as cmd
+
+        order = cmd._targets(self._parse(["service", action, "--all"]), svc)
+        assert order.index("gateway") < order.index("mcp")
+
+    def test_every_service_is_covered_by_all(self):
+        from event_harvester.cli.commands import service as cmd
+
+        order = cmd._targets(self._parse(["service", "install", "--all"]), svc)
+        assert sorted(order) == sorted(svc.SERVICES)
+
+    async def test_renaming_three_services_at_once_is_refused(self):
+        from event_harvester.cli.commands import service as cmd
+
+        args = self._parse(["service", "status", "--all", "--name", "OnlyOne"])
+        assert await cmd.service_cmd(args, None) == 1
+
+    async def test_the_command_acts_on_the_service_it_was_given(self):
+        from event_harvester.cli.commands import service as cmd
+
+        seen = []
+        args = self._parse(["service", "start", "--service", "gateway"])
+        with patch.object(svc, "control",
+                          side_effect=lambda a, service, name: seen.append((a, service))
+                          or {"name": "X", "service": service}):
+            assert await cmd.service_cmd(args, None) == 0
+        assert seen == [("start", "gateway")]
+
+    async def test_a_service_error_is_reported_not_raised(self):
+        from event_harvester.cli.commands import service as cmd
+
+        args = self._parse(["service", "start"])
+        with patch.object(svc, "control", side_effect=svc.ServiceError("nope")):
+            assert await cmd.service_cmd(args, None) == 1
 
 
 class TestErrorReporting:

@@ -268,11 +268,108 @@ sudo systemctl enable --now event-harvester event-harvester-gateway
 Use NSSM or Task Scheduler. Wrap the same command; supply the two
 `INFISICAL_UNIVERSAL_AUTH_*` vars via the service's environment:
 
+The harvester installs and configures its own services now — use it rather than
+hand-writing `nssm` lines, which is how the `AppDirectory`, log rotation and
+`DependOnService` wiring stays consistent:
+
 ```powershell
-nssm install event-harvester "pixi" "run event-harvester mcp --transport streamable-http --port 8765"
-nssm set     event-harvester AppDirectory "C:\event_tool"
-# Prefix with `infisical run -- ` by wrapping in a .cmd, or set env from infisical export.
+# elevated
+pixi run event-harvester service install --service mcp        # backend, 8765
+pixi run event-harvester service install --service gateway    # dispatch, 9000
+pixi run event-harvester service install                      # events site, 8800
+
+# the account matters for site + mcp; the gateway is a pure proxy and does not care
+nssm set EventHarvesterMCP  ObjectName "$env:USERDOMAIN\$env:USERNAME" "<password>"
+nssm set EventHarvesterSite ObjectName "$env:USERDOMAIN\$env:USERNAME" "<password>"
+
+pixi run event-harvester service start --all                  # dependency order
+pixi run event-harvester service status --service gateway
 ```
+
+To inject Infisical secrets, wrap the command in a `.cmd` that prefixes
+`infisical run -- `, or set the service environment from `infisical export`.
+
+---
+
+## 5c. Expose the gateway as a Claude custom connector
+
+A **custom connector** takes exactly one URL, and whatever answers at that URL
+is the entire surface Claude gets. That URL should be the **gateway** (9000),
+never the MCP backend directly — the gateway is where authentication lives.
+
+Three things have to be true, and they are independent:
+
+### (i) Reachable
+
+Claude connects *inbound* from Anthropic's IP ranges over public HTTPS
+([support article][conn]). A loopback bind is not reachable and neither is a
+LAN address behind NAT. Put a tunnel in front:
+
+```powershell
+winget install Cloudflare.cloudflared
+cloudflared tunnel --url http://127.0.0.1:9000     # quick, ephemeral hostname
+```
+
+For anything standing, use a named tunnel with your own hostname so the URL
+survives restarts. `ngrok` and Tailscale Funnel work the same way. A real
+reverse proxy with a certificate is equivalent — the tunnel is only convenient
+because it needs no inbound firewall hole.
+
+Because the tunnel presents a non-loopback `Host` header, the **backend**
+needs `--allow-any-host` if you ever front it directly; the gateway does not
+go through FastMCP's DNS-rebinding check.
+
+### (ii) Authenticated
+
+`EH_GATEWAY_AUTH` picks the mode. **`run_gateway` refuses to bind a
+non-loopback address while it is `none`** — it exits 2 rather than warning,
+because the tools behind it harvest, spend LLM tokens, write to TickTick and
+drive a logged-in browser session.
+
+| Mode | For | Works as a Claude connector? |
+|---|---|---|
+| `none` | loopback only | — |
+| `token` | your own clients over a tunnel | **No** — the connector flow is OAuth |
+| `jwt` | tokens you mint elsewhere (HMAC or JWKS) | **No** — same reason |
+| `github` / `google` / `auth0` / `workos` / … | FastMCP proxies OAuth to the provider | **Yes** |
+
+For a connector, register an OAuth app with the provider, set its callback to
+your tunnel hostname, then:
+
+```
+EH_GATEWAY_AUTH=github
+EH_GATEWAY_CLIENT_ID=Ov23li...
+EH_GATEWAY_CLIENT_SECRET=...
+EH_GATEWAY_PUBLIC_URL=https://events.example.com
+```
+
+Put those in `.env`, **not** in the service config — `AppEnvironmentExtra` is
+stored in the registry in plaintext. The gateway reads `.env` from its
+`AppDirectory` with `override=False`, so the service manager's non-secret
+wiring still wins.
+
+`EH_GATEWAY_PUBLIC_URL` must be the URL Claude actually reaches, because OAuth
+redirect URIs are minted from it. The bind address will not do.
+
+### (iii) Registered
+
+Claude → Settings → Connectors → *Add custom connector* → the tunnel URL plus
+`/mcp`. Custom connectors are available on Free, Pro, Max, Team and Enterprise;
+Free is limited to one.
+
+### Verify before you register
+
+```powershell
+curl.exe https://<tunnel-host>/healthz                       # 200, no auth needed
+curl.exe -X POST https://<tunnel-host>/mcp -H "accept: application/json, text/event-stream" `
+  -H "content-type: application/json" `
+  -d '{\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"id\":1,\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"1\"}}}'
+```
+
+The second must return **401** before you hand the URL to anything. A 200 there
+means the endpoint is open.
+
+[conn]: https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp
 
 ---
 

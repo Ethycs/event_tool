@@ -302,38 +302,101 @@ def build_parser() -> argparse.ArgumentParser:
     # ── service ──
     p_svc = sub.add_parser(
         "service",
-        help="Run the events site as a Windows service (NSSM)",
+        help="Run the site, the MCP backend, or the dispatch gateway as a "
+             "Windows service (NSSM)",
     )
     svc_sub = p_svc.add_subparsers(
         dest="service_command", required=True, metavar="SERVICE_COMMAND",
     )
 
-    def _svc_common(sp):
-        sp.add_argument("--name", default="EventHarvesterSite",
-                        help="Service name (default: EventHarvesterSite)")
+    def _svc_common(sp, *, allow_all: bool = True):
+        sp.add_argument(
+            "--service", default="site", choices=["site", "mcp", "gateway"],
+            help="Which service to act on (default: site). "
+                 "mcp = the MCP backend; gateway = the single dispatch endpoint",
+        )
+        if allow_all:
+            sp.add_argument(
+                "--all", action="store_true",
+                help="Act on every service, in dependency order "
+                     "(mcp, gateway, site; reversed for stop/uninstall)",
+            )
+        sp.add_argument("--name", default=None,
+                        help="Override the Windows service name (default: per service)")
         _add_root_flags(sp)
 
     svc_install = svc_sub.add_parser(
-        "install", help="Install the service (elevated). Does not start it",
+        "install", help="Install a service (elevated). Does not start it",
     )
     svc_install.add_argument("--host", default="127.0.0.1", help="Bind address")
-    svc_install.add_argument("--port", type=int, default=8800, help="Port")
+    svc_install.add_argument("--port", type=int, default=None,
+                             help="Port (default: 8800 site, 8765 mcp, 9000 gateway)")
     svc_install.add_argument("--interval-hours", type=float, default=24.0, metavar="H",
-                             help="Hours between scheduled harvests (default: 24)")
+                             help="site only: hours between scheduled harvests (default: 24)")
+    svc_install.add_argument("--path", default="/mcp",
+                             help="mcp/gateway only: HTTP path (default: /mcp)")
+    svc_install.add_argument("--allow-any-host", action="store_true",
+                             help="mcp only: disable the DNS-rebinding Host check")
+    svc_install.add_argument("--backend-url", default=None, metavar="URL",
+                             help="gateway only: the MCP backend to proxy "
+                                  "(default: http://127.0.0.1:8765/mcp)")
     _svc_common(svc_install)
 
     for action, blurb in (
-        ("uninstall", "Stop and remove the service (elevated)"),
-        ("start", "Start the service (elevated)"),
-        ("stop", "Stop the service (elevated)"),
-        ("restart", "Restart the service (elevated)"),
+        ("uninstall", "Stop and remove a service (elevated)"),
+        ("start", "Start a service (elevated)"),
+        ("stop", "Stop a service (elevated)"),
+        ("restart", "Restart a service (elevated)"),
         ("status", "Show state, account, and configuration"),
     ):
         _svc_common(svc_sub.add_parser(action, help=blurb))
 
-    svc_logs = svc_sub.add_parser("logs", help="Tail the service's stdout/stderr logs")
+    svc_logs = svc_sub.add_parser("logs", help="Tail a service's stdout/stderr logs")
     svc_logs.add_argument("--lines", type=int, default=40, help="Lines per stream")
-    _svc_common(svc_logs)
+    _svc_common(svc_logs, allow_all=False)
+
+    # ── jobs ──
+    p_jobs = sub.add_parser(
+        "jobs",
+        help="Inspect and control the harvest queue",
+    )
+    jobs_sub = p_jobs.add_subparsers(
+        dest="jobs_command", required=True, metavar="JOBS_COMMAND",
+    )
+
+    jobs_list = jobs_sub.add_parser("list", help="List jobs, newest first")
+    jobs_list.add_argument("--state", default=None,
+                           choices=["queued", "running", "done", "failed",
+                                    "cancelled", "interrupted"],
+                           help="Only jobs in this state")
+    jobs_list.add_argument("--limit", type=int, default=20, help="Max rows (default: 20)")
+    _add_root_flags(jobs_list)
+
+    jobs_show = jobs_sub.add_parser("show", help="Show one job in full")
+    jobs_show.add_argument("job_id")
+    jobs_show.add_argument("--lines", type=int, default=40, help="Log lines to show")
+    _add_root_flags(jobs_show)
+
+    jobs_cancel = jobs_sub.add_parser(
+        "cancel",
+        help="Cancel a job. Queued: immediate. Running: at the next stage boundary",
+    )
+    jobs_cancel.add_argument("job_id")
+    _add_root_flags(jobs_cancel)
+
+    jobs_submit = jobs_sub.add_parser(
+        "submit", help="Queue a harvest for the service to run",
+    )
+    _add_days_back(jobs_submit)
+    _add_platforms_filter(jobs_submit)
+    jobs_submit.add_argument("--web-source", default=None, metavar="NAME",
+                             help="Limit web harvesting to one configured source")
+    jobs_submit.add_argument("--no-cooldown", action="store_true",
+                             help="Ignore web-source cooldowns for this run")
+    _add_root_flags(jobs_submit)
+
+    jobs_prune = jobs_sub.add_parser("prune", help="Drop old finished jobs")
+    _add_root_flags(jobs_prune)
 
     # ── recruiters ──
     p_rec = sub.add_parser(
