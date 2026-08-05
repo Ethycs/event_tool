@@ -28,6 +28,7 @@ Every folder is a prerequisite for the ones after it: theory grounds design, des
 | `07 - Status Reports` | Dated session/agent handoffs | Archive when complete |
 | `08 - Analysis` | Measured deep-dives, attempt logs | Living |
 | `09 - Archived` | Superseded material and raw transcripts | Append-only; never edit |
+| `10 - Blueprints` | Repeatable operator procedures — *what do I do, in order, and where does it usually go wrong* | Living; each cites a real run |
 
 ## Where to start
 
@@ -41,6 +42,7 @@ Every folder is a prerequisite for the ones after it: theory grounds design, des
 | picking up work cold | the newest file in `07 - Status Reports/`, then `06 - Roadmaps/` |
 | debugging the web path | `03 - Architecture/03 - Sources — Web.md`, `04 - Observability.md`, `08 - Analysis/00 - Browser Configuration Attempt Log.md` |
 | changing how sites are navigated | `00 - Theory/01 - Site Navigation as a Planning Problem.md` + `05 - Standards/EH-STD-WEBSRC-v0 §3.2a` |
+| **adding a site someone asked for** | `10 - Blueprints/01 - Adding a Web Source.md` — the URL you are given is usually not the page with the events |
 
 ## Adding a doc
 

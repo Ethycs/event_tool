@@ -14,6 +14,7 @@ folder → kind of claim. The rules for writing docs are in
 | a data shape (message / event / web source) | `docs/05 - Standards/` — normative, frozen |
 | setup, credentials, deploy, dev loop | `docs/02 - Implementation/` |
 | open work | `docs/06 - Roadmaps/` |
+| a procedure you'll run more than once | `docs/10 - Blueprints/` |
 | what the last session did | newest file in `docs/07 - Status Reports/` |
 
 When you change code that a doc describes, reconcile the doc in the same pass. If you
