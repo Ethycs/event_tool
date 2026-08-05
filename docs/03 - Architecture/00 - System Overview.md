@@ -50,7 +50,7 @@ Five message sources fan out concurrently into one shared pipeline that filters,
 
  CROSS-CUTTING
    observability/  nav traces · screenshots · VLM quality · OTel spans
-   interlock.py    serializes the one browser-driven LLM session
+   interlock.py    RyzenAI NPU subprocess for local ONNX inference
    config.py       AppConfig ← CLI flags ← profile ← env ← defaults
 ```
 
@@ -79,7 +79,9 @@ The scoring model that stages 3–6 of the pipeline implement is derived in `doc
 | Source fan-out | `asyncio.gather(..., return_exceptions=True)` over ≤5 tasks | A failing source logs and yields `[]`; it never aborts the run (`pipeline/harvest.py:298`) |
 | Sync sources | `asyncio.to_thread` | Discord, Gmail, Signal, and the whole web path are blocking underneath |
 | Web fetch | `WebConfig.parallel` UCBrowser instances, default 3 | Native-chrome sources stay serial — Cloudflare safety |
-| LLM via browser | `interlock.py` + `_interlock_worker.py` subprocess | One browser-driven session at a time, cross-process |
+| Local LLM (NPU) | `interlock.py` + `_interlock_worker.py` subprocess | A `ryzenai-python` subprocess running ONNX/OGA inference; one long-lived `RyzenSession` per process, created lazily by `llm.py:35`. **Not** a browser lock — corrected 2026-07-31, this row previously read "one browser-driven session at a time, cross-process" |
+| Harvest execution | `jobs.py` + `job_runner.py` | **One runner, serial.** The MCP backend (streamable-http only) owns the queue; the site, the CLI and MCP tools all *submit*. The claim is an `os.rename` from `queued/` to `running/`, so it is a mutex even if a second runner ever appears. Added 2026-08-01 — see `01 - Design/03 - The Job Queue.md` |
+| Browser sessions | the job queue, indirectly | `known rough edge` — there is still **no lock** on browsers. Native Chrome takes a fixed `--remote-debugging-port=9222` (`uc_browser/browser.py:614`). The queue removes the case that actually happened (site and backend both harvesting), but a CLI `harvest` or a stdio MCP client runs in its own process and can still overlap. `data/.harvest.lock` is the recorded fix |
 | UI | Flet event loop + cooperative `checkpoint()` | Pause/stop take effect only at stage boundaries |
 
 Message order is deterministic regardless of completion order: results are re-assembled in the canonical source order `discord, telegram, gmail, signal, web` (`pipeline/harvest.py:311`).
@@ -106,7 +108,8 @@ Message order is deterministic regardless of completion order: results are re-as
 ## Verification
 
 ```powershell
-pixi run test                                   # 755 passed, 0 failed as of 2026-07-30 (end of day)
+pixi run test                                   # 906 passed, 0 failed as of 2026-08-01
+pixi run event-harvester jobs list              # the harvest queue: what ran, what waits
 pixi run event-harvester --days 1 --dry-run     # exercise the full pipeline, write nothing external
 pixi run event-harvester site --build-only      # write data/.site/index.html and stop
 ```

@@ -4,6 +4,14 @@ No harvest runs here: `_collect` is patched. The behaviours that matter are the
 ones a broken harvest would otherwise take down — the site must keep serving
 the last good page — and the concurrency guard, because a refresh opens
 browsers and calls an LLM.
+
+**Patching `_collect` is exactly how the site shipped for a day calling
+`Pipeline.run()` without its required `no_kwargs`, so every scheduled harvest
+raised `TypeError` while the page kept serving cached events and looked fine.**
+
+The site no longer calls the pipeline at all — it submits a job and the MCP
+backend's single runner executes it. The signature-conformance check moved
+with the call site, to `tests/test_job_feeds.py::TestTheExecutorCallIsValid`.
 """
 
 from __future__ import annotations
@@ -291,3 +299,49 @@ class TestScheduling:
 
         source = inspect.getsource(site_mod.build_app)
         assert "max(60.0" in source, "the sleep must be floored"
+
+
+class TestTheSiteDoesNotRunThePipeline:
+    """`_collect` used to call `Pipeline.run` directly. It no longer does.
+
+    The site submits a job; the MCP backend's single runner executes it. That
+    is what stops two services harvesting at once. The signature-conformance
+    check that used to live here moved with the call site — see
+    `tests/test_job_feeds.py::TestTheExecutorCallIsValid`.
+    """
+
+    @staticmethod
+    def _cfg():
+        from event_harvester.config import load_config
+
+        return load_config()
+
+    async def test_harvesting_submits_a_job_and_never_builds_a_pipeline(self, tmp_path):
+        from event_harvester import jobs
+
+        async def fake_wait(job_id, **kw):
+            claimed = jobs.claim_next(jobs_dir=tmp_path)
+            return jobs.finish(claimed, jobs.STATE_DONE, jobs_dir=tmp_path)
+
+        with (
+            patch.object(jobs, "JOBS_DIR", tmp_path),
+            patch("event_harvester.job_runner.wait_for", fake_wait),
+            patch("event_harvester.pipeline.Pipeline") as Pipeline,
+            patch.object(site_mod, "_read_cached_events", return_value=([], {}, 0)),
+        ):
+            await site_mod._collect(self._cfg(), harvest=True)
+
+        Pipeline.assert_not_called()
+
+    async def test_not_harvesting_queues_nothing(self, tmp_path):
+        from event_harvester import jobs
+
+        with (
+            patch.object(jobs, "JOBS_DIR", tmp_path),
+            patch.object(site_mod, "_read_cached_events",
+                         return_value=([{"title": "x"}], {}, 1)),
+        ):
+            events, _, _ = await site_mod._collect(self._cfg(), harvest=False)
+
+        assert events[0]["title"] == "x"
+        assert jobs.list_jobs(bucket=jobs.QUEUED, jobs_dir=tmp_path) == []

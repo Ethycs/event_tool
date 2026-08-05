@@ -120,19 +120,53 @@ async def refresh(state: SiteState, cfg, *, harvest: bool = True) -> dict[str, A
 
 
 async def _collect(cfg, *, harvest: bool) -> tuple[list[dict], dict[str, int], int]:
-    """Get events, either by running a harvest or from the MCP cache."""
-    if harvest:
-        from event_harvester.pipeline import Pipeline
+    """Get events, either by asking for a harvest or from the shared cache.
 
-        result = await Pipeline(cfg).run()
-        return (
-            list(result.events or []),
-            dict(result.source_counts or {}),
-            len(result.all_messages or []),
+    **The site does not run the pipeline.** It submits a job and waits, and
+    the MCP backend's single runner executes it. That is what stops the two
+    services harvesting simultaneously — not the queue itself, but the fact
+    that only one process owns execution.
+
+    Either way the events are read from the same cache file, so the served
+    page and the MCP tools cannot disagree about what the last harvest found.
+    """
+    if harvest:
+        await _submit_and_wait(cfg)
+    return _read_cached_events()
+
+
+async def _submit_and_wait(cfg) -> None:
+    """Queue a harvest and wait for it. Raises so `refresh` records the error."""
+    from event_harvester import jobs
+    from event_harvester.job_executor import build_request
+    from event_harvester.job_runner import wait_for
+
+    request = build_request(days=cfg.days_back)
+    job = jobs.submit(request, submitted_by="timer")
+    logger.info("site: queued harvest %s (coalesced=%d)", job.id, job.coalesced)
+
+    finished = await wait_for(job.id)
+    if finished is None:
+        raise RuntimeError(f"job {job.id} vanished from the queue")
+    if finished.state == jobs.STATE_QUEUED:
+        # Nothing drained it. Almost always: the MCP backend is not running.
+        raise RuntimeError(
+            f"job {job.id} was never picked up — is EventHarvesterMCP running? "
+            "The site does not harvest on its own by design."
+        )
+    if finished.state != jobs.STATE_DONE:
+        raise RuntimeError(
+            f"job {job.id} {finished.state}: "
+            f"{(finished.result or {}).get('error') or 'no detail'}"
         )
 
-    # Cache path: the same file the MCP tools read, so `--no-schedule` serves
-    # whatever the last harvest produced from any entry point.
+
+def _read_cached_events() -> tuple[list[dict], dict[str, int], int]:
+    """Read the shared event cache — the same file the MCP tools read.
+
+    One store, so the page and the tools cannot drift. (There were three of
+    these once; `data/.server_events.json` had been dead since March.)
+    """
     from event_harvester.servers.mcp_server import LATEST_EVENTS_FILE
     from event_harvester.utils import load_json
 
@@ -203,6 +237,14 @@ def build_app(cfg, *, interval_hours: float = DEFAULT_INTERVAL_HOURS,
     async def healthz(request):
         payload = state.snapshot()
         payload["interval_hours"] = interval_hours
+        # The site no longer runs harvests, so "is anything happening" is a
+        # question about the queue, not about this process.
+        try:
+            from event_harvester import jobs
+
+            payload["queue"] = jobs.queue_summary()
+        except Exception as e:  # noqa: BLE001 - health must never 500
+            payload["queue"] = {"error": f"{type(e).__name__}: {e}"}
         return JSONResponse(payload, status_code=200 if payload["ok"] else 503)
 
     async def refresh_now(request):

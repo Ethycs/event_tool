@@ -126,6 +126,87 @@ def _public_event(event: dict[str, Any], index: int) -> dict[str, Any]:
     }
 
 
+# ── the job runner ────────────────────────────────────────────────────────
+#
+# Exactly one runner should exist across the machine, and it lives here
+# because this is already the warm pipeline process. It is started only for
+# the **streamable-http** transport — the long-lived service. stdio is a
+# per-client subprocess, and giving each of those a runner would mean several
+# processes draining one queue, which is the concurrency this design exists
+# to prevent.
+
+_RUNNER: Any | None = None
+_RUNNER_TASK: Any | None = None
+
+
+def runner_active() -> bool:
+    """True when this process owns the queue and will drain it."""
+    return _RUNNER is not None
+
+
+async def start_job_runner() -> None:
+    """Start the single serial runner. Idempotent."""
+    global _RUNNER, _RUNNER_TASK
+    if _RUNNER is not None:
+        return
+    import asyncio
+
+    from event_harvester.job_executor import execute_harvest_job
+    from event_harvester.job_runner import JobRunner
+
+    _RUNNER = JobRunner(execute_harvest_job)
+    _RUNNER_TASK = asyncio.create_task(_RUNNER.run_forever())
+    logger.info("mcp: job runner started — this process owns the queue")
+
+
+async def stop_job_runner() -> None:
+    global _RUNNER, _RUNNER_TASK
+    if _RUNNER is None:
+        return
+    _RUNNER.stop()
+    if _RUNNER_TASK is not None:
+        try:
+            await _RUNNER_TASK
+        except Exception:  # pragma: no cover - shutdown best effort
+            logger.debug("mcp: job runner did not stop cleanly", exc_info=True)
+    _RUNNER, _RUNNER_TASK = None, None
+
+
+async def _queue_harvest(direct: dict[str, Any]) -> dict[str, Any]:
+    """Submit a harvest and wait, returning `run_event_pipeline`'s shape.
+
+    The events come back out of the cache the job just wrote, which is the
+    same file `list_latest_events` reads — so there is one writer and the
+    positional indexing `approve_event` relies on stays intact.
+    """
+    from event_harvester import jobs
+    from event_harvester.job_executor import build_request
+    from event_harvester.job_runner import wait_for
+
+    request = build_request(**{
+        k: v for k, v in direct.items() if k not in ("load_path", "save_path")
+    })
+    job = jobs.submit(request, submitted_by="mcp")
+    finished = await wait_for(job.id)
+
+    if finished is None or not finished.is_terminal:
+        return {"ok": False, "job_id": job.id, "state": "timeout", "events": [],
+                "error": "the job did not finish in time; poll job_status"}
+    if finished.state != jobs.STATE_DONE:
+        return {"ok": False, "job_id": job.id, "state": finished.state,
+                "events": [], "error": (finished.result or {}).get("error")}
+
+    cached = _load_latest_events()
+    events = cached.get("events") or []
+    return {
+        "ok": True,
+        "job_id": job.id,
+        "warnings": (finished.result or {}).get("warnings", []),
+        "stats": cached.get("stats", {}),
+        "events": events,
+    }
+
+
 def _load_latest_events() -> dict[str, Any]:
     data = load_json(LATEST_EVENTS_FILE, default={})
     if not isinstance(data, dict):
@@ -213,11 +294,17 @@ async def run_event_pipeline(
     skip_analysis: bool | None = None,
     no_cap: bool = False,
     total_cap: int | None = None,
+    reporter: Any | None = None,
 ) -> dict[str, Any]:
     """Run the harvest/filter/extract pipeline and cache the extracted events.
 
     Wraps the shared ``Pipeline`` class with MCP-specific concerns:
     on-disk caching, the include_known filter, and the public event shape.
+
+    ``reporter`` is the pipeline's progress protocol (`update_stage` / `log` /
+    `checkpoint`). The job runner passes its `ProgressSink`, which is how a
+    queued harvest reports stages and observes Stop. Left None everywhere
+    else, so nothing changes for existing callers.
     """
     cfg = load_config()
     if days is not None:
@@ -236,7 +323,7 @@ async def run_event_pipeline(
         cfg.caps.total = total_cap
 
     no_kwargs = _source_kwargs(cfg, only=only, skip=skip)
-    pipeline = Pipeline(cfg)
+    pipeline = Pipeline(cfg, reporter=reporter)
     warnings = pipeline.validate(no_kwargs=no_kwargs, need_ticktick=False)
 
     # When the caller scopes to specific sources via ``only``, bypass
@@ -400,20 +487,25 @@ def build_server(
             skip_analysis: Return harvested/actionable counts without LLM extraction.
             no_cap: Bypass per-source and total analysis caps.
             total_cap: Override the global analysis cap; -1 means unlimited.
+
+        When this process owns the job queue (the streamable-http service),
+        the request is **queued** and this call waits for it. The return shape
+        is unchanged — every existing client depends on it — but the call may
+        now wait behind other work, and the response carries a `job_id`.
+        Under stdio, or with `load_path`/`save_path` set, it runs directly.
         """
-        return await run_event_pipeline(
-            days=days,
-            only=only,
-            skip=skip,
-            include_known=include_known,
-            load_path=load_path,
-            save_path=save_path,
-            web_source=web_source,
-            no_cooldown=no_cooldown,
-            skip_analysis=skip_analysis,
-            no_cap=no_cap,
-            total_cap=total_cap,
+        direct = dict(
+            days=days, only=only, skip=skip, include_known=include_known,
+            load_path=load_path, save_path=save_path, web_source=web_source,
+            no_cooldown=no_cooldown, skip_analysis=skip_analysis,
+            no_cap=no_cap, total_cap=total_cap,
         )
+        # `load_path`/`save_path` are one-off debugging aids pointing at
+        # caller-local files; queueing them would run the file access in a
+        # different context from the caller. Keep them direct.
+        if not runner_active() or load_path or save_path:
+            return await run_event_pipeline(**direct)
+        return await _queue_harvest(direct)
 
     @server.tool()
     @traced("mcp.tool.list_latest_events", tracer_name=_TRACER)
@@ -768,9 +860,16 @@ async def run_server_async(
         allow_any_host=allow_any_host,
     )
     if transport == "stdio":
+        # No runner: stdio is a per-client subprocess, and one runner per
+        # client would be several processes draining one queue — the exact
+        # concurrency the serial design exists to prevent.
         await server.run_stdio_async()
     elif transport == "streamable-http":
-        await server.run_streamable_http_async()
+        await start_job_runner()
+        try:
+            await server.run_streamable_http_async()
+        finally:
+            await stop_job_runner()
     else:
         raise ValueError(f"Unsupported MCP transport: {transport}")
 
