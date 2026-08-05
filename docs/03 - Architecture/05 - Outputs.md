@@ -80,6 +80,17 @@ Built on Starlette + uvicorn, which `mcp`/`fastmcp` already pull in — **no new
 
 Search is AND across terms — "queer friday" narrows rather than matching either word — over title, location, details, source and date. Sort by date, priority or title.
 
+### Detail on the card · **changed 2026-07-31**
+
+Detail used to sit behind a `Details` button, hidden by default. Measured against live data it runs **50–146 characters**, so the button was concealing roughly one line — and part of that line was already on the card twice over, because the extractor emits `details` as `prose | location | url` while the card renders its own location row and its own Open button.
+
+Now the prose is rendered inline, with the duplicated segments stripped for display only (`detailText`); search still runs against the raw `ev.details`, so a URL stays findable. The text is clamped to **three lines** so one long detail cannot stretch its card past its neighbours in the grid, and a `More`/`Less` toggle appears **only when the clamp actually bit**.
+
+Two things that decide whether this works:
+
+- **Clipping can only be known after layout**, and it changes with card width. `syncDetailToggles` compares `scrollHeight` against `clientHeight` in a `requestAnimationFrame` after render, and re-runs on the Grid/Carousel switch and on a debounced resize. The `+1` absorbs sub-pixel rounding — without it you get a `More` button that expands to reveal nothing.
+- **`.btn` sets `display: inline-flex`, which beats the user-agent `[hidden]` rule**, so a hidden toggle would have rendered anyway. `a.btn[hidden], button.btn[hidden] { display: none }` puts it back. This is pinned by a test, because the failure is invisible in the common case where the button was going to show regardless.
+
 ## 1a. `outputs/ticktick_task.py` — the API object · **added 2026-07-30**
 
 A typed, validated TickTick **Open API v1** task. Until now the payload was assembled inline in `create_ticktick_tasks` and handed to `ticktick-py`'s `task.builder(**kwargs)`, so what reached the API was whatever the pipeline happened to hold. Two things were wrong against the published schema, and **both were silent**:

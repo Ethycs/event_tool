@@ -190,8 +190,19 @@ body.carousel .shelf .card {
 .when { color: var(--accent); font-weight: 600; font-size: 14px; }
 .where, .src { color: var(--muted); font-size: 13px; }
 .src { margin-top: 6px; }
-.details { margin: 10px 0 0; color: var(--fg); font-size: 14px; white-space: pre-wrap; }
-.details[hidden] { display: none; }
+/* Detail is shown, not hidden behind a button. Clamped to three lines so a
+   long one cannot stretch its card taller than its neighbours in the grid;
+   `.open` releases the clamp. Most details in practice are ~90 characters
+   and fit in one line, so most cards never show a toggle at all. */
+.details {
+  margin: 10px 0 0; color: var(--fg); font-size: 14px; line-height: 1.45;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3; line-clamp: 3; overflow: hidden;
+}
+.details.open {
+  -webkit-line-clamp: unset; line-clamp: unset; overflow: visible;
+}
 .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 a.btn, button.btn {
   flex: 1 1 auto; min-width: 120px; min-height: 40px; padding: 9px 12px;
@@ -199,6 +210,9 @@ a.btn, button.btn {
   color: var(--fg); font-size: 14px; text-align: center; text-decoration: none;
   cursor: pointer; display: inline-flex; align-items: center; justify-content: center;
 }
+/* `display: inline-flex` above beats the user-agent `[hidden]` rule, so a
+   hidden button would still render. This puts it back. */
+a.btn[hidden], button.btn[hidden] { display: none; }
 a.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 .empty { color: var(--muted); padding: 40px 0; text-align: center; }
 #toast {
@@ -253,6 +267,21 @@ function icsFor(ev) {
   return 'data:text/calendar;charset=utf-8,' + encodeURIComponent(lines.join('\r\n'));
 }
 
+// The extractor emits details as "prose | location | url". On a card the
+// location already has its own line and the URL already has an Open button,
+// so inline those segments are duplication rather than detail — strip them
+// and keep the prose. Search still runs against the raw `ev.details`.
+function detailText(ev) {
+  const loc = String(ev.location || '').trim().toLowerCase();
+  return String(ev.details || '')
+    .split('|')
+    .map(s => s.trim())
+    .filter(Boolean)
+    .filter(s => s.toLowerCase() !== loc)
+    .filter(s => !/^https?:\/\/\S+$/i.test(s))
+    .join(' — ');
+}
+
 function card(ev) {
   const el = document.createElement('article');
   el.className = 'card';
@@ -278,17 +307,25 @@ function card(ev) {
   const actions = document.createElement('div');
   actions.className = 'actions';
 
-  if (ev.details) {
+  const detail = detailText(ev);
+  if (detail) {
     const body = document.createElement('p');
-    body.className = 'details'; body.textContent = ev.details; body.hidden = true;
+    body.className = 'details';
+    body.textContent = detail;                    // textContent, never innerHTML
     el.appendChild(body);
+
+    // Built now but hidden; `syncDetailToggles` measures after layout and
+    // reveals it only for the cards whose text is actually clipped.
     const toggle = document.createElement('button');
-    toggle.className = 'btn'; toggle.textContent = 'Details';
+    toggle.className = 'btn detail-toggle';
+    toggle.type = 'button';
+    toggle.textContent = 'More';
+    toggle.hidden = true;
     toggle.setAttribute('aria-expanded', 'false');
     toggle.onclick = () => {
-      body.hidden = !body.hidden;
-      toggle.setAttribute('aria-expanded', String(!body.hidden));
-      toggle.textContent = body.hidden ? 'Details' : 'Hide';
+      const open = body.classList.toggle('open');
+      toggle.setAttribute('aria-expanded', String(open));
+      toggle.textContent = open ? 'Less' : 'More';
     };
     actions.appendChild(toggle);
   }
@@ -366,7 +403,28 @@ function render() {
     for (const ev of inBucket) shelf.appendChild(card(ev));
     main.appendChild(shelf);
   }
+  requestAnimationFrame(syncDetailToggles);
 }
+
+// Whether the clamp actually bit can only be known after layout, and it
+// changes with card width — so this re-runs on layout switch and on resize,
+// not just after render.
+function syncDetailToggles() {
+  for (const body of main.querySelectorAll('.details')) {
+    const toggle = body.parentElement.querySelector('.detail-toggle');
+    if (!toggle) continue;
+    if (body.classList.contains('open')) { toggle.hidden = false; continue; }
+    // +1 absorbs sub-pixel rounding, which otherwise shows a "More" button
+    // that expands to reveal nothing.
+    toggle.hidden = body.scrollHeight <= body.clientHeight + 1;
+  }
+}
+
+let resizeTimer = null;
+addEventListener('resize', () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(syncDetailToggles, 150);
+});
 
 document.querySelectorAll('.chip').forEach(chip => {
   chip.onclick = () => {
@@ -385,6 +443,9 @@ function setLayout(mode) {
   layoutBtn.textContent = mode === 'carousel' ? 'Carousel' : 'Grid';
   layoutBtn.dataset.mode = mode;
   try { localStorage.setItem('eh-layout', mode); } catch (e) { /* file:// */ }
+  // Card width differs between the modes, so the same text can be clipped in
+  // one and not the other.
+  requestAnimationFrame(syncDetailToggles);
 }
 layoutBtn.onclick = () => setLayout(layoutBtn.dataset.mode === 'carousel' ? 'grid' : 'carousel');
 let saved = 'grid';

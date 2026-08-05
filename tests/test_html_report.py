@@ -8,6 +8,7 @@ a report that needs the network to render is not forwardable.
 from __future__ import annotations
 
 import json
+import pathlib
 import re
 from datetime import date, timedelta
 
@@ -254,3 +255,73 @@ class TestMarkdownDeprecation:
         from event_harvester.outputs.report import ticktick_deep_link as legacy
 
         assert canonical is legacy
+
+
+class TestDetailIsShownNotHidden:
+    """Detail sits on the card. It used to be behind a `Details` button.
+
+    Measured on live data, `details` runs 50-146 characters — the button was
+    concealing a single line, and part of that line duplicated the card's own
+    location row and Open button.
+    """
+
+    @staticmethod
+    def _js(tmp_path=None, events=None):
+        import tempfile
+        target = pathlib.Path(tmp_path or tempfile.mkdtemp()) / "r.html"
+        generate_html_report(
+            events or [{"title": "X", "date": "2026-08-02"}],
+            output_path=str(target),
+        )
+        return target.read_text(encoding="utf-8")
+
+    def test_details_are_not_rendered_hidden(self):
+        html = self._js()
+        assert "body.hidden = true" not in html, "detail must not start hidden"
+        assert "class='details'" in html or "'details'" in html
+
+    def test_the_clamp_is_three_lines(self):
+        html = self._js()
+        assert "-webkit-line-clamp: 3" in html
+        assert ".details.open" in html, "the clamp must be releasable"
+
+    def test_a_hidden_button_is_actually_hidden(self):
+        """`display: inline-flex` on .btn overrides the UA [hidden] rule."""
+        html = self._js()
+        assert "button.btn[hidden]" in html, (
+            "without this rule the More button renders even when hidden"
+        )
+
+    def test_the_toggle_is_measured_after_layout(self):
+        html = self._js()
+        assert "syncDetailToggles" in html
+        assert "scrollHeight" in html and "clientHeight" in html
+        assert "requestAnimationFrame(syncDetailToggles)" in html
+
+    def test_the_toggle_is_resynced_when_card_width_changes(self):
+        """Grid and carousel are different widths; so is a window resize."""
+        html = self._js()
+        assert html.count("requestAnimationFrame(syncDetailToggles)") >= 2
+        assert "addEventListener('resize'" in html
+
+    def test_duplicate_segments_are_stripped_from_the_inline_text(self):
+        html = self._js()
+        assert "function detailText" in html
+        # The location row and the Open button already carry these.
+        assert "ev.location" in html
+        assert "^https?:" in html
+
+    def test_search_still_matches_the_raw_details(self):
+        """Stripping is for display only — a URL must stay findable."""
+        html = self._js()
+        assert "ev.details" in html.split("function matching()")[1][:400]
+
+    def test_detail_text_is_never_interpolated_as_html(self):
+        html = self._js(events=[{
+            "title": "X", "date": "2026-08-02",
+            "details": "</script><img src=x onerror=alert(1)>",
+        }])
+        # The payload must reach the DOM through textContent, and must not
+        # have closed the JSON block on its way in.
+        assert "body.textContent = detail" in html
+        assert "</script><img" not in html, "the payload closed the script block"
