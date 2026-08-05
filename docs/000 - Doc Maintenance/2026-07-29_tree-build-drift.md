@@ -127,3 +127,17 @@ Appended, not rewritten.
 **Counter-observation, and it cuts against the one above.** The doc-driven method worked for the defects a careful *read* can find. Every serious bug on 2026-07-30 after the Tier 1 pass was found by **running** something: the region key that gave one region per link, two timezone bugs that put events in the wrong bucket and the wrong hour, and a `uvicorn.run()` inside a running loop that meant `event-harvester site` had never once started. Reading found the first tier; only execution found the second. The tree's value is real and it is not a substitute for running the thing.
 
 **Tree is stale again**: `docs/` is 48 files across 11 numbered folders as of 2026-07-30 end of day; the diagram at the top of this note says 39. Treat it as a snapshot, as its own note already warns.
+
+## Fourth resolution log — 2026-07-31
+
+Appended, not rewritten.
+
+| Gap | State | Note |
+|---|---|---|
+| 4 — `01 - Design` / `00 - Theory` thin | 🟢 **Substantially closed for Design** | `01 - Design` 2 → 4: `02 - The Control UI`, `03 - The Job Queue`. Both `DRAFT`, both design-before-code rather than after. The docstrings-as-design-lane question is now moot for new work — new design goes in the folder |
+| 5 — `05 - Standards` derived, not ratified | 🔲 Unchanged | `EH-STD-WEBSRC-v0` will need a `tags` / `enabled` amendment when the control-UI work starts; recorded there, not yet done |
+| 6 — transcript only partly decomposed | 🔲 Still open | Nobody has read the remaining ~2,900 turns |
+
+**New drift found and fixed this pass.** `00 - System Overview.md`'s concurrency table claimed `interlock.py` + `_interlock_worker.py` gave "one browser-driven session at a time, cross-process". They do not: both are the RyzenAI **NPU local-inference** path, and `llm.py:35` is their only consumer. There is **no cross-process browser serialization anywhere** — native Chrome takes a fixed `--remote-debugging-port=9222`, and the site and MCP backend are separate processes that can both harvest. Corrected in the overview, with the real hazard added as a `known rough edge` row.
+
+Worth noting *how* it was found: not by reading the overview, but by designing against it. A doc that is wrong in a way nobody depends on stays wrong indefinitely; the moment a design leaned on that row, it failed immediately. **Load-bearing prose gets checked; decorative prose does not.**
