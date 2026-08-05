@@ -42,6 +42,12 @@
     "scroll_seconds": 10
   },
   {
+    "url": "https://ma.to/events/san-francisco",
+    "name": "mato",
+    "mode": "calendar",
+    "scroll_seconds": 8
+  },
+  {
     "url": "https://tockify.com/mothership/agenda",
     "name": "mothership",
     "mode": "calendar",
