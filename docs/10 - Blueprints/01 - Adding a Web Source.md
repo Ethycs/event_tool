@@ -1,6 +1,6 @@
 # Blueprint — adding a web source
 
-**Status:** CURRENT · **Date:** 2026-08-04 · **Applies to:** `data/web_sources.json`, `event-harvester web {test,add,probe}` · **Related:** `05 - Standards/EH-STD-WEBSRC-v0`, `03 - Architecture/03 - Sources — Web.md`
+**Status:** CURRENT · **Date:** 2026-08-06 (added step 3d, Instagram) · **Applies to:** `data/web_sources.json`, `event-harvester web {test,add,probe,instagram}` · **Related:** `05 - Standards/EH-STD-WEBSRC-v0`, `03 - Architecture/03 - Sources — Web.md`
 
 Someone hands you a URL. Seven steps, cheapest first, and the whole point is
 step 3.
@@ -78,6 +78,19 @@ data-url-id="x">` means `/x` exists as a page — and `/x?format=json` returns
 just that section's content, which is how you compare candidates without a
 browser at all.
 
+**d. Instagram** — for a venue whose site has no calendar at all:
+
+```powershell
+pixi run event-harvester web instagram https://<domain>/
+```
+
+A `@handle` printed in green means the site names its account clearly enough
+to adopt (added 2026-08-06). Add it to the `instagram` source's `accounts`
+list — `--apply` does that for configured sources — **rather than typing a
+handle you guessed**. Oasis is `@theoasissf`, not `@sfoasis`, and Instagram
+answers 200 for handles that do not exist, so a guess fails silently and
+forever. `unsure` lines are candidates for a human, not for `--apply`.
+
 ## 4 — Diagnose each candidate
 
 ```powershell
@@ -108,11 +121,22 @@ signal when the extra text is a nav menu.
 
 | Mode | When |
 |---|---|
-| `ics` | A real feed exists. Always prefer it |
+| `ics` | A real iCalendar feed exists. Always prefer it |
+| `rss` | An RSS/Atom feed exists. Prefer it over scraping — one item per event |
 | `calendar` | Dated event links on the page |
 | `feed` | Infinite-scroll or XHR-driven; needs `api_pattern` |
 | `search` | A **results** page that takes a query. Needs `queries` |
-| `raw` | No links, but the page text carries the schedule — the weekly-venue case |
+| `raw` | No links, and the page text carries a **short** schedule — the weekly-venue case |
+
+**`raw` does not scale with the number of events on the page**, and this is the trap. It produces exactly one message however many shows the page lists, and the LLM returns roughly one event from one message. Measured 2026-08-07 on Bottom of the Hill: a 338 KB calendar page listing ~40 shows became a 30,164-character message and yielded **one** event — *"Calendar and tickets page; includes merch and newsletter sign-up links"*. The same venue's RSS yielded **65**.
+
+So when step 4 recommends `raw` on a page you can see is dense, treat that as a signal to go back to step 3a and look harder for a feed. `web probe` only detects **iCalendar**; grep the HTML for `RSS.xml`, `feed`, `atom` yourself:
+
+```bash
+grep -oiE '(rss|atom)[^"<>]{0,30}\.xml' /tmp/page.html | sort -u
+```
+
+Beware false positives — `ical` matches CSS `vertical-align`.
 
 Two overrides worth knowing:
 

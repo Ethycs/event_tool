@@ -27,7 +27,9 @@ from event_harvester.sources.web_modes.calendar import _do_calendar
 from event_harvester.sources.web_modes.chat import _do_chat
 from event_harvester.sources.web_modes.feed import _do_feed
 from event_harvester.sources.web_modes.ics import _do_ics
+from event_harvester.sources.web_modes.instagram import _do_instagram
 from event_harvester.sources.web_modes.raw import _do_raw
+from event_harvester.sources.web_modes.rss import _do_rss
 from event_harvester.sources.web_modes.search import _do_search
 from event_harvester.sources.web_modes.steps import _do_steps
 
@@ -198,6 +200,31 @@ def fetch_web_sources(
                         # needed (and would fail to navigate webcal:// URLs).
                         if mode == "ics":
                             msgs = _do_ics(uc, src, tracer=nav_tracer, capture=capture)
+                            messages.extend(msgs)
+                            if msgs:
+                                _save_cooldown(src["url"])
+                            logger.info("%s: %d messages.", name, len(msgs))
+                            continue
+
+                        # RSS mode: same browser-free contract as ICS. One
+                        # message per show beats one 30k-char blob per venue.
+                        if mode == "rss":
+                            msgs = _do_rss(uc, src, tracer=nav_tracer, capture=capture)
+                            messages.extend(msgs)
+                            if msgs:
+                                _save_cooldown(src["url"])
+                            logger.info("%s: %d messages.", name, len(msgs))
+                            continue
+
+                        # Instagram mode drives its own pages (one per
+                        # account, each recorded from first paint), so the
+                        # shared page-open + Cloudflare wait below would only
+                        # be a page it immediately closes.
+                        if mode == "instagram":
+                            msgs = _do_instagram(
+                                uc, src, max_events,
+                                tracer=nav_tracer, capture=capture,
+                            )
                             messages.extend(msgs)
                             if msgs:
                                 _save_cooldown(src["url"])

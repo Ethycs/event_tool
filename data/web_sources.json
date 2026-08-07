@@ -22,10 +22,78 @@
   {
     "url": "https://www.instagram.com/",
     "name": "instagram",
-    "mode": "feed",
-    "api_pattern": "graphql",
-    "scroll_seconds": 25,
-    "api_only": true
+    "mode": "instagram",
+    "accounts": [
+      {
+        "handle": "studsf",
+        "name": "stud"
+      },
+      {
+        "handle": "lesbeauxsf",
+        "name": "beaux"
+      },
+      {
+        "handle": "jolenessf",
+        "name": "jolenes"
+      },
+      {
+        "handle": "theoasissf",
+        "name": "oasis"
+      },
+      {
+        "handle": "elriosf",
+        "name": "elrio"
+      },
+      {
+        "handle": "lookoutsf",
+        "name": "lookout"
+      },
+      {
+        "handle": "sfeagle",
+        "name": "sf-eagle"
+      },
+      {
+        "handle": "auntcharliesangels",
+        "name": "aunt-charlies"
+      },
+      {
+        "handle": "driftwoodsf",
+        "name": "driftwood"
+      },
+      {
+        "handle": "midnightsunsf",
+        "name": "midnight-sun"
+      },
+      {
+        "handle": "motherbarsf",
+        "name": "mother"
+      },
+      {
+        "handle": "qbarsf",
+        "name": "qbar"
+      },
+      {
+        "handle": "rikkisbarsf",
+        "name": "rikkis"
+      },
+      {
+        "handle": "thecafesf",
+        "name": "the-cafe"
+      },
+      {
+        "handle": "themix.bar",
+        "name": "the-mix"
+      },
+      {
+        "handle": "thebitterendsf",
+        "name": "the-bitter-end"
+      }
+    ],
+    "max_pages": 0,
+    "max_posts": 8,
+    "request_delay_s": 3,
+    "account_gap_s": 4,
+    "cooldown_hours": 6
   },
   {
     "url": "https://www.eventbrite.com/d/ca--san-francisco/events/",
@@ -38,7 +106,13 @@
     "url": "https://www.meetup.com/find/?source=EVENTS&eventType=inPerson&sortField=RELEVANCE",
     "name": "meetup",
     "mode": "search",
-    "queries": ["AI", "machine learning", "startup", "tech networking", "queer"],
+    "queries": [
+      "AI",
+      "machine learning",
+      "startup",
+      "tech networking",
+      "queer"
+    ],
     "scroll_seconds": 10
   },
   {
@@ -222,5 +296,13 @@
     "mode": "raw",
     "category": "venues",
     "cooldown_hours": 6
+  },
+  {
+    "url": "https://www.bottomofthehill.com/RSS.xml",
+    "name": "bottom-of-the-hill",
+    "mode": "rss",
+    "category": "venues",
+    "cooldown_hours": 12,
+    "forward_days": 120
   }
 ]

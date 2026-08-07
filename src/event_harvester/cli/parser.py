@@ -205,7 +205,7 @@ def build_parser() -> argparse.ArgumentParser:
     # ── web ──
     p_web = sub.add_parser(
         "web",
-        help="Manage web sources (list/add/test/probe/login)",
+        help="Manage web sources (list/add/test/probe/instagram/replay/login)",
     )
     web_sub = p_web.add_subparsers(dest="web_command", required=True, metavar="WEB_COMMAND")
 
@@ -219,7 +219,7 @@ def build_parser() -> argparse.ArgumentParser:
     web_add.add_argument("url", help="URL of the web source to add")
     web_add.add_argument(
         "--mode", default=None,
-        choices=["calendar", "feed", "search", "raw", "ics"],
+        choices=["calendar", "feed", "search", "raw", "ics", "rss"],
         help="Override the auto-detected mode (also skips the feed probe)",
     )
     web_add.add_argument(
@@ -256,6 +256,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Per-request timeout in seconds (default: 10)",
     )
     _add_root_flags(web_probe)
+
+    web_ig = web_sub.add_parser(
+        "instagram",
+        help="Find the Instagram accounts configured venues link to, and adopt them",
+    )
+    web_ig.add_argument(
+        "urls", nargs="*",
+        help="Site URLs to scan; omit to scan every configured source with a website",
+    )
+    web_ig.add_argument(
+        "--apply", action="store_true",
+        help="Add confidently-matched handles to the instagram source's account list",
+    )
+    web_ig.add_argument(
+        "--source", default="instagram", metavar="NAME",
+        help="Name of the instagram source to write accounts into (default: instagram)",
+    )
+    web_ig.add_argument(
+        "--category", metavar="NAME",
+        help="Only scan configured sources with this category (e.g. venues). "
+             "A ticketing platform's corporate account is not a venue's calendar",
+    )
+    web_ig.add_argument(
+        "--timeout", type=int, default=15, metavar="SEC",
+        help="Per-request timeout in seconds (default: 15)",
+    )
+    _add_root_flags(web_ig)
 
     web_replay = web_sub.add_parser(
         "replay",
