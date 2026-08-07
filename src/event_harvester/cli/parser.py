@@ -355,6 +355,29 @@ def build_parser() -> argparse.ArgumentParser:
     svc_logs.add_argument("--lines", type=int, default=40, help="Lines per stream")
     _svc_common(svc_logs, allow_all=False)
 
+    # ── verified transitions ──
+    # start/stop ask the service manager to act; up/down check that it worked.
+    svc_up = svc_sub.add_parser(
+        "up",
+        help="Start every installed service in order, verify health, report the queue",
+    )
+    svc_up.add_argument("--host", default="127.0.0.1",
+                        help="Host to health-check against (default: 127.0.0.1)")
+    _add_root_flags(svc_up)
+
+    svc_down = svc_sub.add_parser(
+        "down",
+        help="Stop every service in reverse order and report processes that survived",
+    )
+    _add_root_flags(svc_down)
+
+    svc_doctor = svc_sub.add_parser(
+        "doctor",
+        help="What is running, at what version, what is unmanaged, is the queue armed",
+    )
+    svc_doctor.add_argument("--host", default="127.0.0.1", help="Host to health-check")
+    _add_root_flags(svc_doctor)
+
     # ── jobs ──
     p_jobs = sub.add_parser(
         "jobs",

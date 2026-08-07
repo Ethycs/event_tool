@@ -3,6 +3,25 @@
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_job_queue(tmp_path, monkeypatch):
+    """No test may touch the real harvest queue.
+
+    This is not hypothetical. A suite run on 2026-08-04 submitted a real job
+    (`{'days': 7}`, submitted_by=timer) into `data/.jobs/`, where it has been
+    sitting queued ever since — armed to run a full unattended harvest the
+    moment a runner starts. The same run then blocked for 30 minutes on
+    `wait_for`, which is how it was noticed at all.
+
+    The cause was a test that exercised `site._collect` after it grew a submit
+    path, while patching only `Pipeline`. Autouse, because remembering to
+    patch `JOBS_DIR` in the right test is exactly the discipline that failed.
+    """
+    from event_harvester import jobs
+
+    monkeypatch.setattr(jobs, "JOBS_DIR", tmp_path / "_jobs")
+
+
 @pytest.fixture
 def sample_messages():
     """A set of sample messages from both platforms."""

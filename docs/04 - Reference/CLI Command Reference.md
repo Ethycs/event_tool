@@ -172,6 +172,30 @@ All subcommands take `--service` and `--name` (default: per service). `install` 
 
 Install/uninstall/start/stop **require an elevated shell**; `status` and `logs` do not.
 
+### `up` / `down` / `doctor` — verified transitions · **added 2026-08-06**
+
+`start` and `stop` ask the service manager to act. **`up` and `down` check that it happened**, and that distinction is the whole point — every lifecycle failure this project has hit was something that *looked* done.
+
+| Verb | Does |
+|---|---|
+| `service down` | Stops every service in reverse order, then reports harvester **servers that survived** — the ones no service owns and `stop --all` silently leaves running |
+| `service up` | Starts every installed service in order, health-checks each, and reports **queue depth before anything drains it** |
+| `service doctor` | What is running, at what version, what is unmanaged, whether the queue is armed |
+
+**Why `down` reports survivors.** A backend started by hand on 2026-07-28 was still serving on `0.0.0.0:8765` with no authentication eight days later. `stop --all` would never have touched it. Teardown that only stops what it installed is not teardown.
+
+**Why `up` reports the queue first.** A job can sit queued for days and then run a full unattended harvest the moment a runner appears — that should be something you are told, not something you infer from the token bill.
+
+**Process classification is ancestry-based, not PID equality.** NSSM's service PID is `nssm.exe`; the worker is a grandchild (`nssm` → `pixi` → `python`). Comparing PIDs directly reported every managed worker as unmanaged — twelve findings for three real processes on the first run. Chains are collapsed to one entry, and client-spawned **stdio** MCP servers are counted separately rather than flagged, because they are expected (they do, however, bypass the job queue).
+
+### Process identity
+
+Every long-lived surface now reports what code it is running — `version`, git SHA at boot, `stale`, `pid`, `started_at` — on `/healthz` (site, gateway) and in `config_summary` (MCP). See `src/event_harvester/buildinfo.py`.
+
+The SHA is read out of `.git/` directly rather than by shelling out: a health check should not spawn a subprocess, and under LocalSystem `git` may not be on PATH. The **booted** SHA is cached deliberately, so it cannot follow the working tree — noticing that the checkout moved and the process did not *is* the feature.
+
+`known rough edge`: a process that predates this reports no identity at all. `doctor` treats that absence as the staleness signal it is.
+
 ### The gateway is the dispatch endpoint
 
 A Claude custom connector takes exactly **one URL**, so whatever is at that URL is the entire surface Claude gets. `install --service gateway` prints the exposure notice; the rules live in `servers/gateway.py` and the operator procedure in `docs/02 - Implementation/02 - Deploy Playbook.md` §5c.

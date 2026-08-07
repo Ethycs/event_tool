@@ -447,6 +447,197 @@ def status(*, service: str = "site", name: str | None = None) -> dict:
     }
 
 
+# ── unmanaged processes ───────────────────────────────────────────────────
+#
+# The failure this exists for: a harvester started by hand on 2026-07-28 was
+# still running on 2026-08-05, on `0.0.0.0:8765` with no authentication and no
+# job runner, owned by nothing. `service stop --all` would never have touched
+# it, because NSSM does not know it exists. Teardown that only stops what it
+# installed is not teardown.
+
+#: Command-line fragments that identify one of our own long-lived processes.
+_HARVESTER_MARKERS = ("event-harvester", "event_harvester", "gateway.py")
+
+#: Sub-commands worth reporting. A one-shot `harvest` exits on its own.
+_LONG_LIVED = ("mcp", "site", "serve", "gateway")
+
+#: Verbs that bind a port and keep running — the things a service should own.
+_SERVER_VERBS = ("site", "serve", "gateway")
+
+
+def _process_table() -> dict[int, dict]:
+    """Every process, keyed by PID, with its parent and command line.
+
+    One CIM call rather than psutil (not a dependency) and rather than one
+    call per service. Returns {} rather than raising — this is diagnostics and
+    must never be the reason a teardown aborts.
+    """
+    script = (
+        "Get-CimInstance Win32_Process | "
+        "Select-Object ProcessId,ParentProcessId,Name,CommandLine | "
+        "ConvertTo-Json -Compress"
+    )
+    proc = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script])
+    if proc.returncode != 0 or not (proc.stdout or "").strip():
+        logger.debug("service: could not enumerate processes")
+        return {}
+
+    import json
+
+    try:
+        raw = json.loads(proc.stdout)
+    except ValueError:
+        return {}
+    if isinstance(raw, dict):
+        raw = [raw]
+
+    table: dict[int, dict] = {}
+    for entry in raw:
+        try:
+            pid = int(entry.get("ProcessId") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not pid:
+            continue
+        table[pid] = {
+            "pid": pid,
+            "ppid": int(entry.get("ParentProcessId") or 0),
+            "name": entry.get("Name") or "",
+            "command": (entry.get("CommandLine") or "").strip(),
+        }
+    return table
+
+
+def _looks_like_a_harvester(command: str) -> bool:
+    """A long-lived harvester process, not a one-shot and not our own query.
+
+    Matches verbs as whole tokens. Substring matching put `site` inside every
+    path containing the word and reported a dozen false positives.
+    """
+    low = command.lower()
+    if not any(marker in low for marker in _HARVESTER_MARKERS):
+        return False
+    if "get-ciminstance" in low or "converto-json" in low:
+        return False
+    tokens = low.replace('"', " ").replace("'", " ").split()
+    return any(verb in tokens for verb in _LONG_LIVED)
+
+
+def _ancestors(pid: int, table: dict[int, dict], limit: int = 12) -> list[int]:
+    """Walk up the parent chain, defensively — PID reuse can make cycles."""
+    chain, seen, current = [], {pid}, table.get(pid, {}).get("ppid", 0)
+    while current and current not in seen and len(chain) < limit:
+        chain.append(current)
+        seen.add(current)
+        current = table.get(current, {}).get("ppid", 0)
+    return chain
+
+
+def is_stdio_mcp(command: str) -> bool:
+    """A client-spawned stdio MCP server, not a service.
+
+    An editor or desktop client starts one of these per session and it dies
+    with the client. It binds no port and owns no queue, so it is not a stray
+    service — but it *does* bypass the job queue (`harvest_events` runs inline
+    over stdio), so it is worth counting rather than hiding.
+    """
+    low = command.lower()
+    tokens = low.replace('"', " ").split()
+    return "mcp" in tokens and "streamable-http" not in low
+
+
+def _is_server(command: str) -> bool:
+    """Binds a port and stays up — the shape a service should own.
+
+    `gateway.py` is matched as well as `gateway`, because the gateway runs as
+    `python gateway.py` and `pixi run gateway`. Matching only the bare token
+    made an unmanaged gateway invisible to this check.
+    """
+    low = command.lower()
+    tokens = low.replace('"', " ").replace("\\", "/").split()
+    tokens = {t.rsplit("/", 1)[-1] for t in tokens}
+    if any(verb in tokens for verb in _SERVER_VERBS):
+        return True
+    if "gateway.py" in tokens:
+        return True
+    return "mcp" in tokens and "streamable-http" in low
+
+
+def _leaves_only(procs: list[dict]) -> list[dict]:
+    """Collapse `pixi -> .exe -> python` chains to the process doing the work.
+
+    Without this one server is reported three times, which is how a first run
+    produced twelve findings for three actual processes.
+    """
+    parents = {p["ppid"] for p in procs}
+    return [p for p in procs if p["pid"] not in parents]
+
+
+def find_harvester_processes(table: dict[int, dict] | None = None) -> list[dict]:
+    """Every running long-lived harvester process, one entry per chain."""
+    table = table if table is not None else _process_table()
+    matched = [p for p in table.values() if _looks_like_a_harvester(p["command"])]
+    return _leaves_only(matched)
+
+
+def _service_pids(names: list[str]) -> dict[str, int]:
+    """The PID NSSM reports for each service — the `nssm.exe` supervisor."""
+    script = "; ".join(
+        f"(Get-CimInstance Win32_Service -Filter \"Name='{n}'\").ProcessId" for n in names
+    )
+    proc = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script])
+    values = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
+    out: dict[str, int] = {}
+    for name, value in zip(names, values):
+        if value.isdigit() and int(value):
+            out[name] = int(value)
+    return out
+
+
+def survey_processes(*, names: list[str] | None = None) -> dict[str, list[dict]]:
+    """Split running harvester processes into unmanaged servers and stdio clients.
+
+    Returns both, rather than returning one and stashing the other on a
+    function attribute — that side-channel pattern is hazard #1 in
+    `03 - Architecture/00 - System Overview.md` and was deliberately removed
+    from this codebase once already.
+
+    **Ancestry, not PID equality.** NSSM's service PID is `nssm.exe`; the
+    actual worker is a grandchild (`nssm` → `pixi` → `python`). Comparing PIDs
+    directly reported every managed worker as unmanaged — a dozen false
+    positives on the first real run, which is worse than no check at all,
+    because a diagnostic that always cries wolf gets ignored.
+
+    Our own process and its ancestors are excluded too: running the check must
+    not report the check.
+    """
+    names = names or [spec.default_name for spec in SERVICES.values()]
+    table = _process_table()
+    if not table:
+        return {"unmanaged": [], "stdio": []}
+
+    service_pids = set(_service_pids(names).values())
+    self_chain = {os.getpid(), *_ancestors(os.getpid(), table)}
+
+    unmanaged, stdio = [], []
+    for proc in find_harvester_processes(table):
+        if proc["pid"] in self_chain:
+            continue
+        if service_pids & set(_ancestors(proc["pid"], table)):
+            continue          # descends from a service supervisor
+        entry = {"pid": proc["pid"], "command": proc["command"]}
+        if _is_server(proc["command"]):
+            unmanaged.append(entry)
+        elif is_stdio_mcp(proc["command"]):
+            stdio.append(entry)
+    return {"unmanaged": unmanaged, "stdio": stdio}
+
+
+def find_unmanaged(*, names: list[str] | None = None) -> list[dict]:
+    """Unmanaged long-lived *servers* only. See `survey_processes`."""
+    return survey_processes(names=names)["unmanaged"]
+
+
 def tail_logs(*, service: str = "site", name: str | None = None, lines: int = 40) -> dict:
     """Return the last `lines` of the service's stdout/stderr logs."""
     name = service_name(service, name)
@@ -464,3 +655,208 @@ def tail_logs(*, service: str = "site", name: str | None = None, lines: int = 40
             continue
         out[key] = content[-lines:]
     return {"ok": info.get("ok", False), "service": service, "name": name, **out}
+
+
+# ── verified transitions ──────────────────────────────────────────────────
+#
+# `start`/`stop` ask the service manager to do something. `up`/`down` check
+# that it happened. The difference matters because every lifecycle failure
+# this project has hit was a thing that *looked* done: a service running
+# four-day-old code, a hand-started process nothing owned, a queued job
+# nobody knew was armed.
+
+#: Health endpoint per service, relative to its bind address.
+HEALTH_PATHS = {"site": "/healthz", "gateway": "/healthz", "mcp": None}
+
+
+def _http_get_json(url: str, timeout: float = 3.0) -> dict | None:
+    import json
+    import urllib.error
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        return None
+
+
+def health(service: str, *, host: str = "127.0.0.1", port: int | None = None) -> dict:
+    """Ask a running service what it is. Never raises."""
+    spec = spec_for(service)
+    path = HEALTH_PATHS.get(service)
+    if not path:
+        return {"service": service, "reachable": None,
+                "detail": "no health endpoint (stdio/JSON-RPC only)"}
+
+    payload = _http_get_json(f"http://{host}:{port or spec.default_port}{path}")
+    if payload is None:
+        return {"service": service, "reachable": False}
+    build = payload.get("build") or {}
+    return {
+        "service": service,
+        "reachable": True,
+        "ok": payload.get("ok"),
+        "version": build.get("version"),
+        "sha": build.get("sha"),
+        "stale": build.get("stale"),
+        "pid": build.get("pid"),
+        "started_at": build.get("started_at"),
+        "queue": payload.get("queue"),
+    }
+
+
+@traced("service.down", tracer_name=_TRACER)
+def down(*, names: list[str] | None = None) -> dict:
+    """Stop every service in reverse dependency order, then verify.
+
+    Verification is the point. It reports processes that survived — the ones
+    NSSM never owned and `stop --all` would silently leave running.
+    """
+    if not is_admin():
+        raise ServiceError("Stopping services requires an elevated shell.")
+
+    stopped, failed = [], []
+    for key in reversed(SERVICE_ORDER):
+        name = service_name(key)
+        info = status(service=key, name=name)
+        if not info.get("installed"):
+            continue
+        try:
+            control("stop", service=key, name=name)
+            stopped.append(name)
+        except ServiceError as e:
+            failed.append({"name": name, "error": str(e)})
+
+    survivors = find_unmanaged(names=names)
+    return {
+        "ok": not failed,
+        "stopped": stopped,
+        "failed": failed,
+        "unmanaged_survivors": survivors,
+    }
+
+
+@traced("service.up", tracer_name=_TRACER)
+def up(*, host: str = "127.0.0.1") -> dict:
+    """Start every installed service in dependency order, then verify.
+
+    Reports the queue depth **before** anything drains it. An orphaned job can
+    sit queued for days and then run a full unattended harvest the moment a
+    runner appears; that should be something you are told, not something you
+    discover from the token bill.
+    """
+    if not is_admin():
+        raise ServiceError("Starting services requires an elevated shell.")
+
+    from event_harvester import jobs
+
+    queue_before = jobs.queue_summary()
+
+    started, failed = [], []
+    for key in SERVICE_ORDER:
+        name = service_name(key)
+        info = status(service=key, name=name)
+        if not info.get("installed"):
+            continue
+        if "RUNNING" in (info.get("state") or "").upper():
+            started.append(name)
+            continue
+        try:
+            control("start", service=key, name=name)
+            started.append(name)
+        except ServiceError as e:
+            failed.append({"name": name, "error": str(e)})
+
+    checks = [health(key, host=host) for key in SERVICE_ORDER]
+    return {
+        "ok": not failed,
+        "started": started,
+        "failed": failed,
+        "health": checks,
+        "queue_before": queue_before,
+    }
+
+
+@traced("service.doctor", tracer_name=_TRACER)
+def doctor(*, host: str = "127.0.0.1") -> dict:
+    """One command for "what is actually running, and is it current?".
+
+    Replaces the process enumeration, start-time comparison and log reading
+    that establishing this used to take.
+    """
+    from event_harvester import jobs
+    from event_harvester.buildinfo import current_sha
+
+    services = []
+    for key in SERVICE_ORDER:
+        info = status(service=key)
+        entry = {
+            "service": key,
+            "name": info.get("name"),
+            "installed": info.get("installed", False),
+            "state": info.get("state"),
+            "runs_as": info.get("runs_as"),
+            "needs_user_account": spec_for(key).needs_user_account,
+        }
+        if entry["installed"]:
+            entry["health"] = health(key, host=host)
+        services.append(entry)
+
+    findings = []
+    for entry in services:
+        health_info = entry.get("health") or {}
+        if health_info.get("stale"):
+            findings.append(
+                f"{entry['name']} is running {health_info.get('sha')} but "
+                f"{current_sha() or '?'} is checked out — restart it"
+            )
+        elif health_info.get("reachable") and not health_info.get("sha"):
+            # Absence of identity *is* the staleness signal: build info was
+            # added 2026-08-06, so a process that cannot report it booted
+            # before that and is by definition behind.
+            findings.append(
+                f"{entry['name']} reports no build identity — it predates "
+                f"buildinfo (2026-08-06), so it is running stale code"
+            )
+        if entry["installed"] and "RUNNING" in (entry.get("state") or "").upper() \
+                and health_info.get("reachable") is False:
+            findings.append(f"{entry['name']} is RUNNING but not answering health")
+        if entry["needs_user_account"] and (entry.get("runs_as") or "").lower() in (
+            "localsystem", "system",
+        ):
+            findings.append(
+                f"{entry['name']} runs as LocalSystem — Discord and Signal "
+                f"will be invisible"
+            )
+
+    survey = survey_processes()
+    unmanaged = survey["unmanaged"]
+    for proc in unmanaged:
+        findings.append(
+            f"pid {proc['pid']} is an unmanaged server no service owns: "
+            f"{proc['command'][:70]}"
+        )
+
+    queue = jobs.queue_summary()
+    if queue.get("queued"):
+        findings.append(
+            f"{queue['queued']} job(s) queued; they run as soon as a runner starts"
+        )
+    if queue.get("queued") and not any(
+        e["service"] == "mcp" and "RUNNING" in (e.get("state") or "").upper()
+        for e in services
+    ):
+        findings.append("nothing is draining the queue — EventHarvesterMCP is not running")
+
+    return {
+        "ok": not findings,
+        "checked_out_sha": (current_sha() or "")[:12] or None,
+        "services": services,
+        "unmanaged": unmanaged,
+        # Informational, not a finding: a client spawns one per session and it
+        # dies with the client. Counted because stdio bypasses the job queue.
+        "stdio_clients": survey["stdio"],
+        "queue": queue,
+        "findings": findings,
+    }

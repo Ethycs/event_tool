@@ -31,9 +31,13 @@ async def service_cmd(args, cfg) -> int:
     sub = args.service_command
     with tracer.start_as_current_span(f"cli.service.{sub}") as span:
         span.set_attribute("cli.subcommand", sub)
-        span.set_attribute("service.selected", args.service)
+        # up/down/doctor act on the whole set, so they carry no --service.
+        span.set_attribute("service.selected", getattr(args, "service", "*"))
         span.set_attribute("service.all", bool(getattr(args, "all", False)))
         try:
+            if sub in ("up", "down", "doctor"):
+                return _lifecycle(sub, args, svc)
+
             targets = _targets(args, svc)
             # `--name` renames one service; it cannot rename three.
             if len(targets) > 1 and args.name:
@@ -161,3 +165,115 @@ def _logs(key: str, args, svc) -> int:
             print(f"    {line}")
     print()
     return 0
+
+
+# ── verified transitions ──────────────────────────────────────────────────
+
+
+def _lifecycle(sub: str, args, svc) -> int:
+    if sub == "down":
+        return _down(args, svc)
+    if sub == "up":
+        return _up(args, svc)
+    return _doctor(args, svc)
+
+
+def _down(args, svc) -> int:
+    info = svc.down()
+    for name in info["stopped"]:
+        print(f"  {GREEN}stopped{RESET} {BOLD}{name}{RESET}")
+    for failure in info["failed"]:
+        print(f"  {RED}failed {RESET} {BOLD}{failure['name']}{RESET} "
+              f"{DIM}{failure['error']}{RESET}")
+
+    survivors = info["unmanaged_survivors"]
+    if survivors:
+        # The whole reason `down` exists rather than `stop --all`: a process
+        # nothing owns is invisible to the service manager and survives it.
+        print(f"\n  {YELLOW}{len(survivors)} harvester process(es) survived — "
+              f"no service owns them:{RESET}")
+        for proc in survivors:
+            print(f"    pid {BOLD}{proc['pid']}{RESET} {DIM}{proc['command'][:110]}{RESET}")
+        print(f"\n  {DIM}Stop-Process -Id <pid> -Force{RESET}")
+    else:
+        print(f"\n  {GREEN}Nothing left running.{RESET}")
+    print()
+    return 0 if info["ok"] else 1
+
+
+def _up(args, svc) -> int:
+    info = svc.up(host=args.host)
+    for name in info["started"]:
+        print(f"  {GREEN}started{RESET} {BOLD}{name}{RESET}")
+    for failure in info["failed"]:
+        print(f"  {RED}failed {RESET} {BOLD}{failure['name']}{RESET} "
+              f"{DIM}{failure['error']}{RESET}")
+
+    print()
+    for check in info["health"]:
+        _print_health(check)
+
+    # Say this *before* anything drains it. A job can sit queued for days and
+    # then run a full unattended harvest the moment a runner appears.
+    queue = info["queue_before"] or {}
+    if queue.get("queued"):
+        print(f"\n  {YELLOW}{queue['queued']} job(s) were already queued{RESET} — "
+              f"the runner will start on them immediately.")
+        for job_id in queue.get("next", []):
+            print(f"    {DIM}{job_id}{RESET}")
+        print(f"  {DIM}Cancel with: event-harvester jobs cancel <id>{RESET}")
+    print()
+    return 0 if info["ok"] else 1
+
+
+def _print_health(check: dict) -> None:
+    name = check["service"]
+    if check["reachable"] is None:
+        print(f"  {DIM}{name:<9} {check['detail']}{RESET}")
+        return
+    if not check["reachable"]:
+        print(f"  {RED}{name:<9} not answering{RESET}")
+        return
+    if not check.get("sha"):
+        # Reachable but silent about itself — it predates buildinfo.
+        print(f"  {YELLOW}{name:<9} answering, but reports no identity "
+              f"(pre-buildinfo build){RESET}")
+        return
+    flag = f" {RED}STALE{RESET}" if check.get("stale") else ""
+    print(f"  {GREEN}{name:<9} ok{RESET} {DIM}v{check.get('version')} "
+          f"@{check['sha']} pid={check.get('pid')}{RESET}{flag}")
+
+
+def _doctor(args, svc) -> int:
+    info = svc.doctor(host=args.host)
+
+    print(f"\n  {BOLD}checked out{RESET} {DIM}{info['checked_out_sha']}{RESET}\n")
+    for entry in info["services"]:
+        if not entry["installed"]:
+            print(f"  {DIM}{entry['service']:<9} not installed{RESET}")
+            continue
+        state = entry.get("state") or "?"
+        colour = GREEN if "RUNNING" in state.upper() else YELLOW
+        print(f"  {colour}{entry['service']:<9} {state}{RESET} "
+              f"{DIM}as {entry.get('runs_as')}{RESET}")
+        if entry.get("health"):
+            print("  ", end="")
+            _print_health(entry["health"])
+
+    queue = info["queue"]
+    print(f"\n  {BOLD}queue{RESET} {queue['queued']} waiting"
+          f"{', running ' + queue['running'] if queue.get('running') else ''}")
+
+    stdio = info.get("stdio_clients") or []
+    if stdio:
+        print(f"  {DIM}{len(stdio)} client-spawned stdio MCP server(s) — expected; "
+              f"they bypass the queue{RESET}")
+
+    if info["findings"]:
+        print(f"\n  {YELLOW}{len(info['findings'])} finding(s){RESET}")
+        for line in info["findings"]:
+            print(f"    {YELLOW}·{RESET} {line}")
+    else:
+        print(f"\n  {GREEN}Nothing to report.{RESET}")
+    print()
+    return 0 if info["ok"] else 1

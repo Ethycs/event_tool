@@ -12,6 +12,7 @@ Five message sources fan out concurrently into one shared pipeline that filters,
 3. **Every stage is skippable and every drop is recorded.** Rejects are bucketed by the stage that dropped them (`classifier` / `reranker` / `caps` / `llm_past` / `llm_no_events`) so a missing event is always attributable.
 4. **The LLM is the last resort, not the first pass.** A regex gate, a trained classifier, a reranker, and per-source caps all run before extraction, because extraction is the only cost-bearing stage.
 5. **Data paths resolve from one repo-root anchor.** Counting `.parent` calls has silently broken twice (message cache → `src/data/`, classifier models → wrong dir). See `pipeline/harvest.py:40` for the scar tissue.
+6. **A long-lived process must be able to say what code it is running.** `buildinfo.build_info()` on every server surface. Established 2026-08-06 after a service ran four-day-old code undetected: `/healthz` reported events and refresh counts and nothing about itself, so diagnosing it took process enumeration and start-time comparison. Identity is not a nice-to-have on a system with three services and five harvest triggers.
 
 ## 1. Architecture
 
@@ -108,7 +109,8 @@ Message order is deterministic regardless of completion order: results are re-as
 ## Verification
 
 ```powershell
-pixi run test                                   # 906 passed, 0 failed as of 2026-08-01
+pixi run test                                   # 938 passed, 0 failed as of 2026-08-06
+pixi run event-harvester service doctor         # what runs, at what version, what is stray
 pixi run event-harvester jobs list              # the harvest queue: what ran, what waits
 pixi run event-harvester --days 1 --dry-run     # exercise the full pipeline, write nothing external
 pixi run event-harvester site --build-only      # write data/.site/index.html and stop

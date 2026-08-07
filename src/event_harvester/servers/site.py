@@ -237,6 +237,14 @@ def build_app(cfg, *, interval_hours: float = DEFAULT_INTERVAL_HOURS,
     async def healthz(request):
         payload = state.snapshot()
         payload["interval_hours"] = interval_hours
+        # Identity, so "is this service running current code?" is a field
+        # rather than an investigation. See buildinfo.py.
+        try:
+            from event_harvester.buildinfo import build_info
+
+            payload["build"] = build_info()
+        except Exception as e:  # noqa: BLE001 - health must never 500
+            payload["build"] = {"error": f"{type(e).__name__}: {e}"}
         # The site no longer runs harvests, so "is anything happening" is a
         # question about the queue, not about this process.
         try:

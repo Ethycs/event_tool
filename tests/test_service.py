@@ -344,3 +344,167 @@ class TestErrorReporting:
         }):
             out = svc.tail_logs(lines=5)
         assert out["stdout_log"] == ["95", "96", "97", "98", "99"]
+
+
+class TestProcessClassification:
+    """Getting this wrong makes the diagnostic useless.
+
+    The first real run reported twelve unmanaged processes for three actual
+    servers: substring matching put `site` inside filesystem paths, and each
+    `pixi -> .exe -> python` chain counted three times. A check that always
+    cries wolf gets ignored, which is worse than not having it.
+    """
+
+    def test_a_verb_inside_a_path_is_not_a_match(self):
+        assert not svc._looks_like_a_harvester(
+            r'"C:\dev\my-site-project\event_harvester\tool.exe" --help'
+        )
+
+    def test_a_real_server_matches(self):
+        assert svc._looks_like_a_harvester(
+            r'"C:\x\.pixi\envs\default\Scripts\event-harvester.exe" site --port 8800'
+        )
+
+    def test_our_own_enumeration_is_not_a_harvester(self):
+        assert not svc._looks_like_a_harvester(
+            "powershell -Command Get-CimInstance Win32_Process | ConvertTo-Json"
+        )
+
+    def test_stdio_mcp_is_recognised_and_is_not_a_server(self):
+        cmd = r'"C:\x\Scripts\event-harvester.exe" mcp'
+        assert svc.is_stdio_mcp(cmd) is True
+        assert svc._is_server(cmd) is False
+
+    def test_streamable_http_mcp_is_a_server(self):
+        cmd = r'"C:\x\event-harvester.exe" mcp --transport streamable-http --port 8765'
+        assert svc.is_stdio_mcp(cmd) is False
+        assert svc._is_server(cmd) is True
+
+    def test_the_site_and_gateway_are_servers(self):
+        assert svc._is_server('event-harvester.exe site --port 8800')
+        assert svc._is_server('python gateway.py')
+
+    def test_a_process_chain_collapses_to_one_entry(self):
+        """pixi -> .exe -> python is one server, not three findings."""
+        chain = [
+            {"pid": 1, "ppid": 0, "command": "pixi run event-harvester site"},
+            {"pid": 2, "ppid": 1, "command": "event-harvester.exe site"},
+            {"pid": 3, "ppid": 2, "command": "python event-harvester site"},
+        ]
+        leaves = svc._leaves_only(chain)
+        assert [p["pid"] for p in leaves] == [3]
+
+    def test_two_independent_servers_both_survive_collapsing(self):
+        procs = [
+            {"pid": 1, "ppid": 0, "command": "a site"},
+            {"pid": 2, "ppid": 1, "command": "b site"},
+            {"pid": 9, "ppid": 0, "command": "c gateway"},
+        ]
+        assert sorted(p["pid"] for p in svc._leaves_only(procs)) == [2, 9]
+
+    def test_ancestry_walking_survives_a_cycle(self):
+        """PID reuse can produce one; an infinite loop in a health check is fatal."""
+        table = {1: {"pid": 1, "ppid": 2}, 2: {"pid": 2, "ppid": 1}}
+        assert len(svc._ancestors(1, table)) <= 12
+
+
+class TestSurveyReturnsBothWithoutASideChannel:
+    """Hazard #1 in the System Overview is function-attribute side channels."""
+
+    def test_the_survey_returns_a_mapping_with_both_lists(self):
+        table = {
+            10: {"pid": 10, "ppid": 0, "name": "python.exe",
+                 "command": "event-harvester.exe site --port 8800"},
+            11: {"pid": 11, "ppid": 0, "name": "python.exe",
+                 "command": "event-harvester.exe mcp"},
+        }
+        with patch.object(svc, "_process_table", return_value=table), \
+             patch.object(svc, "_service_pids", return_value={}):
+            survey = svc.survey_processes(names=[])
+
+        assert [p["pid"] for p in survey["unmanaged"]] == [10]
+        assert [p["pid"] for p in survey["stdio"]] == [11]
+
+    def test_find_unmanaged_stores_nothing_on_itself(self):
+        table = {10: {"pid": 10, "ppid": 0, "name": "x",
+                      "command": "event-harvester.exe site"}}
+        with patch.object(svc, "_process_table", return_value=table), \
+             patch.object(svc, "_service_pids", return_value={}):
+            svc.find_unmanaged(names=[])
+        assert not hasattr(svc.find_unmanaged, "last_stdio")
+
+    def test_a_service_descendant_is_not_unmanaged(self):
+        """NSSM's service PID is nssm.exe; the worker is a grandchild."""
+        table = {
+            100: {"pid": 100, "ppid": 1, "name": "nssm.exe", "command": "nssm"},
+            101: {"pid": 101, "ppid": 100, "name": "pixi.exe",
+                  "command": "pixi run event-harvester site"},
+            102: {"pid": 102, "ppid": 101, "name": "python.exe",
+                  "command": "event-harvester.exe site --port 8800"},
+        }
+        with patch.object(svc, "_process_table", return_value=table), \
+             patch.object(svc, "_service_pids", return_value={"EventHarvesterSite": 100}):
+            survey = svc.survey_processes(names=["EventHarvesterSite"])
+        assert survey["unmanaged"] == []
+
+    def test_an_enumeration_failure_is_empty_not_an_exception(self):
+        """Diagnostics must never be the reason a teardown aborts."""
+        with patch.object(svc, "_process_table", return_value={}):
+            assert svc.survey_processes(names=[]) == {"unmanaged": [], "stdio": []}
+
+
+class TestDoctorFindings:
+    @staticmethod
+    def _doctor(services, *, survey=None, queue=None):
+        survey = survey or {"unmanaged": [], "stdio": []}
+        queue = queue or {"queued": 0, "running": None, "next": []}
+
+        def fake_status(*, service, name=None):
+            return services[service]
+
+        with patch.object(svc, "status", side_effect=fake_status), \
+             patch.object(svc, "health", return_value={"reachable": None}), \
+             patch.object(svc, "survey_processes", return_value=survey), \
+             patch("event_harvester.jobs.queue_summary", return_value=queue):
+            return svc.doctor()
+
+    def test_a_clean_system_reports_nothing(self):
+        services = {k: {"installed": False} for k in svc.SERVICE_ORDER}
+        out = self._doctor(services)
+        assert out["ok"] is True
+        assert out["findings"] == []
+
+    def test_a_queued_job_with_no_runner_is_two_findings(self):
+        services = {k: {"installed": False} for k in svc.SERVICE_ORDER}
+        out = self._doctor(services, queue={"queued": 1, "running": None, "next": ["j_x"]})
+        joined = " ".join(out["findings"])
+        assert "queued" in joined
+        assert "nothing is draining" in joined
+
+    def test_localsystem_is_flagged_only_where_it_matters(self):
+        services = {
+            k: {"installed": True, "state": "SERVICE_RUNNING",
+                "runs_as": "LocalSystem", "name": svc.SERVICES[k].default_name}
+            for k in svc.SERVICE_ORDER
+        }
+        out = self._doctor(services)
+        flagged = [f for f in out["findings"] if "LocalSystem" in f]
+        assert len(flagged) == 2, "the gateway reads no user credentials"
+        assert not any("Gateway" in f for f in flagged)
+
+    def test_an_unmanaged_server_is_reported(self):
+        services = {k: {"installed": False} for k in svc.SERVICE_ORDER}
+        out = self._doctor(services, survey={
+            "unmanaged": [{"pid": 999, "command": "event-harvester.exe site"}],
+            "stdio": [],
+        })
+        assert any("999" in f for f in out["findings"])
+
+    def test_stdio_clients_are_reported_but_are_not_findings(self):
+        services = {k: {"installed": False} for k in svc.SERVICE_ORDER}
+        out = self._doctor(services, survey={
+            "unmanaged": [],
+            "stdio": [{"pid": 5, "command": "event-harvester.exe mcp"}],
+        })
+        assert out["stdio_clients"]
+        assert out["findings"] == [], "an expected client is not a problem"

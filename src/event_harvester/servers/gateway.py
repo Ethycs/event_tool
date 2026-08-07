@@ -231,7 +231,16 @@ def build_gateway(env: dict[str, str] | None = None, *, name: str = "gateway") -
     async def _healthz(_request):  # pragma: no cover - exercised by run
         from starlette.responses import JSONResponse
 
-        return JSONResponse({"ok": True, "service": "event-harvester-gateway"})
+        from event_harvester.buildinfo import build_info
+
+        # Says nothing about backends or auth — it is reachable by anyone who
+        # can reach the port, including before auth. Build identity is not
+        # sensitive and is the whole reason this endpoint is useful.
+        return JSONResponse({
+            "ok": True,
+            "service": "event-harvester-gateway",
+            "build": build_info(),
+        })
 
     return gateway
 

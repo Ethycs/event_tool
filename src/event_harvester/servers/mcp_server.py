@@ -455,8 +455,21 @@ def build_server(
     @server.tool()
     @traced("mcp.tool.config_summary", tracer_name=_TRACER)
     def config_summary() -> dict[str, Any]:
-        """Return enabled sources, caps, and credential readiness."""
-        return _summarize_config(load_config())
+        """Return enabled sources, caps, credential readiness, and identity."""
+        from event_harvester import jobs
+        from event_harvester.buildinfo import build_info
+
+        summary = _summarize_config(load_config())
+        # Which code this process is running, and whether it owns the queue.
+        # Both were guesswork before: a backend can be months old and look
+        # perfectly healthy, and "is anything draining the queue?" had no
+        # answer short of watching a job sit there.
+        summary["build"] = build_info()
+        summary["runner"] = {
+            "active": runner_active(),
+            "queue": jobs.queue_summary(),
+        }
+        return summary
 
     @server.tool()
     @traced("mcp.tool.harvest_events", tracer_name=_TRACER)
