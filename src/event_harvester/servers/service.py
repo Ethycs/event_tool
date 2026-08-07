@@ -49,6 +49,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -95,6 +96,10 @@ class ServiceSpec:
     #: rather than failing under LocalSystem. The gateway is a pure proxy and
     #: touches none of them.
     needs_user_account: bool = True
+    #: True when the process launches Playwright. Those browsers live under
+    #: the installing user's `%LOCALAPPDATA%`, which LocalSystem does not
+    #: resolve to — see `default_browsers_path`.
+    runs_browser: bool = True
     env: dict[str, str] = field(default_factory=dict)
 
 
@@ -128,6 +133,7 @@ SERVICES: dict[str, ServiceSpec] = {
         depends_on=("mcp",),
         is_cli_verb=False,
         needs_user_account=False,
+        runs_browser=False,
     ),
 }
 
@@ -211,6 +217,32 @@ def build_app_args(
     raise ServiceError(f"no argument builder for service {spec.key!r}")
 
 
+def default_browsers_path() -> str | None:
+    """Where Playwright's browsers actually live, for the installing user.
+
+    **This is the fix for a silent, total failure of the web path.** Playwright
+    installs its browsers under `%LOCALAPPDATA%\\ms-playwright`. Under
+    LocalSystem that resolves to
+    `C:\\WINDOWS\\system32\\config\\systemprofile\\AppData\\Local\\`, where
+    nothing is installed — so **every** standard web source died at
+    `launch_persistent_context` with "Executable doesn't exist", logged once
+    as a single `web source failed` line.
+
+    Only `erobay` survived, because `native_chrome: true` launches the
+    machine-wide Google Chrome instead. Measured 2026-08-06: 1 of 31 sources
+    producing, for five consecutive nightly runs, with no error anyone noticed.
+
+    Pointing `PLAYWRIGHT_BROWSERS_PATH` at the user's install fixes it without
+    a second 650 MB download and without needing the account password —
+    `NT AUTHORITY\\SYSTEM` already has FullControl there.
+    """
+    base = os.environ.get("LOCALAPPDATA")
+    if not base:
+        return None
+    candidate = Path(base) / "ms-playwright"
+    return str(candidate) if candidate.is_dir() else None
+
+
 def build_service_env(
     spec: ServiceSpec,
     *,
@@ -218,22 +250,39 @@ def build_service_env(
     port: int,
     path: str = "/mcp",
     backend_url: str | None = None,
+    browsers_path: str | None = None,
 ) -> dict[str, str]:
     """Non-secret wiring passed to the service as environment.
 
     Deliberately excludes anything secret. `AppEnvironmentExtra` is stored in
     the registry in plaintext, so tokens and OAuth client secrets belong in
-    `.env` — which the process reads from `AppDirectory` — not here.
+    `.env` — which the process reads from `AppDirectory` — not here. A
+    filesystem path is not a secret.
     """
-    if spec.key != "gateway":
-        return dict(spec.env)
-    return {
-        **spec.env,
-        "GATEWAY_HOST": str(host),
-        "GATEWAY_PORT": str(port),
-        "EH_GATEWAY_PATH": path,
-        "EH_MCP_URL": backend_url or f"http://127.0.0.1:{SERVICES['mcp'].default_port}/mcp",
-    }
+    env = dict(spec.env)
+
+    if spec.runs_browser:
+        resolved = browsers_path or default_browsers_path()
+        if resolved:
+            env["PLAYWRIGHT_BROWSERS_PATH"] = resolved
+        # The conda-forge playwright finds its Node driver through
+        # CONDA_PREFIX, which only exists once the env is activated. A service
+        # that launches `event-harvester.exe` directly instead of through
+        # `pixi run` never activates, and every web source then dies with
+        # "Playwright driver executable not found" — a different failure from
+        # the missing-browsers one above, and it appears only after you fix
+        # that. Setting it explicitly makes the service work either way.
+        env.setdefault("CONDA_PREFIX", sys.prefix)
+
+    if spec.key == "gateway":
+        env.update({
+            "GATEWAY_HOST": str(host),
+            "GATEWAY_PORT": str(port),
+            "EH_GATEWAY_PATH": path,
+            "EH_MCP_URL": backend_url
+            or f"http://127.0.0.1:{SERVICES['mcp'].default_port}/mcp",
+        })
+    return env
 
 
 def build_install_commands(
@@ -828,6 +877,24 @@ def doctor(*, host: str = "127.0.0.1") -> dict:
             findings.append(
                 f"{entry['name']} runs as LocalSystem — Discord and Signal "
                 f"will be invisible"
+            )
+
+    # A service that cannot see Playwright's browsers loses every standard web
+    # source at launch, and says so exactly once per run in a line nobody
+    # reads. Five nightly runs went by with 1 of 31 sources producing.
+    for entry in services:
+        if not entry["installed"] or not spec_for(entry["service"]).runs_browser:
+            continue
+        configured = _run(
+            [find_nssm(), "get", entry["name"], "AppEnvironmentExtra"]
+        ).stdout or ""
+        if "PLAYWRIGHT_BROWSERS_PATH" in configured.replace("\x00", ""):
+            continue
+        if (entry.get("runs_as") or "").lower() in ("localsystem", "system"):
+            findings.append(
+                f"{entry['name']} has no PLAYWRIGHT_BROWSERS_PATH and runs as "
+                f"LocalSystem — every non-native-chrome web source will fail "
+                f"at browser launch"
             )
 
     survey = survey_processes()

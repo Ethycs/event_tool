@@ -508,3 +508,69 @@ class TestDoctorFindings:
         })
         assert out["stdio_clients"]
         assert out["findings"] == [], "an expected client is not a problem"
+
+
+class TestTheBrowserEnvironment:
+    """Two separate failures that each silently killed every web source.
+
+    Measured 2026-08-06: five consecutive nightly harvests fetched 1 of 31
+    sources. Only `erobay` survived, because `native_chrome: true` launches
+    the machine-wide Google Chrome instead of Playwright's. Everything else
+    died at launch, logged once per run as a single line.
+    """
+
+    def test_the_browsers_path_is_set_for_services_that_launch_one(self):
+        env = svc.build_service_env(
+            svc.spec_for("site"), host="127.0.0.1", port=8800,
+            browsers_path=r"C:\Users\me\AppData\Local\ms-playwright",
+        )
+        assert env["PLAYWRIGHT_BROWSERS_PATH"].endswith("ms-playwright")
+
+    def test_conda_prefix_is_set_so_the_driver_resolves(self):
+        """The second failure, only visible after fixing the first.
+
+        conda-forge's playwright finds its Node driver through CONDA_PREFIX,
+        which exists only once the env is activated. A service launching
+        `event-harvester.exe` directly never activates.
+        """
+        env = svc.build_service_env(
+            svc.spec_for("mcp"), host="127.0.0.1", port=8765, browsers_path="x",
+        )
+        assert env["CONDA_PREFIX"]
+
+    def test_the_gateway_gets_neither(self):
+        """It proxies. It has never launched a browser."""
+        env = svc.build_service_env(
+            svc.spec_for("gateway"), host="127.0.0.1", port=9000,
+            browsers_path=r"C:\somewhere",
+        )
+        assert "PLAYWRIGHT_BROWSERS_PATH" not in env
+        assert "CONDA_PREFIX" not in env
+
+    def test_the_gateway_still_gets_its_own_wiring(self):
+        env = svc.build_service_env(
+            svc.spec_for("gateway"), host="127.0.0.1", port=9000,
+        )
+        assert env["GATEWAY_PORT"] == "9000"
+        assert env["EH_MCP_URL"]
+
+    def test_a_missing_browsers_directory_sets_nothing(self, monkeypatch):
+        """Better to omit it than to point the service at a path that is not there."""
+        monkeypatch.setenv("LOCALAPPDATA", str(Path("/nonexistent-xyz")))
+        assert svc.default_browsers_path() is None
+
+    def test_the_install_commands_carry_the_environment(self):
+        line = next(c for c in svc.build_install_commands(service="site")
+                    if "AppEnvironmentExtra" in c)
+        joined = " ".join(line)
+        assert "PLAYWRIGHT_BROWSERS_PATH" in joined or "CONDA_PREFIX" in joined
+
+    def test_still_no_secrets_in_the_service_config(self):
+        """A filesystem path is not a secret; a token is. Registry is plaintext."""
+        for key in svc.SERVICE_ORDER:
+            env = svc.build_service_env(
+                svc.spec_for(key), host="127.0.0.1", port=1234, browsers_path="p",
+            )
+            assert not any(
+                k.endswith(("TOKEN", "SECRET", "PASSWORD")) for k in env
+            ), (key, env)
