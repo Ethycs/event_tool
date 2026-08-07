@@ -109,7 +109,7 @@ Message order is deterministic regardless of completion order: results are re-as
 ## Verification
 
 ```powershell
-pixi run test                                   # 938 passed, 0 failed as of 2026-08-06
+pixi run test                                   # 1018 passed, 0 failed as of 2026-08-07
 pixi run event-harvester service doctor         # what runs, at what version, what is stray
 pixi run event-harvester jobs list              # the harvest queue: what ran, what waits
 pixi run event-harvester --days 1 --dry-run     # exercise the full pipeline, write nothing external

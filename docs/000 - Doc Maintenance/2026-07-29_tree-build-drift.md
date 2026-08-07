@@ -141,3 +141,21 @@ Appended, not rewritten.
 **New drift found and fixed this pass.** `00 - System Overview.md`'s concurrency table claimed `interlock.py` + `_interlock_worker.py` gave "one browser-driven session at a time, cross-process". They do not: both are the RyzenAI **NPU local-inference** path, and `llm.py:35` is their only consumer. There is **no cross-process browser serialization anywhere** — native Chrome takes a fixed `--remote-debugging-port=9222`, and the site and MCP backend are separate processes that can both harvest. Corrected in the overview, with the real hazard added as a `known rough edge` row.
 
 Worth noting *how* it was found: not by reading the overview, but by designing against it. A doc that is wrong in a way nobody depends on stays wrong indefinitely; the moment a design leaned on that row, it failed immediately. **Load-bearing prose gets checked; decorative prose does not.**
+
+## Fifth resolution log — 2026-08-07
+
+Appended, not rewritten.
+
+| Gap | State | Note |
+|---|---|---|
+| 4 — `01 - Design` / `00 - Theory` thin | 🟢 **Closed for Design** | `01 - Design` 2 → 4 (`02 - The Control UI`, `03 - The Job Queue`), and the job queue doc went DRAFT → IMPLEMENTED in two days, with a §11 recording what building it changed about the design. Design-before-code, then reconciled — which is the pattern the folder was created for |
+| 5 — `05 - Standards` derived, not ratified | 🟡 Extended again | `EH-STD-WEBSRC-v0` gained the `rss` mode row. Still Normative-in-name |
+| 6 — transcript only partly decomposed | 🔲 Still open | Nobody has read the remaining ~2,900 turns |
+
+**New folder**: `10 - Blueprints` — repeatable operator procedures, indexed in `docs/README.md` and `CLAUDE.md`. The distinction it draws: `04 - Reference` says `web test` exists; a blueprint says run it against three candidate URLs first, and why.
+
+**A drift note about this note's own method.** The 2026-07-30 entry claimed doc-driven work found the defects and the 2026-07-31 counter-observation said only execution found the serious ones. This week adds a third mode, and it is the sharpest of the three: **the defects that mattered most were found by neither reading nor running the tests, but by running the deployed system and reading its logs.**
+
+Nothing in the suite could have found that 30 of 31 web sources were failing at browser launch under LocalSystem — the failure exists only in a service account, and the tests do not have one. Nor that `EventHarvesterSite` was running four-day-old code. Nor that HEAD does not import, because the suite runs against the working tree and nothing checks out a clean HEAD.
+
+The generalisation worth keeping: **a test suite validates the code; it does not validate the deployment.** `service doctor` and `buildinfo` exist because that gap needed an instrument, and both earned themselves within an hour of being written.
