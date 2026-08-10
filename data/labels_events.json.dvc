@@ -1,0 +1,5 @@
+outs:
+- md5: 8a6390fe7176695924a6dc24e5035457
+  size: 2754781
+  hash: md5
+  path: labels_events.json

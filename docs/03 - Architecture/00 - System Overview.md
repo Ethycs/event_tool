@@ -13,6 +13,7 @@ Five message sources fan out concurrently into one shared pipeline that filters,
 4. **The LLM is the last resort, not the first pass.** A regex gate, a trained classifier, a reranker, and per-source caps all run before extraction, because extraction is the only cost-bearing stage.
 5. **Data paths resolve from one repo-root anchor.** Counting `.parent` calls has silently broken twice (message cache → `src/data/`, classifier models → wrong dir). See `pipeline/harvest.py:40` for the scar tissue.
 6. **A long-lived process must be able to say what code it is running.** `buildinfo.build_info()` on every server surface. Established 2026-08-06 after a service ran four-day-old code undetected: `/healthz` reported events and refresh counts and nothing about itself, so diagnosing it took process enumeration and start-time comparison. Identity is not a nice-to-have on a system with three services and five harvest triggers.
+7. **A green suite says the working tree is correct, not that the commit is.** Established 2026-08-07, when `main` was found importing a module that had never been committed — 31 of 70 modules dead from a bare checkout, including every entry point, while `pytest` reported 1018 passed. Tests import the working tree; untracked files satisfy imports the commit cannot. `pixi run check-head` is the separate instrument, and the general form of this axiom is why `service doctor` exists too: **the deployment is a distinct thing from the code, and needs its own checks.**
 
 ## 1. Architecture
 
@@ -110,6 +111,7 @@ Message order is deterministic regardless of completion order: results are re-as
 
 ```powershell
 pixi run test                                   # 1018 passed, 0 failed as of 2026-08-07
+pixi run check-head                             # does a bare checkout import? (axiom 7)
 pixi run event-harvester service doctor         # what runs, at what version, what is stray
 pixi run event-harvester jobs list              # the harvest queue: what ran, what waits
 pixi run event-harvester --days 1 --dry-run     # exercise the full pipeline, write nothing external

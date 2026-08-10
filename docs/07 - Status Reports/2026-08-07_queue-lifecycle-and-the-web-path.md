@@ -7,7 +7,7 @@
 
 ---
 
-## 1. Read this first: `main` does not import
+## 1. Read this first: a fresh clone of `main` runs nothing
 
 **I broke HEAD and did not notice until compaction prep.**
 
@@ -20,16 +20,17 @@ MISSING from HEAD, present on disk:
   tests/test_instagram.py
 ```
 
-**Cause.** Instagram GraphQL work was in the working tree as untracked files plus edits to `__init__.py`, `web_fetch.py`, `cli/commands/web.py` and `web_modes/feed.py`. When I staged those two files for the `rss` commit I picked up its *import lines* without its *modules*. `git add <file>` takes the whole file, including other people's uncommitted edits to it — which is exactly the trap of staging by path in a dirty tree.
+**It is worse than "the top commit does not import."** Measured 2026-08-07 with the new `pixi run check-head`: **31 of 70 modules** fail from a bare checkout, because `web_modes` sits under `sources/__init__.py`, which everything transitively imports. The casualties include `cli`, `cli.dispatch`, `pipeline`, `pipeline.orchestrator`, `servers.mcp_server`, `ui.app` and `watch` — **every entry point the project has**. A fresh clone cannot run the CLI, the pipeline, the MCP server or the UI. The only reason this machine works is that it runs an editable install against the working tree, where the untracked file is present.
 
-**Why the suite did not catch it.** Tests run against the working tree, where `instagram.py` exists. Nothing in this repo imports from a clean checkout of HEAD. Same shape as every other bug this week: green over broken.
+**`origin/main` is clean** (`check-head origin/main` → 70 modules, clean), so the damage is entirely inside the 25 unpushed commits and nothing published is affected. This is recoverable at zero cost to anyone else — provided it is fixed before the push.
 
-**Two ways out, and it is not my call which:**
+**Cause.** Instagram GraphQL work was in the working tree as untracked files plus edits to `__init__.py`, `web_fetch.py`, `cli/commands/web.py` and `web_modes/feed.py`. When I staged those two files for the `rss` commit I picked up its *import lines* without its *modules*. `git add <file>` takes the whole file, including whatever uncommitted edits it already carried — the trap of staging by path in a dirty tree.
 
-1. **Commit the Instagram work** — it is referenced by HEAD already, so this is the smallest step to a working tree. But it is not mine to commit, and it is mid-flight.
-2. **Strip the instagram imports back out of `__init__.py` and `web_fetch.py`** and re-commit — keeps history clean, but breaks the Instagram feature in the working tree until its owner commits.
+**Why the suite did not catch it.** Tests run against the working tree, where `instagram.py` exists. Nothing in this repo imported from a clean checkout. Same shape as every other defect this week: green over broken.
 
-**Do not push `main` until this is resolved.** It is 24 commits ahead of `origin/main` and the top commit does not import.
+**The instrument now exists.** `scripts/check_head_imports.py` (`pixi run check-head [ref]`) exports a ref with `git archive` — which writes only what is committed — and imports every module with the repo's own `src/` removed from `sys.path`. It asserts the package resolved to the export, because an editable install shadowing it would make the check prove nothing. Run it before any push.
+
+**The fix is to commit the Instagram work.** It is one coherent, finished change from 2026-08-06 — 953 + 215 lines of source, 645 lines of tests, its own status report, and doc updates across five files — and HEAD already references it. Committing it is additive and revertible; stripping the imports back out would instead delete a working, tested feature to make a broken commit consistent. Verified before committing: **1018 passed, lint 43**.
 
 ---
 
@@ -114,8 +115,8 @@ before   1 of 31 sources          after   Web sources: 499 messages from 31 sour
 |---|---|
 | Tests | **1018 passed**, 0 failed, ~33 s |
 | Lint | 43 — unchanged all week |
-| Git | `main` **24 ahead** of `origin/main`. **Top commit does not import — see §1** |
-| Services | `EventHarvesterSite` RUNNING (**STALE**, restart it), `EventHarvesterMCP` RUNNING, `EventHarvesterGateway` not installed |
+| Git | `main` **25 ahead** of `origin/main`. **31 of 70 modules do not import — see §1.** `origin/main` itself is clean |
+| Services | `EventHarvesterSite` RUNNING @`c081004` (restarted 2026-08-07, no longer stale), `EventHarvesterMCP` RUNNING, `EventHarvesterGateway` not installed |
 | Queue | empty |
 | Site | `http://192.168.1.67:8800`, firewall rule scoped to LocalSubnet, **no auth** |
 | Not mine | `.dvc/` + 6 pointers, and the **Instagram work** (§1) — neither committed by me |
@@ -126,8 +127,8 @@ before   1 of 31 sources          after   Web sources: 499 messages from 31 sour
 
 ## 8. What the next session should pick up
 
-1. **Resolve §1.** Nothing else should be pushed first.
-2. **Restart `EventHarvesterSite`** — `doctor` says it is running `5600542` while `0cbbae8` is checked out, so it does not have the `rss` mode.
+1. **Resolve §1** by committing the Instagram work. Nothing should be pushed first, and `pixi run check-head` must pass before the push.
+2. ~~Restart `EventHarvesterSite`~~ — **done 2026-08-07.** It was running `5600542` against `c081004`; now `@c0810047d364`, and `doctor`'s findings dropped 3 → 2. It has the `rss` mode.
 3. **Revisit the caps** (§4). The supply problem is fixed; allocation is now the binding constraint and it is a config change, not code.
 4. **`parallel: 1`** — 23.5 minutes for one serial web sweep. Raising it multiplies concurrent browsers on a 7.9 GB box, so it wants a deliberate number.
 5. Still open from before: **roadmap 2.2** (`ui/app.py`, zero tests, mutates TickTick) blocks the Reflex migration and `/admin`.
@@ -137,9 +138,12 @@ before   1 of 31 sources          after   Web sources: 499 messages from 31 sour
 ```powershell
 pixi run test                                   # 1018 passed
 pixi run lint                                   # 43, all pre-existing
-pixi run event-harvester service doctor         # 3 findings, all known
+pixi run check-head                             # 31 modules fail until §1 lands
+pixi run check-head origin/main                 # clean — nothing published is broken
+pixi run event-harvester service doctor         # 2 findings, both known
 pixi run event-harvester jobs list              # queue state
-git ls-tree HEAD src/event_harvester/sources/web_modes/   # instagram.py absent — §1
 ```
+
+**`pixi run` needs the site service stopped** if it has to re-solve the environment: `EventHarvesterSite` holds `Scripts/event-harvester.exe` open, and pixi's editable reinstall fails with `os error 32`. Fall back to `.pixi/envs/dev/Scripts/ruff.exe` / `.pixi/envs/default/python.exe` directly, or stop the service first. Found 2026-08-07, right after restarting it.
 
 `unverified` — no push, no TickTick write, and the `rss` mode has been exercised against one feed only.

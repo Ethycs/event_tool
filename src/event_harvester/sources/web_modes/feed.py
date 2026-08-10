@@ -2,8 +2,14 @@
 
 The dwell loop interleaves scroll, GIF-frame snapshots, and XHR capture,
 so feed mode keeps its own scrolling rather than using the shared
-``_scroll_for_seconds`` helper. Owns the Instagram-GraphQL post walker
-since no other mode uses it.
+``_scroll_for_seconds`` helper.
+
+It used to own the Instagram-GraphQL post walker too. That moved to
+``sources/instagram.py`` on 2026-08-06 when `instagram` mode started
+needing it: the walker was the general half (parse a feed payload) and
+the scroll loop was the specific half, and only one of them was about
+feeds. This mode is now the answer for a site that *has* no API worth
+addressing directly — scroll, capture whatever fires, parse it.
 """
 
 from __future__ import annotations
@@ -52,7 +58,6 @@ def _do_feed_inner(uc, src: dict, max_events: int = 30, page=None, tracer=None, 
     """
     if page is not None:
         page.close()  # need to re-open with interception
-    import json as json_mod
     import time as _time
     from urllib.parse import urlparse
 
@@ -197,7 +202,12 @@ def _do_feed_inner(uc, src: dict, max_events: int = 30, page=None, tracer=None, 
         except Exception as e:  # noqa: BLE001 — capture is duck-typed
             logger.debug("feed-gif assembly failed for %s: %s", name, e)
 
-    # Parse captured API responses
+    # Parse captured API responses. ``seen`` spans every response in the run:
+    # a feed re-serves the same media in a prefetch and again in the timeline
+    # query, so per-response dedup alone posts the same night twice.
+    from event_harvester.sources.instagram import loads_multi, normalize_posts
+
+    seen: set[str] = set()
     for resp_url, resp_body in captured:
         if tracer is not None:
             try:
@@ -206,12 +216,13 @@ def _do_feed_inner(uc, src: dict, max_events: int = 30, page=None, tracer=None, 
                 )
             except Exception:
                 pass
-        try:
-            data = json_mod.loads(resp_body)
-            posts = _extract_posts_from_api(data, resp_url, name)
-            messages.extend(posts)
-        except json_mod.JSONDecodeError:
-            pass
+        for payload in loads_multi(resp_body):
+            messages.extend(
+                normalize_posts(
+                    payload, source_name=name,
+                    channel=f"{name}-feed", seen=seen,
+                ),
+            )
 
     return messages
 
@@ -221,94 +232,21 @@ def _do_feed_inner(uc, src: dict, max_events: int = 30, page=None, tracer=None, 
 def _extract_posts_from_api(data: dict, url: str, source_name: str) -> list[dict]:
     """Extract individual posts from a feed API response.
 
-    Handles Instagram GraphQL timeline responses and other common
-    feed structures. Returns one message dict per post.
+    Thin wrapper over :func:`event_harvester.sources.instagram.normalize_posts`
+    since 2026-08-06. The walker used to live here and keyed on *container*
+    shape — ``edges`` and ``items``, recursing only through dict values, never
+    through lists. A payload nesting its posts one array deeper (which is what
+    Instagram's deferred timeline does) returned zero posts and no error. The
+    shared walker keys on the *object* instead: a dict with a caption and an
+    id is a post, wherever it sits.
 
     ``platform`` is always ``"web"`` per EH-STD-MSG-v0 — the *source* name
     goes in ``channel``. This used to emit ``"platform": "instagram"``, which
     made `CapConfig.get("instagram")` fall through to its default instead of
     applying the `web` cap, so feed sources were silently uncapped.
     """
-    posts = []
-    data_inner = data.get("data", data)
+    from event_harvester.sources.instagram import normalize_posts
 
-    # Walk through all values looking for edges/items with media+caption
-    def _walk(obj, depth=0):
-        if depth > 5 or not isinstance(obj, dict):
-            return
-
-        # Instagram timeline: edges → node → media → caption
-        edges = obj.get("edges", [])
-        if isinstance(edges, list):
-            for edge in edges:
-                node = edge.get("node", {}) if isinstance(edge, dict) else {}
-                media = node.get("media") or {}
-                if not isinstance(media, dict):
-                    # Try explore_story.media
-                    es = node.get("explore_story", {})
-                    media = es.get("media", {}) if isinstance(es, dict) else {}
-
-                if not isinstance(media, dict) or not media:
-                    continue
-
-                user = media.get("user", {})
-                username = user.get("username", "?") if isinstance(user, dict) else "?"
-
-                caption = media.get("caption")
-                text = ""
-                if isinstance(caption, dict):
-                    text = caption.get("text", "")
-                elif isinstance(caption, str):
-                    text = caption
-
-                taken_at = media.get("taken_at", "")
-                media_id = str(media.get("id", media.get("pk", "")))
-
-                if text and len(text) > 10:
-                    ts = ""
-                    if taken_at:
-                        try:
-                            ts = datetime.fromtimestamp(int(taken_at), tz=timezone.utc).isoformat()
-                        except (ValueError, OSError):
-                            pass
-
-                    posts.append({
-                        "platform": "web",
-                        "id": f"ig:{media_id}" if media_id else f"ig:{hash(text[:50])}",
-                        "timestamp": ts or datetime.now(timezone.utc).isoformat(),
-                        "author": f"@{username}",
-                        "channel": f"{source_name}-feed",
-                        "content": text[:2000],
-                    })
-
-        # Also check items arrays (some APIs use items instead of edges)
-        items = obj.get("items", [])
-        if isinstance(items, list):
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                caption = item.get("caption")
-                text = ""
-                if isinstance(caption, dict):
-                    text = caption.get("text", "")
-                user = item.get("user", {})
-                username = user.get("username", "?") if isinstance(user, dict) else "?"
-                media_id = str(item.get("id", item.get("pk", "")))
-
-                if text and len(text) > 10:
-                    posts.append({
-                        "platform": "web",
-                        "id": f"ig:{media_id}" if media_id else f"ig:{hash(text[:50])}",
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "author": f"@{username}",
-                        "channel": f"{source_name}-feed",
-                        "content": text[:2000],
-                    })
-
-        # Recurse into dict values
-        for v in obj.values():
-            if isinstance(v, dict):
-                _walk(v, depth + 1)
-
-    _walk(data_inner)
-    return posts
+    return normalize_posts(
+        data, source_name=source_name, channel=f"{source_name}-feed",
+    )

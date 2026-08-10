@@ -1,4 +1,4 @@
-"""Web command — manage web sources (list/add/test/probe/login)."""
+"""Web command — manage web sources (list/add/test/probe/instagram/replay/login)."""
 
 import logging
 
@@ -22,6 +22,8 @@ async def web_cmd(args, cfg) -> int:
             return _web_test(args, cfg)
         if sub == "probe":
             return _web_probe(args, cfg)
+        if sub == "instagram":
+            return _web_instagram(args, cfg)
         if sub == "replay":
             return _web_replay(args, cfg)
         if sub == "login":
@@ -61,6 +63,8 @@ def _web_list(args, cfg) -> int:
             extras.append(f"query={s['query']!r}")
         if s.get("scroll_seconds"):
             extras.append(f"scroll={s['scroll_seconds']}s")
+        if s.get("accounts"):
+            extras.append(f"{len(s['accounts'])} accounts")
         extras_str = f"  {DIM}[{', '.join(extras)}]{RESET}" if extras else ""
 
         print(f"  {BOLD}{name}{RESET}  {DIM}({mode}){RESET}{extras_str}")
@@ -234,6 +238,126 @@ def _apply_feed_hits(hits, sources_by_url: dict[str, dict]) -> int:
     if skipped:
         print(f"{DIM}{skipped} source(s) left unchanged — see above.{RESET}")
     print()
+    return 0
+
+
+def _web_instagram(args, cfg) -> int:
+    """Read venues' Instagram handles off their own websites.
+
+    The sibling of ``web probe``, for the segment that probe cannot reach.
+    Feed discovery converts a venue that runs a calendar platform; measured
+    on this source list, that was 1 of 27. The other 26 are mostly bars whose
+    real calendar is an Instagram account — and the account is linked from
+    their own footer, so it can be read rather than guessed.
+
+    Guessing is the thing to avoid: Oasis is ``@theoasissf``, not
+    ``@sfoasis``, and a wrong handle produces a source that silently harvests
+    someone else's posts. Hence ``--apply`` adopts only *confident* matches
+    (the handle shares ≥5 characters with the venue's name or domain) and
+    prints the rest for a human.
+    """
+    from event_harvester.sources.instagram import discover_handles
+    from event_harvester.sources.web_fetch import _load_web_sources
+
+    sources = _load_web_sources()
+    targets: list[tuple[str, str]] = []  # (url, venue name)
+
+    category = getattr(args, "category", None)
+    if getattr(args, "urls", None):
+        targets = [(u, "") for u in args.urls]
+    else:
+        for src in sources:
+            url = src.get("url", "")
+            # An ICS feed URL is a file, not a venue page — scan the page it
+            # was discovered from when we recorded one.
+            page_url = src.get("source_page") or url
+            if src.get("mode") == "instagram" or not page_url.startswith("http"):
+                continue
+            if category and src.get("category") != category:
+                continue
+            targets.append((page_url, src.get("name", "")))
+        if not targets:
+            print(f"{DIM}No configured sources with a website to scan.{RESET}")
+            return 0
+        scope = f" in category {category!r}" if category else ""
+        print(f"\n{BOLD}Scanning {len(targets)} configured source(s){scope} "
+              f"for Instagram accounts{RESET}")
+        print(f"{DIM}One request each, no browser.{RESET}\n")
+
+    found: list[tuple[str, object]] = []
+    with tracer.start_as_current_span("cli.web.instagram.scan") as span:
+        span.set_attribute("scan.url_count", len(targets))
+        for url, name in targets:
+            label = name or url
+            prefix = f"  {BOLD}{label:18}{RESET}"
+            cands = discover_handles(
+                url, names=(name,) if name else (),
+                timeout_s=getattr(args, "timeout", 15) or 15,
+            )
+            confident = [c for c in cands if c.confident]
+            if confident:
+                best = confident[0]
+                print(f"{prefix}  {GREEN}@{best.handle}{RESET}  {DIM}(match {best.affinity}, "
+                      f"linked {best.count}x){RESET}")
+                found.append((name, best))
+            elif cands:
+                others = ", ".join(f"@{c.handle}" for c in cands[:3])
+                print(f"{prefix}  {YELLOW}unsure{RESET}  {DIM}{others}{RESET}")
+            else:
+                print(f"{prefix}  {DIM}none{RESET}")
+        span.set_attribute("scan.hit_count", len(found))
+
+    print(f"\n{BOLD}{len(found)}/{len(targets)}{RESET} site(s) name an Instagram account "
+          f"clearly enough to adopt.")
+    if not found:
+        return 0
+    if not getattr(args, "apply", False):
+        print(f"{DIM}Re-run with --apply to add them to the instagram source.{RESET}\n")
+        return 0
+
+    return _apply_instagram_handles(found, getattr(args, "source", "instagram"))
+
+
+def _apply_instagram_handles(found, source_name: str) -> int:
+    """Merge discovered handles into the instagram source's ``accounts`` list."""
+    from event_harvester.sources.web_fetch import _WEB_SOURCES_FILE, _load_web_sources
+    from event_harvester.utils import save_json
+
+    sources = _load_web_sources()
+    src = next((s for s in sources if s.get("name") == source_name), None)
+    if src is None:
+        print(f"{RED}No source named {source_name!r}.{RESET} "
+              f"Add one with mode 'instagram' first, or pass --source.")
+        return 1
+    if src.get("mode") != "instagram":
+        print(f"{YELLOW}{source_name} is mode={src.get('mode')!r}, not 'instagram'.{RESET} "
+              f"Switching it would change what that source harvests — not doing it for you.")
+        return 1
+
+    accounts = list(src.get("accounts") or [])
+    existing = {
+        (a.get("handle") if isinstance(a, dict) else str(a)).lstrip("@").lower()
+        for a in accounts
+    }
+    added = 0
+    for venue, cand in found:
+        if cand.handle.lower() in existing:
+            continue
+        entry = {"handle": cand.handle, "name": venue} if venue else {"handle": cand.handle}
+        accounts.append(entry)
+        existing.add(cand.handle.lower())
+        added += 1
+        suffix = f"  {DIM}({venue}){RESET}" if venue else ""
+        print(f"  {GREEN}added{RESET} @{cand.handle}{suffix}")
+
+    if not added:
+        print(f"{DIM}Nothing new — every confident handle is already configured.{RESET}\n")
+        return 0
+
+    src["accounts"] = accounts
+    save_json(_WEB_SOURCES_FILE, sources)
+    print(f"\n{GREEN}{BOLD}Updated{RESET} {source_name}: {len(accounts)} account(s) "
+          f"in {_WEB_SOURCES_FILE}\n")
     return 0
 
 

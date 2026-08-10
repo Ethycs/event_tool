@@ -218,11 +218,31 @@ Each entry in `data/web_sources.json` has a `scroll_seconds` field that controls
 ```json
 [
   {"url": "https://lu.ma/discover", "name": "luma", "mode": "calendar", "scroll_seconds": 5},
-  {"url": "https://www.instagram.com/", "name": "instagram", "mode": "feed", "scroll_seconds": 25, "api_pattern": "graphql"}
+  {"url": "https://www.eventbrite.com/d/ca--san-francisco/events/", "name": "eventbrite", "mode": "feed", "scroll_seconds": 15, "api_pattern": "api|search|events"}
 ]
 ```
 
 Default if omitted: 5 seconds. The full schema for a web-source entry is [EH-STD-WEBSRC-v0](docs/05%20-%20Standards/EH-STD-WEBSRC-v0%20—%20Web%20Source%20&%20Profile%20Config.md).
+
+## Instagram
+
+`mode: "instagram"` asks named accounts for their posts over Instagram's own
+GraphQL, instead of scrolling the ranked home feed and hoping. Requires a
+logged-in session (`pixi run event-harvester web login`).
+
+The account list is read off the venues rather than guessed — venues link
+their own Instagram from their own site:
+
+```powershell
+pixi run event-harvester web instagram --category venues          # report
+pixi run event-harvester web instagram --category venues --apply  # adopt
+```
+
+Only *confident* matches are adopted (the handle shares ≥5 characters with
+the venue's name or domain), because a wrong handle harvests a stranger's
+posts forever and never errors. Measured 2026-08-06: 17 of 23 venue sites
+name their account clearly enough. Details:
+[docs/03 - Architecture/03 - Sources — Web.md](docs/03%20-%20Architecture/03%20-%20Sources%20—%20Web.md).
 
 ## Parallel web fetch
 

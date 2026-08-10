@@ -1,0 +1,5 @@
+outs:
+- md5: 12f4c9fbb3b968195a1f415368b5c830
+  size: 609657
+  hash: md5
+  path: classifier_email.pkl

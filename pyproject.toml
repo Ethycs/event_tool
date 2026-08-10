@@ -90,5 +90,8 @@ gateway = "python gateway.py"
 
 [tool.pixi.feature.dev.tasks]
 test = "pytest -v"
+# Does a bare checkout import? pytest runs against the working tree, so it
+# cannot answer this -- see the docstring for the commit that proved it.
+check-head = "python scripts/check_head_imports.py"
 lint = "ruff check src/ tests/"
 format = "ruff format src/ tests/"

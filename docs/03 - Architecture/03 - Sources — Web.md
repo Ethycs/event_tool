@@ -1,6 +1,6 @@
 # Sources — Web
 
-**Status:** CURRENT · **Date:** 2026-07-30 (added `feed_probe.py`, then `web_steps.py`/`web_explore.py`) · **Applies to:** `src/event_harvester/sources/web_fetch.py`, `uc_browser.py`, `web_session.py`, `web_utils.py`, `feed_probe.py`, `web_steps.py`, `web_explore.py`, `src/event_harvester/sources/web_modes/{__init__,calendar,feed,search,raw,ics,chat,steps}.py`, `src/event_harvester/web_primitives.py`, `src/event_harvester/observability/hints.py`, `data/web_sources.json`, `ext/helpers/extract_event_links.js` · **Depends on:** `docs/04 - Reference/Universal Controller Guide.md`
+**Status:** CURRENT · **Date:** 2026-08-06 (added `instagram.py` + `mode: "instagram"`) · **Applies to:** `src/event_harvester/sources/web_fetch.py`, `uc_browser.py`, `web_session.py`, `web_utils.py`, `feed_probe.py`, `instagram.py`, `web_steps.py`, `web_explore.py`, `src/event_harvester/sources/web_modes/{__init__,calendar,feed,search,raw,ics,chat,steps,instagram}.py`, `src/event_harvester/web_primitives.py`, `src/event_harvester/observability/hints.py`, `data/web_sources.json`, `ext/helpers/extract_event_links.js` · **Depends on:** `docs/04 - Reference/Universal Controller Guide.md`
 
 The web fetch path turns `data/web_sources.json` into a list of message dicts by driving one or more headed Chromium/Chrome instances through Universal Controller (UC), routing each source through a mode-specific handler in `web_modes/`. `web_fetch.fetch_web_sources` is the sole entry point: it splits sources into a parallel pool of "standard" browsers plus one serial pool for `native_chrome` (Cloudflare) sources, and retries Cloudflare-blocked standard sources through native Chrome afterward. Everything downstream (`pipeline/harvest.py`) treats the return value as a flat `list[dict]` of chat-shaped messages, regardless of which mode produced them.
 
@@ -49,11 +49,52 @@ Accepted cost: a venue whose only feed legitimately holds one upcoming event rea
 
 **Measured result** (`web probe` over all 27 non-ICS sources, 2026-07-30): **1 hit** — `sf-eagle`, 27 upcoming events via `webcal://wp.sf-eagle.com/events/?ical=1`. The 11 `raw` venues are bare homepages for bars that mostly use Instagram or bespoke designs rather than a calendar platform, so the platform-fingerprint payoff is much smaller here than the Powerhouse/DNA Lounge precedent suggested. The probe is cheap and correct; the SF gay-bar segment simply is not WordPress-shaped.
 
+## Module: `instagram.py` — record the query, then ask it yourself
+
+**Added 2026-08-06.** **Domain:** given a handle, return that account's recent posts. **Runs at:** harvest (`mode: "instagram"`), plus a browser-free discovery half at `web instagram`. **Inputs:** a UC browser with a logged-in session, and a list of accounts. **Outputs:** message records.
+
+**Why it exists.** §4.2 of the roadmap: the 11 bare-homepage `raw` venues do not run a calendar platform, so `feed_probe` cannot reach them — SF gay bars publish their calendar to Instagram. The pre-existing Instagram source could not serve them either, because it read the **home feed**: Meta ranks it, so "did we see this week's Oasis lineup" had no answer, only a probability. Naming the accounts is what turns Instagram from a lottery into a source.
+
+**The GraphQL half.** Instagram's web client talks to `/graphql/query` with *persisted queries* — a numeric `doc_id`, a JSON `variables` blob, and a dozen session parameters (`lsd`, `jazoest`, `__csr`, `av`). Nothing here is hardcoded. `QueryRecorder` attaches to the page **before** navigation, records the requests the real client issues, and `GraphQLQuery.with_cursor` replays one with `variables.after` patched to the cursor found in the last response — which is precisely what the page does when you scroll, minus the scrolling.
+
+**Recording rather than hardcoding is the load-bearing choice.** Every hand-rolled Instagram client dies the day Meta rotates a `doc_id` or adds a required parameter. Here those parameters are whatever the page just sent, because the recorded body is reused verbatim and exactly one field is changed. A rotation costs one run's worth of staleness, not a rewrite. The replay runs as `fetch(..., {credentials: "include"})` **inside the page** rather than through a Python HTTP client, so cookies, TLS fingerprint and origin belong to the session that was already there.
+
+**Two walkers were replaced by one, and the old one had a silent hole.** The pre-existing extractor keyed on *container* shape — `edges` and `items` — and recursed only through dict values, **never through lists**. A payload nesting posts one array deeper (which is what the deferred timeline does) yielded zero posts and no error, indistinguishable from a venue that posted nothing. `iter_media` keys on the *object* instead — a dict carrying a caption and an id is a post, wherever it sits — and walks lists. It yields in document order, because a timeline arrives newest-first and every cap downstream trusts that.
+
+| Hard constraint | Value | Why |
+|---|---|---|
+| Replayed pages per account | `max_pages` (default 1), hard cap `MAX_PAGES_HARD_CAP = 8` | Each is a request Instagram did not ask for; a config typo should not become a hundred |
+| Accounts per run | `max_accounts`, default **25** | 25 accounts is already ~3 min of paced loading |
+| Delay between requests | `request_delay_s` **2.5s**, `account_gap_s` **3s** | Rate discipline is the design constraint, not throughput |
+| Posts kept per account | `max_posts`, default 24 | Trimmed again by `max_events` — see below |
+| Caption floor | 10 chars | Below that it is an emoji, not an announcement |
+
+**A login wall raises rather than returns empty**, and stops the whole source. Empty and logged-out are the same `[]` downstream, and only one of them is fixed by `web login`; walking twenty profiles into the same wall is also the pattern that gets a session challenged.
+
+**`max_events` (30) against 17 venues is the interesting cap.** Concatenate-and-truncate would spend the entire budget on the first two accounts in config order, so the same two venues would be the only ones ever seen and the other fifteen would look like they never post. `_interleave` takes every venue's newest post before any venue's second. The shipped config therefore sets `max_pages: 0` — a profile load already carries ~12 posts and the trim keeps ~2, so a replayed page would be fetched and discarded. Pagination earns its keep on a *narrow* account list (one venue, a fortnight of history), which is what the knob is for.
+
+**`unverified`: the replay path has not been run against a live logged-in session** — that needs credentials this repo does not hold. It is written to degrade to the recorded first page (the old behaviour, parsed better) on a non-200, a non-JSON body, or a missing cursor, and `tests/test_instagram.py` pins that degradation with a fake page. The recording half, the walker, the interleave, and discovery are all exercised; the live `fetch` is not.
+
+### Handle discovery — `discover_handles`, and why it cannot validate
+
+The sibling of `feed_probe`, for the segment `feed_probe` measured itself unable to serve. Venues link their own Instagram from their own footer, so the account list is **read off the venues, never guessed** — and guessing is the specific thing to avoid, because Oasis is `@theoasissf`, not `@sfoasis`, and a wrong handle harvests a stranger's posts forever without ever erroring.
+
+The structural difference from `feed_probe` is that **validation is impossible here**. A feed candidate is proven by fetching and parsing it; a handle cannot be. Checked 2026-08-06: logged out, `instagram.com/<anything>/` returns **200 with an identical JS shell** for a real account and for `zzzznotarealhandle999` alike. Ranking therefore has to carry the weight validation carries there:
+
+- **Reserved-path and shape filters** drop `/p/`, `/explore/`, and CDN fragments like `t51.2885` that match the same regex.
+- **Affinity** — the longest run of characters shared with the venue's name or domain, punctuation-insensitive — is the ranking key, and `MIN_AFFINITY = 5` is the adoption threshold.
+
+**Frequency alone would have been wrong**, which is the finding that set the threshold: `beauxsf.com` links `@beauxdragbrunch` 18 times and its own `@lesbeauxsf` twice. Affinity picks the venue; count picks the party it promotes.
+
+**Measured** (`web instagram --category venues`, 2026-08-06): **17 of 23** venue sites name an account clearly enough to adopt, against `feed_probe`'s 1 of 27 on the same segment. The six misses (`hi-tops`, `badlands`, `the-edge`, `wild-side-west`, `mothership`, `powerhouse`) link no handle in server-rendered HTML.
+
+`known rough edge`: like `feed_probe`, the scan is regex over HTML with no parser dependency. Unlike `feed_probe`, a bad match cannot be caught by validation — only by the affinity threshold and a human reading the `unsure` lines. `--apply` adopts confident matches only and prints the rest.
+
 ## Modes
 
-**The modes are** `calendar`, `feed`, `search`, `raw`, `ics`, `chat`, and — since 2026-07-30 — `steps`. Each has its own file, OTel span, and dispatch branch in `fetch_web_sources`; `web_modes/__init__.py` re-exports them and `__all__` is the count.
+**The modes are** `calendar`, `feed`, `search`, `raw`, `ics`, `chat`, `steps` (2026-07-30), and `instagram` (2026-08-06). Each has its own file, OTel span, and dispatch branch in `fetch_web_sources`; `web_modes/__init__.py` re-exports them and `__all__` is the count.
 
-*Two places once said "five" and were fixed 2026-07-29. The durable half of that fix was deleting the number from the `web_modes/__init__.py` docstring and pointing at `__all__` — this section is now on its third count, which is the argument.*
+*Two places once said "five" and were fixed 2026-07-29. The durable half of that fix was deleting the number from the `web_modes/__init__.py` docstring and pointing at `__all__` — this section is now on its fourth count, which is the argument.*
 
 **`steps` is the mode the other browser modes are special cases of.** `calendar`, `feed` and `search` each encode one fixed walk in Python; `steps` reads its walk from the source config (`web_steps.replay`), so a site matching none of the three no longer needs a new module — it needs a route. It is never auto-detected, and `web_utils._detect_mode` is unchanged: a route only runs when someone configured one.
 
@@ -61,6 +102,7 @@ Accepted cost: a venue whose only feed legitimately holds one upcoming event rea
 |---|---|---|---|---|
 | `calendar` | Load page, extract date↔link pairs (DOM-graph or Calcium HTML), fetch each detail page in parallel | `mode: "calendar"`, or auto-detect finds ≥3 event links | Browser page (Chromium+UC or native Chrome) | `scroll_seconds`, `max_pages` (pagination), `native_chrome`, `cooldown_hours` |
 | `feed` | Re-open page with response interception, scroll while capturing XHR/GraphQL, parse posts from captured JSON and/or extracted links | `mode: "feed"` | Browser page, own re-opened tab (`open_with_intercept`) | `api_pattern` (regex), `scroll_seconds`, `api_only` (skip link-extraction path) |
+| `instagram` | Open each configured account's profile, replay the recorded GraphQL query for further pages, normalise posts | `mode: "instagram"` — **never auto-detected** | Own page per account (recorder attached pre-navigation); dispatched **before** the shared page-open | `accounts`, `max_pages`, `max_posts`, `max_accounts`, `request_delay_s`, `account_gap_s`, `include_home_feed` |
 | `search` | Detect search bar, fill `query`, scroll, extract event links from results | `mode: "search"`, or auto-detect finds a search box + `query` set | Browser page | `query`, `scroll_seconds`, `max_events` |
 | `raw` | Load page, scroll, strip HTML to text — last-resort fallback | `mode: "raw"`, or auto-detect finds nothing else | Browser page | `scroll_seconds` |
 | `ics` | Fetch an iCalendar feed over plain HTTP(S) via `requests`, parse `VEVENT`s with `icalendar`, one message per event | `mode: "ics"`, or URL is `webcal://`/`webcals://`/`*.ics` (shortcut in `_detect_mode`) | **No browser** — plain HTTP in the worker thread | `timeout_s` (default 20) |
@@ -68,7 +110,7 @@ Accepted cost: a venue whose only feed legitimately holds one upcoming event rea
 
 Auto-mode detection (`web_utils.py:_detect_mode`) order: ICS URL shortcut → `_extract_event_links` ≥3 → `uc.detect(page, "search")` + `src.get("query")` → `uc.get_feed_items` ≥3 items >30 chars → fallback `raw`. A saved UC "signature" (`mode:<name>`) from a prior successful run is checked *before* auto-detection runs (`web_fetch.py:220-236`).
 
-**Undocumented-mode finding:** `ics` doesn't need a browser at all, but `fetch_web_sources`'s outer dispatch still enters the `_process_group`/`UCBrowser` context and iterates the source inside it — the `ics.py` module docstring itself flags this: "~1s of wasted setup per ICS source until we refactor to skip browser allocation for browser-free modes" (`ics.py:8`). `chat` sources are dispatched the same way — before the page-open branch — so they also skip the shared `_wait_cloudflare`/auto-detect path, but unlike `ics` they still open a page via `uc.open(...)` inside `_do_chat`.
+**Undocumented-mode finding:** `ics` doesn't need a browser at all, but `fetch_web_sources`'s outer dispatch still enters the `_process_group`/`UCBrowser` context and iterates the source inside it — the `ics.py` module docstring itself flags this: "~1s of wasted setup per ICS source until we refactor to skip browser allocation for browser-free modes" (`ics.py:8`). `chat` sources are dispatched the same way — before the page-open branch — so they also skip the shared `_wait_cloudflare`/auto-detect path, but unlike `ics` they still open a page via `uc.open(...)` inside `_do_chat`. `instagram` (2026-08-06) joins that group for a third reason: it opens one page *per account* with a recorder attached before navigation, so a shared pre-opened page would be a page it immediately closes — which is exactly what `feed` mode still does and documents as interface-consistency overhead.
 
 ## Parallel-fetch model and why native-chrome stays serial
 
@@ -102,7 +144,9 @@ One JSON array of source objects (`_load_web_sources` in `web_utils.py:83-88`, f
 | `cooldown_hours` | number (default `-1`, i.e. cooldown check skipped in the `_is_on_cooldown` call path *unless* `>= 0`) | `fetch_web_sources` (pre-filter step) | Per-source override of the 1-hour default cooldown window. `-1` (absent) effectively disables cooldown filtering for that source — see honesty marker below. |
 | `max_pages` | int (default `0`) | `calendar` only | Number of pagination "next" clicks to follow after the first page. |
 | `timeout_s` | int | `ics` (HTTP timeout, default 20), `chat` (response wait, default 45) | Per-mode timeout override; unrelated to the shared `timeout_ms` browser-nav timeout. |
-| `category` | str | **not read by any file in this subsystem** | Present on ~24 of 31 entries in `data/web_sources.json` (all tagged `"venues"`) but grep across `src/event_harvester/` shows no code path consuming it — `dead code?` / forward-compat field, unverified whether another subsystem (e.g. a report grouping view) reads it. |
+| `accounts` | list[str \| dict] | `instagram` only (`web_modes/instagram.py:_normalize_accounts`) | Handles to walk. Accepts `"studsf"`, `"@studsf"`, a profile URL, or `{"handle": …, "name": …}` — the dict form keeps the venue's name, which `@theoasissf` alone would not tell you. Written by `web instagram --apply`. |
+| `max_posts` / `max_accounts` / `request_delay_s` / `account_gap_s` / `include_home_feed` / `home_max_pages` | int / int / float / float / bool / int | `instagram` only | Per-account post cap (24), account-list ceiling (25), delay between replays (2.5s) and between accounts (3s), whether to also read the ranked home feed (defaults to *true only when `accounts` is empty*), home-feed page count (2). |
+| `category` | str | `cli/commands/web.py:_web_instagram` — **`--category` scan filter only**; still unread on the harvest path | Present on ~24 of 31 entries (all `"venues"`). Since 2026-08-06 it has exactly one reader, and it is a CLI filter rather than harvest behaviour: `web instagram --category venues` scopes the scan so a ticketing platform's corporate account is not adopted as if it were a venue's calendar. |
 
 **BUG (confirmed by `tests/test_web_fetch_helpers.py:test_load_web_sources_when_file_missing_returns_empty_dict`):** `_load_web_sources()` calls `load_json(_WEB_SOURCES_FILE, default=None)`. `event_harvester.utils.load_json` internally does `return default if default is not None else {}` on a missing/corrupt file — so passing `default=None` actually makes a missing file return `{}`, never `None`. `_load_web_sources`'s own fallback check (`return sources if sources is not None else list(_DEFAULT_SOURCES)`) therefore never fires: a missing `data/web_sources.json` silently yields an **empty dict**, not the 7-source `_DEFAULT_SOURCES` list the docstring promises. Currently latent because the file exists in the repo; would bite anyone who deletes/renames it.
 
@@ -190,7 +234,13 @@ Dead/removed event pages are filtered via `_is_dead_page` (regex over the first 
 
 Before detail pages are even fetched, `_filter_known_links` drops links whose fingerprint (`event_harvester.pipeline.event_match`) is already `approved` or `declined` — matched by exact URL first, then a fuzzy title+date score ≥2. Fingerprints with no `status` (or `status: "auto"`) are deliberately **not** treated as "known" — `_save_link_fingerprint` is now a documented no-op (`web_utils.py:115-127`) specifically because eagerly fingerprinting every fetched page used to hide 90%+ of a calendar's events after the first run; fingerprinting now only happens in the approve/decline/ticktick-push paths elsewhere in the pipeline.
 
-Feed mode has a third content path with no JSON-LD/text-extraction step at all: captured XHR/GraphQL response bodies are parsed as JSON and walked by `_extract_posts_from_api` (`feed.py:219-307`), which recursively descends into `edges`/`node`/`media`/`caption` (Instagram GraphQL shape) or `items`/`caption` shapes up to depth 5, emitting one message per post with `id: "ig:<media_id>"`.
+Feed and Instagram modes share a third content path with no JSON-LD/text-extraction step at all: captured response bodies are parsed as JSON and walked by `instagram.normalize_posts`, emitting one message per post with `id: "ig:<media_id>"`. `feed._extract_posts_from_api` is a thin wrapper over it since 2026-08-06 (it owned the walker before that). Three things changed in the move, all of which affect `feed` sources too:
+
+1. **Lists are walked.** The old walker recursed through dict values only, so posts nested inside an array were invisible — silently, since the result was an empty list rather than an error.
+2. **`content` leads with the post permalink** (`https://www.instagram.com/p/<code>/`), then location, then the caption. `analysis.build_prompt` truncates content to 400 chars, so a link appended after a long caption is a link the LLM never sees — and an Instagram event nobody can click is an event nobody can check.
+3. **Multi-chunk bodies parse.** Deferred GraphQL arrives as newline-delimited JSON objects; `json.loads` on the whole body raised `JSONDecodeError`, which the caller caught and dropped — so the responses carrying the deferred timeline were exactly the ones discarded. `loads_multi` falls back to line-by-line.
+
+Injected ads (`ad_id`/`is_ad`/`injected`) are dropped, and a `seen` set spans every response in a run because a feed re-serves the same media in a prefetch and again in the timeline query.
 
 ## Failure modes (by module)
 
@@ -200,7 +250,11 @@ Feed mode has a third content path with no JSON-LD/text-extraction step at all: 
 | `web_fetch.py` | Exception anywhere inside one source's processing | Caught per-source in `_process_group`'s `try/except`; logged, OTel span records the exception, loop continues to the next source in that group — one bad source never aborts the whole run |
 | `web_modes/calendar.py` | Cloudflare still blocking after `_wait_cloudflare` | Page closed, `[]` returned (no retry queued from inside a mode handler — retry only happens for the *initial* page-open Cloudflare check in `fetch_web_sources` itself) |
 | `web_modes/feed.py` | `page` param passed in but feed needs interception from first load | Pre-opened page is closed and a fresh one opened via `open_with_intercept` — documented in the module docstring as "interface consistency" overhead |
-| `web_modes/feed.py` | Captured response body isn't valid JSON | `json.JSONDecodeError` caught per-response, that response silently skipped |
+| `web_modes/feed.py` | Captured response body isn't valid JSON | Tried as one object, then line-by-line (`loads_multi`); a body that parses as neither yields no posts and is skipped |
+| `web_modes/instagram.py` | Login wall on any account | `InstagramLoginRequired` raised by `harvest_account`, caught by the mode, **whole source stops** — remaining accounts are not visited, and the log names the fix (`web login`) |
+| `web_modes/instagram.py` | One account fails (private, renamed, timeout) | Caught per-account, logged, the walk continues — a renamed venue must not cost the other sixteen |
+| `sources/instagram.py` | Replay returns non-200, non-JSON, or no cursor | Cursor is cleared *before* the request, so the loop ends rather than re-asking; the recorded first page is still returned. `paginate` returns the count of pages that actually landed |
+| `sources/instagram.py` | No GraphQL recorded at all for an account | Warns that the profile may be private, renamed, or served from cache — distinguishes "asked and got nothing" from "never asked" |
 | `web_modes/search.py` | Login wall detected (`uc.has_login_wall`) | Logged warning, page closed, `[]` returned immediately — no partial scrape attempted |
 | `web_modes/ics.py` | HTTP fetch fails (non-2xx, network error) or `Calendar.from_ical` raises | Logged, `[]` returned; **`anti-bot dependent`: N/A** — plain HTTP, no browser, so this mode is immune to Cloudflare/bot-detection failures that affect every other mode |
 | `web_modes/chat.py` | Login wall, or response `< 50` chars | `[]` returned with a warning; a *short but real* answer under 50 chars (e.g. "no events found") is indistinguishable from a failed/empty response — `fragile` |
@@ -221,6 +275,17 @@ This drives the same auto-detect + dispatch path as a live harvest (minus cooldo
 
 ```bash
 pixi run event-harvester web test webcal://cdn.dnalounge.com/calendar/dnalounge.ics
+```
+
+For the Instagram source, the two halves verify separately — deliberately, since only one of them needs a session:
+
+```powershell
+# Discovery: browser-free, no session, safe to run any time.
+pixi run event-harvester web instagram --category venues
+
+# Harvest: needs a logged-in session, opens one page per account.
+pixi run event-harvester web login
+pixi run event-harvester --only web --web-source instagram --no-cooldown
 ```
 
 `unverified`: neither command was executed as part of writing this document (read-only research pass); behavior above is derived from static reading of `web_fetch.py`, `web_utils.py`, `web_modes/*.py`, `browser.py`, and the test suite (`tests/test_web_fetch_helpers.py`, `tests/test_web_fetch_parallel.py`, `tests/test_web_primitives.py`, `tests/test_web_ics_diag.py`), not from running the harvester.
