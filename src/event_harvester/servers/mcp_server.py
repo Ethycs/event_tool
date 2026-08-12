@@ -229,6 +229,41 @@ def _save_latest_events(
     source_counts: dict[str, int],
     links: list[dict[str, Any]],
 ) -> None:
+    """Write the shared event cache — unless doing so would destroy it.
+
+    **An outage must not look like an empty night.** On 2026-08-12 the OpenAI
+    account ran out of credit, every extraction batch returned 429, the run
+    reported `ok` with 0 events, and this function wrote that over a cache
+    holding 251. They were unrecoverable: the job records keep counts, not
+    events.
+
+    So a run that extracted nothing *and* failed to reach the model leaves the
+    previous cache alone. The two conditions together are the test — a genuine
+    quiet night still writes its zero, and a partial outage (some batches
+    answered) still writes what it got, because that is strictly newer than
+    what is there. Only the total-failure case is refused, and it is refused
+    loudly rather than silently.
+
+    This is the cache-level form of the property `servers/site.py` already has
+    at the page level: a failed refresh keeps serving the last good page.
+    """
+    # `stats["rejects"]` holds counts here and lists elsewhere in the pipeline;
+    # accept either rather than depend on which caller got there first.
+    raw = (stats.get("rejects") or {}).get("llm_errors") or 0
+    errors = raw if isinstance(raw, int) else len(raw)
+    if not events and errors:
+        existing = load_json(LATEST_EVENTS_FILE, default={}) or {}
+        held = len(existing.get("events") or [])
+        if held:
+            logger.error(
+                "Refusing to overwrite %d cached event(s) with an empty result: "
+                "%d message(s) never reached the model. The cache is unchanged "
+                "and the previous events are still being served. Fix the LLM "
+                "backend and re-run; the message cache makes that cheap.",
+                held, errors,
+            )
+            return
+
     save_json(
         LATEST_EVENTS_FILE,
         {

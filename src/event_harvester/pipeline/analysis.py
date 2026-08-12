@@ -11,7 +11,8 @@ logger = logging.getLogger("event_harvester.pipeline.analysis")
 tracer = get_tracer("event_harvester.pipeline.analysis")
 
 # The five reject buckets every caller expects, in pipeline order.
-REJECT_BUCKETS = ("classifier", "caps", "reranker", "llm_past", "llm_no_events")
+REJECT_BUCKETS = ("classifier", "caps", "reranker", "llm_past", "llm_no_events",
+                  "llm_errors")
 
 
 def empty_rejects() -> dict[str, list[dict]]:
@@ -439,6 +440,7 @@ def _extract_events_cloud(
     raw_outputs: list[str] = []
     llm_dropped: list[dict] = []
     llm_no_events: list[dict] = []  # messages in batches that yielded 0 events
+    llm_errors: list[dict] = []     # messages in batches that never got an answer
 
     def _process_batch_with_raw(batch, i):
         with tracer.start_as_current_span(f"extract.batch.{i}") as span:
@@ -465,22 +467,42 @@ def _extract_events_cloud(
                 span.set_attribute(
                     "events.source_linked", sum(1 for t in tasks if t.get("_source_ids")),
                 )
-                return tasks, raw, dropped, batch if not tasks else []
+                return tasks, raw, dropped, batch if not tasks else [], []
             except Exception as e:
                 logger.exception("Batch failed (%s)", type(e).__name__)
                 span.set_attribute("error.message", str(e))
                 span.record_exception(e)
-                return [], "", [{"title": "(batch error)", "reason": str(e)}], batch
+                # The batch goes to `llm_errors`, NOT `llm_no_events`. They are
+                # different facts — "the model read these and found nothing"
+                # versus "the model never saw these" — and conflating them cost
+                # 251 events on 2026-08-12: the API returned 429 for every
+                # batch, all 20,716 messages were filed as "no events", the run
+                # reported ok with 0 events, and that empty result overwrote a
+                # full cache. Axiom 3 says every drop is attributable; a drop
+                # attributed to the wrong stage is worse than an unattributed
+                # one, because it reads as a finding.
+                return [], "", [], [], batch
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
         futures = [pool.submit(_process_batch_with_raw, b, i) for i, b in enumerate(batches)]
         for f in concurrent.futures.as_completed(futures):
-            tasks, raw, dropped, no_event_msgs = f.result()
+            tasks, raw, dropped, no_event_msgs, error_msgs = f.result()
             all_tasks.extend(tasks)
             llm_dropped.extend(dropped)
             llm_no_events.extend(no_event_msgs)
+            llm_errors.extend(error_msgs)
             if raw:
                 raw_outputs.append(raw)
+
+    if llm_errors:
+        # Loud, and phrased as the operational fact it is. The 429 storm was
+        # visible only as a stack trace per batch in a log nobody reads during
+        # a run; the summary said "0 events" and looked like a quiet night.
+        logger.error(
+            "Extraction incomplete: %d of %d message(s) across %d batch(es) never "
+            "reached the model. This is an outage, not an empty result.",
+            len(llm_errors), len(messages), len(batches),
+        )
 
     if not all_tasks and raw_outputs:
         logger.warning(
@@ -497,7 +519,8 @@ def _extract_events_cloud(
         span.set_attribute("events.in", len(all_tasks))
         span.set_attribute("events.out", len(unique))
 
-    return "", unique, {"llm_past": llm_dropped, "llm_no_events": llm_no_events}
+    return "", unique, {"llm_past": llm_dropped, "llm_no_events": llm_no_events,
+                        "llm_errors": llm_errors}
 
 
 def attach_source_ids(events: list[dict], batch: list[dict]) -> None:
@@ -582,6 +605,7 @@ def _extract_events_local(
     summary = ""
     llm_dropped: list[dict] = []
     llm_no_events: list[dict] = []
+    llm_errors: list[dict] = []
 
     for i in range(0, len(messages), batch_size):
         batch = messages[i : i + batch_size]
@@ -605,7 +629,9 @@ def _extract_events_local(
                 span.set_attribute("error.message", str(e))
                 span.record_exception(e)
                 llm_dropped.append({"title": "(batch error)", "reason": str(e)})
-                llm_no_events.extend(batch)
+                # `llm_errors`, not `llm_no_events` — see the same branch in
+                # `_extract_events_cloud` for what conflating them cost.
+                llm_errors.extend(batch)
                 continue
 
             batch_summary, batch_tasks, batch_dropped = _parse_event_ini(raw)
@@ -627,7 +653,15 @@ def _extract_events_local(
         span.set_attribute("events.in", len(all_tasks))
         span.set_attribute("events.out", len(unique))
 
-    return summary, unique, {"llm_past": llm_dropped, "llm_no_events": llm_no_events}
+    if llm_errors:
+        logger.error(
+            "Extraction incomplete: %d of %d message(s) never reached the model. "
+            "This is an outage, not an empty result.",
+            len(llm_errors), len(messages),
+        )
+
+    return summary, unique, {"llm_past": llm_dropped, "llm_no_events": llm_no_events,
+                             "llm_errors": llm_errors}
 
 
 def _parse_event_ini(raw: str) -> tuple[str, list[dict], list[dict]]:

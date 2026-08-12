@@ -381,8 +381,13 @@ def _print_rejects(rejects: dict[str, list]) -> None:
         "caps": "Per-source caps",
         "llm_past": "LLM (past events)",
         "llm_no_events": "LLM (no events extracted)",
+        # Not a rejection at all — these never reached the model. Named
+        # separately because reading them as "no events" is what turned a
+        # billing outage into a silent zero-event harvest on 2026-08-12.
+        "llm_errors": "LLM UNREACHABLE (never asked)",
     }
-    stages = ("classifier", "reranker", "caps", "llm_past", "llm_no_events")
+    stages = ("classifier", "reranker", "caps", "llm_past", "llm_no_events",
+              "llm_errors")
 
     total_rejected = sum(len(rejects.get(s, [])) for s in stages)
     if not total_rejected:
@@ -401,8 +406,8 @@ def _print_rejects(rejects: dict[str, list]) -> None:
     lines: list[str] = []
     idx = 0
 
-    # Message-level rejects (classifier, reranker, caps, llm_no_events)
-    for stage in ("classifier", "reranker", "caps", "llm_no_events"):
+    # Message-level rejects (classifier, reranker, caps, llm_no_events, llm_errors)
+    for stage in ("classifier", "reranker", "caps", "llm_no_events", "llm_errors"):
         msgs = rejects.get(stage, [])
         if not msgs:
             continue

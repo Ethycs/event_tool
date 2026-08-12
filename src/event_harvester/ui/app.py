@@ -510,9 +510,11 @@ class EventsApp:
             "caps": "Per-source caps",
             "llm_past": "LLM (past events)",
             "llm_no_events": "LLM (no events)",
+            "llm_errors": "LLM unreachable",
         }
         panels = []
-        for stage in ("classifier", "reranker", "caps", "llm_past", "llm_no_events"):
+        for stage in ("classifier", "reranker", "caps", "llm_past", "llm_no_events",
+                      "llm_errors"):
             items = self.rejects.get(stage, [])
             if not items:
                 continue

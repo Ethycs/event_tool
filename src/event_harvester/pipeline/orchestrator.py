@@ -13,7 +13,9 @@ What stays with each caller (true divergence, not duplication):
 What this class owns (the duplicated middle):
   * harvest_messages → filter_read_sent → extract_links → extract_events_llm
   * fingerprint-based ``_status`` tagging on each event
-  * Standard rejects shape (5 keys: classifier/reranker/caps/llm_past/llm_no_events)
+  * Standard rejects shape (6 keys: classifier/reranker/caps/llm_past/llm_no_events/
+    llm_errors — the last added 2026-08-12; it is not a rejection but an outage,
+    and reading it as "no events" destroyed a harvest)
   * Optional ProgressReporter integration that is a no-op when the
     reporter is None (so CLI and MCP callers pay nothing for it)
 """

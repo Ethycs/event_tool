@@ -223,10 +223,27 @@ holds for an *exception* — but 328 consecutive `429`s are not an exception at
 this layer. Every batch was counted as `llm_no_events`, the run reported
 `ok: true, events: 0`, and the empty result was written over 251 good ones.
 
-**Recorded, not fixed.** The shape of a fix: `_write` should decline to replace
-a non-empty cache with an empty one when the LLM stage reported errors, and
-`llm_no_events` must stop counting transport failures as "the model found
-nothing" — a distinction the reject buckets exist to make (axiom 3).
+**Fixed the same day**, after the operator reported the symptom:
+
+* **`llm_errors` is now its own reject bucket** in both extraction backends, and
+  is threaded through the CLI summary, the Flet UI and `rejects.ini`. It is
+  labelled *"LLM UNREACHABLE (never asked)"* rather than a rejection, because
+  it is not one. Axiom 3 is amended in the System Overview: **a drop attributed
+  to the wrong stage is worse than an unattributed one**, since it reads as a
+  finding.
+* **`_save_latest_events` refuses to replace a non-empty cache with an empty
+  result when the model was never reached.** Both conditions together are the
+  test: a genuine quiet night still writes its zero, and a partial outage still
+  writes what it got, because that is strictly newer. Only total failure is
+  refused, and loudly — the log line names how many events were protected and
+  what to do next.
+* Extraction now logs `Extraction incomplete: N of M message(s) never reached
+  the model. This is an outage, not an empty result.` The 429 storm was
+  previously visible only as one stack trace per batch, in a log nobody reads
+  during a run, under a summary that said "0 events" and looked like a quiet
+  night.
+
+`tests/test_outage_does_not_clobber.py` (9) replays the exact 2026-08-12 shape.
 
 ---
 
@@ -252,9 +269,13 @@ after a disappointing one.
 ## 6. Still open
 
 * **The OpenAI account has no credit** (`429 insufficient_quota`, first seen
-  2026-08-12 ~16:10 local). Nothing extracts until it is topped up, and the
-  site currently serves 0 events. §4b.
-* **An empty harvest clobbers a good cache.** §4b. This is the one to fix first.
+  2026-08-12 ~16:10 local, still failing a single probe call at 16:40).
+  `LLM_MODEL=openai/gpt-5.4-mini-2026-03-17`, `LLM_BACKEND=litellm`, and
+  `OPENAI_API_KEY` is the only provider key set. `models/` is empty, so
+  `LLM_BACKEND=local` has no ONNX file to load. **Nothing extracts until credit
+  is added, another provider key is set, or a local model is installed** — this
+  is the one open item that blocks the product, and no code change reaches it.
+  §4b.
 * **A `service restart` runs a full harvest**, because the installed command
   line has no `--no-harvest-on-start`. That is right for a code deploy and
   wrong for the eight times it happened today. Worth either a
