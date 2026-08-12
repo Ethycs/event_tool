@@ -84,6 +84,11 @@ input[type=search], select, button, .btn {
 input[type=search] { cursor: text; }
 button:hover, .btn:hover { border-color: var(--accent); }
 .btn { text-decoration: none; display: inline-block; }
+/* `display` above beats the user-agent `[hidden]` rule, so the Export button
+   rendered as a dead "Export" whenever the month held nothing to export.
+   Same trap the list page hit and documented; it belongs next to the rule
+   that causes it. */
+.btn[hidden], button[hidden] { display: none; }
 .btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
 .chips { display: flex; gap: 6px; flex-wrap: wrap; margin: 10px 0 0; }
 .chip {
@@ -99,7 +104,10 @@ button:hover, .btn:hover { border-color: var(--accent); }
   display: flex; align-items: center; gap: 8px; margin: 16px 0 8px; flex-wrap: wrap;
 }
 .monthbar h2 { font-size: 18px; margin: 0; flex: 1 1 auto; }
-.nav-btn { padding: 7px 13px; line-height: 1; }
+/* The two arrows travel together. Left to wrap freely they separated on a
+   360px screen — `←` at the end of one line and `→` orphaned on the next. */
+.stepper { display: flex; gap: 6px; flex: 0 0 auto; margin-left: auto; }
+.nav-btn { padding: 7px 13px; line-height: 1; min-width: 44px; }
 
 .dow {
   display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px;
@@ -148,14 +156,48 @@ footer {
   color: var(--muted); font-size: 12px;
 }
 
+/* Declared before the media query that reveals it: same specificity, so the
+   later rule wins on source order and putting this after would hide the
+   button on exactly the screens that need it. It did, for one build. */
+#filter-toggle { display: none; }
+#filter-toggle.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+/* The count badge sits under the day number and was reading as a second date
+   — "12" then "30". A filled pill says "this many things", not "the 30th". */
+.badge {
+  background: var(--accent); color: #fff; border-radius: 999px;
+  min-width: 20px; padding: 1px 6px; font-weight: 700; line-height: 1.5;
+}
+
 /* A seven-column grid on a phone leaves ~44px per cell — too narrow for a
    title, wide enough for a number and a count. The pills are hidden rather
    than shrunk, and the day panel does the reading. */
 @media (max-width: 700px) {
-  .cell { min-height: 58px; align-items: center; }
+  header { padding: 12px 14px 0; }
+  h1 { font-size: 18px; }
+  main, .controls { padding-left: 14px; padding-right: 14px; }
+  .cell { min-height: 58px; align-items: center; gap: 2px; padding: 4px 2px; }
   .pill, .more { display: none; }
   .badge { display: block; }
   .daynum { font-size: 13px; }
+  .grid, .dow { gap: 3px; }
+  /* Same measurement as the list page: the filter chips were most of a
+     354px control block on a 320px screen, and the grid — the whole point of
+     this page — began 611px down, below the fold on every phone tested. */
+  #filter-toggle { display: inline-flex; }
+  .chips.filter { display: none; }
+  body.filters-open .chips.filter { display: flex; }
+  .monthbar { margin-top: 12px; }
+  .monthbar h2 { flex: 1 1 100%; }
+}
+
+/* Last in the file on purpose — same specificity as the base rules, so an
+   earlier position loses on source order and only on a touch device. */
+@media (pointer: coarse) {
+  .chip { min-height: 40px; padding: 8px 13px; }
+  button, .btn, input[type=search] { min-height: 44px; }
+  .cell { min-height: 62px; }
+  .ev .actions .btn { min-height: 40px; }
 }
 """
 
@@ -412,10 +454,37 @@ function bindChips(attr, set) {
       for (const other of buttons) {
         other.setAttribute('aria-pressed', String(other === b));
       }
+      syncFilterToggle();
       render();
     };
   }
 }
+
+// Collapsed on a phone, so the button carries what the chips would have said —
+// "Oakland · web" rather than a count. Which filter is on is the thing you
+// cannot otherwise see.
+const filterToggle = $('filter-toggle');
+
+function activeChipLabel(attr) {
+  const chip = document.querySelector(
+    '.chip[data-' + attr + '][aria-pressed="true"]');
+  if (!chip || !chip.dataset[attr]) return null;
+  const copy = chip.cloneNode(true);
+  const tally = copy.querySelector('.tally');
+  if (tally) tally.remove();
+  return copy.textContent.trim();
+}
+
+function syncFilterToggle() {
+  const parts = [activeChipLabel('region'), activeChipLabel('source')].filter(Boolean);
+  filterToggle.textContent = parts.length ? parts.join(' · ') : 'Filters';
+  filterToggle.classList.toggle('on', parts.length > 0);
+}
+
+filterToggle.onclick = () => {
+  const open = document.body.classList.toggle('filters-open');
+  filterToggle.setAttribute('aria-expanded', String(open));
+};
 
 $('prev').onclick = () => step(-1);
 $('next').onclick = () => step(1);
@@ -501,15 +570,16 @@ def generate_calendar_html(
     <input id="q" type="search" placeholder="Search events, venues, people"
            autocomplete="off" aria-label="Search events">
     <button id="today-btn" type="button">Today</button>
+    <button id="filter-toggle" type="button" aria-expanded="false">Filters</button>
     <button id="undated" type="button" aria-pressed="false" hidden></button>
     <a id="export" class="btn" hidden>Export</a>
   </div>
-  <div class="chips" role="group" aria-label="Filter by place">
+  <div class="chips filter" role="group" aria-label="Filter by place">
     <button class="chip" type="button" aria-pressed="true"
             data-region="">Everywhere<span class="tally">{len(prepared)}</span></button>
     {region_chips}
   </div>
-  <div class="chips" role="group" aria-label="Filter by source">
+  <div class="chips filter" role="group" aria-label="Filter by source">
     <button class="chip" type="button" aria-pressed="true"
             data-source="">All<span class="tally">{len(prepared)}</span></button>
     {chips}
@@ -519,8 +589,10 @@ def generate_calendar_html(
   <div class="monthbar">
     <h2 id="month-label"></h2>
     <span class="meta" id="count"></span>
-    <button class="nav-btn" id="prev" type="button" aria-label="Previous month">&larr;</button>
-    <button class="nav-btn" id="next" type="button" aria-label="Next month">&rarr;</button>
+    <span class="stepper">
+      <button class="nav-btn" id="prev" type="button" aria-label="Previous month">&larr;</button>
+      <button class="nav-btn" id="next" type="button" aria-label="Next month">&rarr;</button>
+    </span>
   </div>
   <div class="dow" aria-hidden="true">{dow}</div>
   <div class="grid" id="grid" role="grid" aria-label="Month"></div>

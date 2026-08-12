@@ -275,7 +275,16 @@ _PAGE = r"""<!doctype html>
   h1{font-size:19px;margin:0}
   a{color:var(--accent)}
   main{max-width:1080px;margin:0 auto;padding:24px;display:grid;gap:24px}
-  section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:20px}
+  /* A grid item's automatic minimum size is its *min-content* width, so a
+     section holding a 33-row table refuses to shrink below that table — and
+     no amount of `overflow-x` on the table itself changes it, because the
+     section was never the thing scrolling. This one declaration is what
+     stopped /admin scrolling sideways on every phone. */
+  section{background:var(--card);border:1px solid var(--line);border-radius:10px;
+          padding:20px;min-width:0}
+  /* The table keeps its own layout and scrolls inside its own box. */
+  .tablewrap{overflow-x:auto;min-width:0;-webkit-overflow-scrolling:touch}
+  .tablewrap table{min-width:520px}
   h2{font-size:15px;margin:0 0 4px;letter-spacing:.02em}
   .hint{color:var(--dim);font-size:13px;margin:0 0 16px}
   .eq{display:grid;gap:14px}
@@ -308,8 +317,36 @@ _PAGE = r"""<!doctype html>
       border:1px solid var(--line);border-radius:8px}
   .kw .top{display:grid;grid-template-columns:180px 1fr auto;gap:10px}
   .picks{display:grid;grid-template-columns:1fr 1fr;gap:18px}
-  @media(max-width:640px){.picks{grid-template-columns:1fr}
-    .kw .top{grid-template-columns:1fr}}
+
+  /* ── Phones ────────────────────────────────────────────────────────
+     Measured 2026-08-12: this page was **545px wide inside a 320px
+     viewport** and scrolled horizontally on every phone tested. The cap
+     rows are `110px 1fr 84px 44px`, and a range input's intrinsic width
+     (~129px in Chromium) meant the row could not compress — so the number
+     field and the ∞ toggle, the two controls that actually set a cap, sat
+     off the right edge with no indication they existed. The page was not
+     merely cramped, it was unusable.
+
+     The fix is to give the row two lines: the label above, the controls
+     below. Nothing is hidden and nothing needs a horizontal swipe. */
+  @media(max-width:700px){
+    main{padding:14px 12px;gap:16px}
+    section{padding:14px}
+    h1{font-size:17px}
+    .picks{grid-template-columns:1fr;gap:12px}
+    .kw .top{grid-template-columns:1fr}
+    .row{grid-template-columns:1fr 76px 46px;
+         grid-template-areas:"lab lab lab" "rng num inf";gap:8px 10px}
+    .row label{grid-area:lab;margin-bottom:-4px}
+    .row input[type=range]{grid-area:rng;min-width:0}
+    .row input[type=number]{grid-area:num}
+    .row .inf{grid-area:inf}
+    /* A long unbroken token — `data/settings.json` — is the other way a
+       fixed-width child pushes a page wider than the screen. */
+    .hint code,.note code,code{overflow-wrap:anywhere}
+    th,td{padding:7px 8px}
+  }
+
   .pick{display:inline-flex;align-items:center;gap:6px;margin:0 12px 4px 0;
         font-size:13.5px;white-space:nowrap}
   .pick input{accent-color:var(--accent)}
@@ -317,6 +354,24 @@ _PAGE = r"""<!doctype html>
   .note{color:var(--dim);font-size:12.5px}
   header{flex-direction:column;align-items:stretch;gap:0}
   .headline{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap}
+
+  /* 44px is the WCAG 2.5.5 target. The range input was **16px tall** — a
+     slider you cannot reliably grab with a thumb is a slider you cannot use.
+     Height rather than a taller track, so the line stays thin and the hit
+     area does not.
+
+     **Last in the file, and that is load-bearing.** These selectors have the
+     same specificity as the base rules they override, so a block placed above
+     them loses on source order — silently, and only on a touch device. The
+     first version of this sat mid-stylesheet and measured 41px where it asked
+     for 44. */
+  @media(pointer:coarse){
+    button,.inf,input[type=text],input[type=number],select{min-height:44px}
+    input[type=range]{height:44px}
+    .headline a{min-height:44px;display:inline-flex;align-items:center}
+    .pick{min-height:44px}
+    .pick input{width:20px;height:20px}
+  }
 /*NAV-STYLE*/
 </style></head><body>
 <header>
@@ -391,8 +446,10 @@ _PAGE = r"""<!doctype html>
     <select id="prof" onchange="loadPlan()" style="background:#0c0e13;color:var(--fg);
       border:1px solid var(--line);border-radius:6px;padding:7px"></select>
   </div>
-  <table><thead><tr><th>Source</th><th>Mode</th><th>Strength</th>
-    <th>Searches</th><th>Why</th></tr></thead><tbody id="plan"></tbody></table>
+  <div class="tablewrap">
+    <table><thead><tr><th>Source</th><th>Mode</th><th>Strength</th>
+      <th>Searches</th><th>Why</th></tr></thead><tbody id="plan"></tbody></table>
+  </div>
 </section>
 
 </main>

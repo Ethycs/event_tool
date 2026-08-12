@@ -59,6 +59,31 @@ Four sinks turn harvested/validated events into something a human (or TickTick) 
 
 JavaScript source, not Python: the pages are self-contained files with no server behind them, so the calendar has to be assembled in the browser and handed over as a `data:` URI. Extracted from `html_report._SCRIPT` on 2026-08-12 when the grid needed `icsForMany` — a copy-paste would have drifted the moment either page changed its date handling, which is exactly where it is delicate. Exports `icsFor` (one event), `icsForMany` (a calendar of many), `icsName` (a safe `download` filename). An event with no date returns `null` rather than a VEVENT at epoch zero. Line folding is deliberately **not** implemented: every client tested accepts long lines, and a wrong fold corrupts the file.
 
+### The mobile pass — measured 2026-08-12
+
+The list page had said "mobile-first" since 2026-07-30 and had never been opened at a phone width. Rendered in headless Chromium at 320×568, 360×740 and 390×844:
+
+| | before | after |
+|---|---|---|
+| `/admin` document width in a 360px viewport | **456–546px — it scrolled sideways on every phone** | 360px |
+| `/` sticky control block | **303px, 53% of an iPhone SE, permanently** | 61px |
+| `/` first card begins at | **y=546 — the page opened showing no events** | y=256 |
+| `/calendar` grid begins at | y=611 | y=369 |
+| Undersized tap targets | 6–8 per page | 0 on `/`, 2 explained below |
+
+**`/admin` was the serious one.** Its cap rows are `110px 1fr 84px 44px`, and a range input's intrinsic width meant the row could not compress — so the number field and the ∞ toggle, *the two controls that actually set a cap*, sat off the right edge with nothing indicating they existed. The page was not cramped, it was unusable.
+
+The cause was not the table's `overflow-x`, which was already set and did nothing. **A grid item's automatic minimum size is its min-content width**, so `section` refused to shrink below the 33-row Searches table regardless of what the table itself was told; the section was never the thing scrolling. `section { min-width: 0 }` is the fix, found by hiding elements one at a time and watching `document.scrollWidth` rather than by reasoning about the cascade.
+
+**Source order decided two silent failures**, both invisible except on a touch device:
+
+* The `@media (pointer: coarse)` block sat mid-stylesheet, above the base `a.btn` rule it overrides. Same specificity, so the later base rule won: the block asked for 44px and measured 41.
+* `#filter-toggle { display: none }` was written *after* the media query that reveals it, hiding the filter button on exactly the screens whose filters are collapsed. It shipped that way for one build.
+
+Both are now last in their stylesheets with the reason written above them, and `tests/test_mobile.py::TestSourceOrder` asserts the ordering.
+
+**Two undersized targets remain, deliberately.** A calendar cell is 39px wide at 320px — seven columns cannot each be 44px in a 320px viewport, and the alternative is dropping columns or scrolling the grid. It is 62px tall, which is what a thumb actually needs. And `/admin`'s checkbox inputs are 20px inside a 44px `<label>`, which is the real hit area.
+
 ### `outputs/nav.py` — the cross-page links, and why they are opt-in
 
 `/admin` was mounted, tested and working for a full day with **nothing anywhere pointing at it** — which is functionally the same as not having shipped it. A page with no inbound link is not a feature.

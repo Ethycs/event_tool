@@ -122,4 +122,12 @@ NAV_STYLE = """
 .sitenav a[aria-current="page"] {
   color: var(--fg); background: var(--chip); border-color: var(--line);
 }
+/* The tabs were 35px tall on a phone, under the 44px WCAG 2.5.5 target — and
+   they are the control that moves you between the three pages. Kept here
+   rather than in each page's stylesheet so a forwarded file, which has no nav,
+   does not carry a rule for one. */
+@media (pointer: coarse) {
+  .sitenav { gap: 4px; margin-bottom: 6px; }
+  .sitenav a { min-height: 44px; display: inline-flex; align-items: center; }
+}
 """

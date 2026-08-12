@@ -301,11 +301,33 @@ body.carousel .shelf .card {
   flex: 0 0 auto; color: var(--muted); font-size: 13px; white-space: nowrap;
   font-variant-numeric: tabular-nums;
 }
-@media (max-width: 560px) {
+/* The chips collapse behind this on a phone; it names what is active, so
+   nothing is hidden that you would need to see. Absent on desktop. */
+#filter-toggle { display: none; }
+#filter-toggle.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+/* ── Phones ──────────────────────────────────────────────────────────
+   Measured 2026-08-12 on a 320x568 screen, before this block: the sticky
+   control bar was **303px tall — 53% of the viewport, permanently** — and the
+   first card began 546px down, so the page opened showing no events at all.
+   Two rows of filter chips were the bulk of both numbers. Collapsing them
+   takes the sticky block to ~62px and puts events above the fold. */
+@media (max-width: 700px) {
+  header { padding: 12px 14px 8px; }
+  h1 { font-size: 18px; }
+  /* The source tallies are a debugging line, not a reason to push the events
+     off the screen. Kept in the DOM for a forwarded copy read on a desktop. */
+  header .meta + .meta { display: none; }
+  .controls { padding: 8px 14px; }
+  #filter-toggle { display: inline-flex; }
+  .filters { display: none; padding-top: 8px; }
+  body.filters-open .filters { display: flex; }
+  .filters { flex-direction: column; align-items: flex-start; gap: 6px; }
+  main { padding: 0 14px 48px; }
   /* The layout toggle is the least-used control and the first to go. */
   .bar #layout { display: none; }
-  .filters { flex-direction: column; align-items: flex-start; gap: 6px; }
 }
+
 /* Fixed aspect box, so a card with a picture and one without stay the same
    width and the grid does not jump as images load. */
 .thumb {
@@ -350,6 +372,21 @@ a.btn.primary { background: var(--accent); border-color: var(--accent); color: #
 #toast.show { transform: translate(-50%, 0); opacity: 1; }
 @media (prefers-reduced-motion: reduce) { #toast { transition: none; } }
 footer { color: var(--muted); font-size: 12px; padding: 24px 16px; text-align: center; }
+
+/* Touch targets, 44px per WCAG 2.5.5 — these were 32-41px, and every one of
+   them is something you tap on the page you read on a phone. Scoped to coarse
+   pointers so a mouse keeps the denser controls.
+
+   **Last in the file, and that is load-bearing.** These selectors have the
+   same specificity as the base rules they override, so a media query placed
+   above them loses on source order — silently, and only on a touch device.
+   The first version of this block sat mid-stylesheet and measured 41px where
+   it asked for 44. */
+@media (pointer: coarse) {
+  .chip { min-height: 40px; padding: 9px 14px; }
+  a.btn, button.btn, .bar select, .bar button { min-height: 44px; }
+  input[type=search] { min-height: 44px; }
+}
 """
 
 # Rendering happens here, in the browser, from JSON — never by interpolating
@@ -622,9 +659,39 @@ document.querySelectorAll('.chip').forEach(chip => {
       c.setAttribute('aria-pressed',
         String(active === null ? mine === null : mine === active));
     });
+    syncFilterToggle();
     render();
   };
 });
+
+// On a phone the chips are collapsed, so the button has to carry what they
+// would have shown. It reads "SF · web" rather than "Filters (2)": the point
+// of a filter you cannot see is knowing *which* one is on, not how many.
+const filterToggle = document.getElementById('filter-toggle');
+
+function activeChipLabel(attr) {
+  const chip = document.querySelector(`.chip[data-${attr}][aria-pressed="true"]`);
+  if (!chip || !chip.dataset[attr]) return null;   // the "All"/"Everywhere" chip
+  const copy = chip.cloneNode(true);
+  const tally = copy.querySelector('.tally');
+  if (tally) tally.remove();
+  return copy.textContent.trim();
+}
+
+function syncFilterToggle() {
+  if (!filterToggle) return;
+  const parts = [activeChipLabel('region'), activeChipLabel('source')].filter(Boolean);
+  filterToggle.textContent = parts.length ? parts.join(' · ') : 'Filters';
+  filterToggle.classList.toggle('on', parts.length > 0);
+}
+
+if (filterToggle) {
+  filterToggle.onclick = () => {
+    const open = document.body.classList.toggle('filters-open');
+    filterToggle.setAttribute('aria-expanded', String(open));
+  };
+  syncFilterToggle();
+}
 
 // Layout is a body class, so switching it costs a repaint rather than a
 // re-render — the cards themselves are identical in both modes.
@@ -826,8 +893,10 @@ def generate_html_report(
     </select>
     <button id="layout" type="button" data-mode="grid"
             aria-label="Toggle grid or carousel layout">Grid</button>
+    <button id="filter-toggle" type="button" aria-expanded="false"
+            aria-controls="filters">Filters</button>
   </div>
-  <div class="filters">
+  <div class="filters" id="filters">
     <div class="chips" role="group" aria-label="Filter by place">
       <button class="chip" type="button" aria-pressed="true"
               data-region="">Everywhere<span class="tally">{len(prepared)}</span></button>

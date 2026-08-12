@@ -1,8 +1,8 @@
 # Session Report — a month grid, and the page that shipped without a link
 
-**Date**: 2026-08-12 (second pass) · **Status**: ✅ LANDED
-**Scope**: `/calendar` · shared nav · profile editor · the `/admin` cap-clamping defect · a destroyed config file · **the sub-path mount**
-**Tests**: 1395 passed, 0 failed (1314 at start) · **Lint**: 43, unchanged
+**Date**: 2026-08-12 (second pass) · **Status**: ✅ LANDED · ⚠️ **the event cache is empty — see §4b**
+**Scope**: `/calendar` · shared nav · profile editor · the `/admin` cap-clamping defect · a destroyed config file · the sub-path mount · **the mobile pass**
+**Tests**: 1411 passed, 0 failed (1314 at start) · **Lint**: 43, unchanged
 **Follows**: [2026-08-12_email-extraction-discovery-and-the-percent-bug.md](2026-08-12_email-extraction-discovery-and-the-percent-bug.md)
 
 ---
@@ -171,6 +171,65 @@ written in the first place.
 
 ---
 
+## 4b. The mobile pass, and what it cost
+
+`/` had claimed "mobile-first" since 2026-07-30 and had never been opened at a
+phone width. Rendered in headless Chromium at 320×568, 360×740 and 390×844:
+
+| | before | after |
+|---|---|---|
+| `/admin` doc width in a 360px viewport | **456–546px, scrolled sideways on every phone** | 360 |
+| `/` sticky control block | **303px — 53% of an iPhone SE, permanently** | 61px |
+| `/` first card at | **y=546, below the fold** | y=256 |
+| `/calendar` grid at | y=611 | y=369 |
+| undersized tap targets | 6–8 per page | 0 on `/`, 2 explained |
+
+`/admin` was unusable rather than merely cramped: the number field and the ∞
+toggle sat off the right edge of every phone. The cause was not the table's
+`overflow-x`, which was already set and did nothing — **a grid item's automatic
+minimum size is its min-content width**, so `section` would not shrink below the
+33-row table whatever the table was told. Found by hiding elements one at a time
+and watching `document.scrollWidth`, not by reasoning about the cascade. One
+declaration: `section { min-width: 0 }`.
+
+**Source order decided two silent failures.** The `pointer: coarse` block sat
+above the base rules it overrides — same specificity, so it asked for 44px and
+measured 41. And `#filter-toggle { display: none }` was written *after* the
+media query that reveals it, hiding the filter button on exactly the screens
+whose filters are collapsed. Both now last in their stylesheets, both pinned by
+`TestSourceOrder`. Neither is visible except on a touch device.
+
+### The cost, which was mine
+
+**I restarted the site service eight times to pick up CSS changes. The service
+harvests on start.** Eight full harvests of 20,716 messages against a paid API
+in ninety minutes, for changes that touched only stylesheets.
+
+Between 16:09 and 16:12 the OpenAI account ran out of credit
+(`429 insufficient_quota`). The 16:12 and 16:13 harvests extracted **0 events**
+and **overwrote `data/.mcp_events.json`, which held 251**. Those events are not
+recoverable; the job records keep counts, not events. The message cache still
+holds all 20,716 messages for its 4h TTL, so a harvest with working credit
+re-extracts without re-scraping.
+
+`site --build-only --no-harvest-on-start` regenerates both pages from the cache
+and is what a stylesheet change needs. A `service restart` is not.
+
+### The defect it exposed
+
+**A harvest that extracts nothing overwrites a cache that held everything.**
+`05 - Outputs.md` records "a failed harvest keeps the last good page", and that
+holds for an *exception* — but 328 consecutive `429`s are not an exception at
+this layer. Every batch was counted as `llm_no_events`, the run reported
+`ok: true, events: 0`, and the empty result was written over 251 good ones.
+
+**Recorded, not fixed.** The shape of a fix: `_write` should decline to replace
+a non-empty cache with an empty one when the LLM stage reported errors, and
+`llm_no_events` must stop counting transport failures as "the model found
+nothing" — a distinction the reject buckets exist to make (axiom 3).
+
+---
+
 ## 5. What is where now
 
 Reachable both directly on `:8800` and through the proxy at
@@ -192,6 +251,14 @@ after a disappointing one.
 
 ## 6. Still open
 
+* **The OpenAI account has no credit** (`429 insufficient_quota`, first seen
+  2026-08-12 ~16:10 local). Nothing extracts until it is topped up, and the
+  site currently serves 0 events. §4b.
+* **An empty harvest clobbers a good cache.** §4b. This is the one to fix first.
+* **A `service restart` runs a full harvest**, because the installed command
+  line has no `--no-harvest-on-start`. That is right for a code deploy and
+  wrong for the eight times it happened today. Worth either a
+  `service reload`-style verb or a note in the runbook.
 * **`sources/venue_location.py` is still unwired** — unchanged from the last
   report §7, and still the intended fix for the hand-maintained venue table.
   Needs a `city` field in `EH-STD-WEBSRC-v0`, a hook in `_web_add`, a backfill
