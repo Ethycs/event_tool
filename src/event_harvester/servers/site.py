@@ -42,6 +42,7 @@ _TRACER = "event_harvester.servers.site"
 
 SITE_DIR = data_path(".site")
 SITE_HTML = SITE_DIR / "index.html"
+SITE_CALENDAR = SITE_DIR / "calendar.html"
 SITE_JSON = SITE_DIR / "events.json"
 
 DEFAULT_INTERVAL_HOURS = 24
@@ -181,6 +182,7 @@ def _read_cached_events() -> tuple[list[dict], dict[str, int], int]:
 def _write(events: list[dict], source_counts: dict[str, int], total_messages: int) -> None:
     import json
 
+    from event_harvester.outputs.calendar_html import generate_calendar_html
     from event_harvester.outputs.html_report import _prepare, generate_html_report
     from event_harvester.servers.mcp_server import _events_for_report
 
@@ -197,6 +199,18 @@ def _write(events: list[dict], source_counts: dict[str, int], total_messages: in
         # on disk by URL so a rebuild re-costs only the newly-seen links.
         thumbnails=os.environ.get("SITE_THUMBNAILS", "1").lower()
         not in ("0", "false", "no"),
+        # Only the served copy gets cross-page links; a forwarded file has no
+        # origin to resolve /calendar or /admin against. See `outputs/nav.py`.
+        nav=True,
+    )
+    # Both pages are written in the same pass, from the same list, so /calendar
+    # can never show a different harvest than /. A calendar built lazily on
+    # first request would have been one more thing that can be stale.
+    generate_calendar_html(
+        validated_events=prepared,
+        output_path=str(SITE_CALENDAR),
+        title="Calendar",
+        nav=True,
     )
     # The JSON is the same projection the page embeds, so a client reading it
     # cannot see a different set of events than a browser does.
@@ -231,6 +245,17 @@ def build_app(cfg, *, interval_hours: float = DEFAULT_INTERVAL_HOURS,
             # no-store: the whole point is that the URL is current. A cached
             # copy of yesterday's events is worse than a slow load.
             return FileResponse(SITE_HTML, media_type="text/html; charset=utf-8",
+                                headers={"Cache-Control": "no-store"})
+
+    async def calendar_page(request):
+        with tracer.start_as_current_span("site.GET./calendar"):
+            if not SITE_CALENDAR.exists():
+                return PlainTextResponse(
+                    "The calendar has not been built yet. It is written with the "
+                    "events page on every refresh; check /healthz.",
+                    status_code=503,
+                )
+            return FileResponse(SITE_CALENDAR, media_type="text/html; charset=utf-8",
                                 headers={"Cache-Control": "no-store"})
 
     async def events_json(request):
@@ -303,6 +328,7 @@ def build_app(cfg, *, interval_hours: float = DEFAULT_INTERVAL_HOURS,
         debug=False,
         routes=[
             Route("/", index),
+            Route("/calendar", calendar_page),
             Route("/events.json", events_json),
             Route("/healthz", healthz),
             Route("/refresh", refresh_now, methods=["POST"]),

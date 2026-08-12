@@ -1,8 +1,8 @@
 # Output Sinks
 
-**Status:** CURRENT · **Date:** 2026-07-30 (HTML report added, Markdown deprecated) · **Applies to:** `src/event_harvester/outputs/__init__.py`, `src/event_harvester/outputs/html_report.py`, `src/event_harvester/outputs/deeplinks.py`, `src/event_harvester/outputs/report.py`, `src/event_harvester/outputs/ticktick.py`, `src/event_harvester/outputs/obsidian.py`, `src/event_harvester/ui/display.py`
+**Status:** CURRENT · **Date:** 2026-08-12 (month grid + shared nav added) · **Applies to:** `src/event_harvester/outputs/__init__.py`, `src/event_harvester/outputs/html_report.py`, `src/event_harvester/outputs/calendar_html.py`, `src/event_harvester/outputs/ics.py`, `src/event_harvester/outputs/nav.py`, `src/event_harvester/outputs/deeplinks.py`, `src/event_harvester/outputs/report.py`, `src/event_harvester/outputs/ticktick.py`, `src/event_harvester/outputs/obsidian.py`, `src/event_harvester/ui/display.py`
 
-Four sinks turn harvested/validated events into something a human (or TickTick) consumes: a throwaway Markdown report, an Obsidian vault writer, a TickTick task sync, and ANSI terminal printers. Only `ticktick.py` mutates external state — `report.py`, `obsidian.py`, and `display.py` are local/idempotent and safe to re-run. `src/event_harvester/outputs/__init__.py` is a one-line docstring module with no exports to import from (`"""Sinks that write extracted events outward: TickTick, Markdown reports, Obsidian vault."""`) — callers import directly from the submodules.
+Four sinks turn harvested/validated events into something a human (or TickTick) consumes: a throwaway Markdown report, an Obsidian vault writer, a TickTick task sync, and ANSI terminal printers. The HTML pair — the list (§0) and the month grid (§0a) — is the default and is what the site serves. Only `ticktick.py` mutates external state — `report.py`, `obsidian.py`, and `display.py` are local/idempotent and safe to re-run. `src/event_harvester/outputs/__init__.py` is a one-line docstring module with no exports to import from (`"""Sinks that write extracted events outward: TickTick, Markdown reports, Obsidian vault."""`) — callers import directly from the submodules.
 
 **Hard constraints, upfront:**
 1. TickTick OAuth's authorization-code exchange is interactive (opens a browser, blocks on `input()` for the redirect URL) and has **no refresh-token path** — see below. It cannot run unattended the first time, or ever again once the token silently expires mid-run.
@@ -32,6 +32,38 @@ Four sinks turn harvested/validated events into something a human (or TickTick) 
 **Dates are bucketed against the *local* date, not UTC.** Event dates are local wall-clock dates scraped from venue pages — a 9pm SF show is `2026-07-30`, not an instant. Bucketing them against `datetime.now(timezone.utc).date()` put every event happening tonight into `Past` from 5pm PDT onward, which is exactly when someone opens the page to decide what to do that evening. `today` is injectable for deterministic tests. This was found by rendering the page in a browser, not by a test — the tests computed both sides of the comparison the same way and agreed with each other.
 
 **Forwarding the file forwards the data.** It embeds every event and the source channel each came from. `_prepare` therefore whitelists display fields only; internals like `_status` never reach the file.
+
+## 0a. `outputs/calendar_html.py` — the month grid · **added 2026-08-12**
+
+**Domain:** the same events, arranged by *when* instead of by rank. `generate_calendar_html(validated_events, output_path, title="Calendar", today=None, nav=False)`. Same contract as §0 — one file, no network, scraped text through `textContent` only.
+
+**Why a second page rather than a view toggle on the first.** The list answers "what is there?" and sorts by relevance; the grid answers "what is on Thursday?" and cannot sort at all, because position *is* the date. The list is happy to hide events behind a filter; the grid must render every day including the empty ones or it is not a calendar. Merging them meant a mode flag threaded through rendering, sorting, filtering and the URL. Two pages over one projection is less code and neither compromises.
+
+**Both pages are built from `html_report._prepare`**, in the same `_write` pass, from the same list. That is what stops them disagreeing about a harvest: a field that reaches a card is available in a cell for free, and a field the projection drops is invisible to both.
+
+| | |
+|---|---|
+| Grid | Six rows always — a grid that changed height between months would move the buttons under the cursor. Sunday-first, weekends tinted, today outlined |
+| A cell | Up to 3 pills (time + title), then `+N more`. Clicking opens the day panel below the grid with the full events, time-ordered |
+| Undated | Its own tray button, because a grid cannot place them and dropping them would be a silent loss. **1 of 240** on 2026-08-12 |
+| Export | `icsForMany` — one `.ics` of everything visible in the month. Thirty separate downloads is not an import |
+| Filters | The same two axes as the list (place, source), ANDed, plus search. No sort control: the grid *is* the sort |
+| Keys | `←`/`→` page the month, `T` returns to today — suppressed while the search box has focus |
+| Phone | Below 700px a seven-column grid leaves ~44px per cell, so the pills are hidden and each day shows a count badge. The day panel does the reading |
+
+**No thumbnails, and that is the point.** The list page embeds 95 inline JPEGs — 1276 KB of its 1562 KB. A grid cell is 96px tall and could not show one usefully. Measured 2026-08-12: **247 KB against 1562 KB for the same 240 events**. This is the one to open on a phone.
+
+**Local dates, again, and here it is worse.** `new Date('2026-08-12')` parses as **UTC midnight** and renders as the 11th anywhere west of Greenwich. The grid is built with `new Date(y, m, d)` and day keys are assembled by string formatting; `toISOString()` appears nowhere. This is the same defect as the `Past`-bucket one in §0, except a calendar renders 42 cells and would have been wrong in all of them at once. `tests/test_calendar_html.py::TestDateHandling` asserts the absent constructs, since there is no DOM to inspect.
+
+### `outputs/ics.py` — the shared iCalendar builder
+
+JavaScript source, not Python: the pages are self-contained files with no server behind them, so the calendar has to be assembled in the browser and handed over as a `data:` URI. Extracted from `html_report._SCRIPT` on 2026-08-12 when the grid needed `icsForMany` — a copy-paste would have drifted the moment either page changed its date handling, which is exactly where it is delicate. Exports `icsFor` (one event), `icsForMany` (a calendar of many), `icsName` (a safe `download` filename). An event with no date returns `null` rather than a VEVENT at epoch zero. Line folding is deliberately **not** implemented: every client tested accepts long lines, and a wrong fold corrupts the file.
+
+### `outputs/nav.py` — the cross-page links, and why they are opt-in
+
+`/admin` was mounted, tested and working for a full day with **nothing anywhere pointing at it** — which is functionally the same as not having shipped it. A page with no inbound link is not a feature.
+
+`nav_html(active)` renders the bar; `NAV_STYLE` carries its CSS. Both generated pages take `nav=False` by default and `servers/site.py` passes `nav=True`, because a forwarded copy has no origin — `/calendar` and `/admin` in an emailed file resolve against whatever site the recipient has open, or against `file:///admin`. `/admin` renders it unconditionally, since that page only ever exists on the origin. Links are root-relative: the site is reached as `localhost`, as a LAN address and as a ZeroTier address, and hard-coding any one would break the other two.
 
 ## 1. `outputs/report.py` — Markdown report · **DEPRECATED 2026-07-30**
 
@@ -63,6 +95,18 @@ Four sinks turn harvested/validated events into something a human (or TickTick) 
 The site is a **file**, and serving it is a detail. That is why this module is small, and it is the property worth protecting: the served page and a forwarded page are the same bytes, so they can never drift apart.
 
 Built on Starlette + uvicorn, which `mcp`/`fastmcp` already pull in — **no new dependency**. `event-harvester site` builds `data/.site/index.html`, serves it at `/`, and refreshes on a schedule (default 24h).
+
+**The route map, as of 2026-08-12:**
+
+| Route | File | |
+|---|---|---|
+| `/` | `data/.site/index.html` | the list, with thumbnails |
+| `/calendar` | `data/.site/calendar.html` | the month grid, no thumbnails |
+| `/admin` | rendered per request | caps, keywords, profiles — `servers/admin.py` |
+| `/events.json` | `data/.site/events.json` | the same projection the pages embed |
+| `/healthz`, `POST /refresh` | — | state, identity, queue |
+
+`/` and `/calendar` are written together in one `_write` pass, so they cannot show different harvests. A calendar built lazily on first request would have been one more thing that can be stale. Both are served `no-store`: the point of the URL is that it is current.
 
 | Property | Why |
 |---|---|

@@ -46,7 +46,7 @@ Five message sources fan out concurrently into one shared pipeline that filters,
         │                    │                    │
         └────────────────────┴────────────────────┘
                              ▼
-              SINKS: TickTick · Markdown report · Obsidian vault
+              SINKS: HTML list + month grid · TickTick · Obsidian vault
                              │
               fingerprint store ── approve/decline are remembered
                                     so the next run tags them, not re-offers them
@@ -111,12 +111,12 @@ Message order is deterministic regardless of completion order: results are re-as
 ## Verification
 
 ```powershell
-pixi run test                                   # 1306 passed, 0 failed as of 2026-08-12
+pixi run test                                   # 1340 passed, 0 failed as of 2026-08-12
 pixi run check-head                             # does a bare checkout import? (axiom 7)
 pixi run event-harvester service doctor         # what runs, at what version, what is stray
 pixi run event-harvester jobs list              # the harvest queue: what ran, what waits
 pixi run event-harvester --days 1 --dry-run     # exercise the full pipeline, write nothing external
-pixi run event-harvester site --build-only      # write data/.site/index.html and stop
+pixi run event-harvester site --build-only      # write data/.site/{index,calendar}.html and stop
 ```
 
 If the second command prints a stage sequence other than harvest → filter → extract → match, this overview is stale and the pipeline was restructured — reconcile against `01 - Pipeline.md` before trusting anything here.

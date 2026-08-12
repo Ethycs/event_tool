@@ -39,6 +39,8 @@ from typing import Any
 from event_harvester.observability.metrics import count, record
 from event_harvester.observability.tracing import set_span_attrs, traced
 from event_harvester.outputs.deeplinks import ticktick_deep_link
+from event_harvester.outputs.ics import ICS_JS
+from event_harvester.outputs.nav import NAV_STYLE, nav_html
 from event_harvester.outputs.regions import HINTS as REGION_HINTS
 from event_harvester.outputs.regions import LABELS as REGION_LABELS
 from event_harvester.outputs.regions import REGIONS
@@ -352,45 +354,13 @@ footer { color: var(--muted); font-size: 12px; padding: 24px 16px; text-align: c
 
 # Rendering happens here, in the browser, from JSON — never by interpolating
 # scraped text into markup. See the module docstring.
-_SCRIPT = r"""
+_SCRIPT = ICS_JS + r"""
 const DATA = JSON.parse(document.getElementById('events-data').textContent);
 const BUCKETS = JSON.parse(document.getElementById('bucket-order').textContent);
 const main = document.getElementById('list');
 const search = document.getElementById('q');
 let activeSource = null;
 let activeRegion = null;
-
-function icsFor(ev) {
-  const esc = (s) => String(s || '').replace(/([,;\\])/g, '\\$1').replace(/\n/g, '\\n');
-  const stamp = (d, t) => {
-    if (!d) return null;
-    const day = d.replace(/-/g, '');
-    if (!t) return day;
-    const m = String(t).match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i);
-    if (!m) return day;
-    let h = parseInt(m[1], 10);
-    const min = m[2] || '00';
-    const ap = (m[3] || '').toLowerCase();
-    if (ap === 'pm' && h < 12) h += 12;
-    if (ap === 'am' && h === 12) h = 0;
-    return day + 'T' + String(h).padStart(2, '0') + min + '00';
-  };
-  const dt = stamp(ev.date, ev.time);
-  if (!dt) return null;
-  const allDay = dt.length === 8;
-  const lines = [
-    'BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//event-harvester//EN',
-    'BEGIN:VEVENT',
-    'UID:eh-' + ev.i + '-' + dt + '@event-harvester',
-    allDay ? 'DTSTART;VALUE=DATE:' + dt : 'DTSTART:' + dt,
-    'SUMMARY:' + esc(ev.title),
-  ];
-  if (ev.location) lines.push('LOCATION:' + esc(ev.location));
-  const desc = [ev.details, ev.link].filter(Boolean).join('\n\n');
-  if (desc) lines.push('DESCRIPTION:' + esc(desc));
-  lines.push('END:VEVENT', 'END:VCALENDAR');
-  return 'data:text/calendar;charset=utf-8,' + encodeURIComponent(lines.join('\r\n'));
-}
 
 // The extractor emits details as "prose | location | url". On a card the
 // location already has its own line and the URL already has an Open button,
@@ -480,7 +450,7 @@ function card(ev) {
   if (ics) {
     const a = document.createElement('a');
     a.className = 'btn primary'; a.href = ics;
-    a.setAttribute('download', (ev.title.slice(0, 40).replace(/[^\w -]/g, '') || 'event') + '.ics');
+    a.setAttribute('download', icsName(ev.title));
     a.textContent = 'Add to calendar';
     actions.appendChild(a);
   }
@@ -748,12 +718,17 @@ def generate_html_report(
     title: str = "Events",
     today: date | None = None,
     thumbnails: bool = False,
+    nav: bool = False,
 ) -> str:
     """Write a self-contained mobile-friendly HTML report. Returns the path.
 
     Mirrors `report.generate_report`'s signature so it drops into the same call
     sites. `links` is deliberately absent — the Markdown report's "Top Links"
     section is a debugging aid, and this file is meant to be forwarded.
+
+    ``nav`` adds the cross-page links (`/calendar`, `/admin`) and defaults to
+    off: those paths only exist on the origin that serves this, and a forwarded
+    copy would carry three dead links. `servers/site.py` turns it on.
 
     ``today`` defaults to the **local** date, and that is load-bearing. Event
     dates are local wall-clock dates scraped from venue pages: a 9pm SF show is
@@ -827,10 +802,11 @@ def generate_html_report(
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
 <title>{title} — {len(prepared)}</title>
-<style>{_STYLE}</style>
+<style>{_STYLE}{NAV_STYLE if nav else ""}</style>
 </head>
 <body>
 <header>
+  {nav_html("/" if nav else "")}
   <h1>{title}</h1>
   <div class="meta">{len(prepared)} event(s) · generated
     <span id="generated">{generated}</span></div>

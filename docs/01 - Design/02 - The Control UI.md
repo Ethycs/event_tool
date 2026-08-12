@@ -1,8 +1,8 @@
 # The control UI — browse, sources, categories, run
 
-**Status:** DRAFT — nothing here is implemented · **Date:** 2026-07-31 · **Applies to:** `src/event_harvester/servers/site.py`, `src/event_harvester/outputs/html_report.py`, `data/web_sources.json`, `data/profiles.json`, `src/event_harvester/ui/app.py`, `src/event_harvester/cli/commands/web.py` · **Related:** roadmap 2.2, 2.15 · `03 - Architecture/05 - Outputs.md` §1, `03 - Architecture/07 - Flet UI.md`
+**Status:** DRAFT — **§0a is built, the rest is not** · **Date:** 2026-08-12 · **Applies to:** `src/event_harvester/servers/site.py`, `src/event_harvester/servers/admin.py`, `src/event_harvester/outputs/html_report.py`, `src/event_harvester/outputs/calendar_html.py`, `src/event_harvester/outputs/nav.py`, `data/web_sources.json`, `data/profiles.json`, `data/keywords.json`, `src/event_harvester/ui/app.py`, `src/event_harvester/cli/commands/web.py` · **Related:** roadmap 2.2, 2.15 · `03 - Architecture/05 - Outputs.md` §0a, §1, `03 - Architecture/07 - Flet UI.md`
 
-A design doc, not a description. Filed as `DRAFT` so nobody mistakes it for as-built — the folder's freeze policy is "stable, corrections only", and none of this exists yet.
+A design doc, not a description. Filed as `DRAFT` so nobody mistakes it for as-built — the folder's freeze policy is "stable, corrections only". **§0a is the exception: it records what has actually shipped**, and is the section to trust. Everything from §1 onward is still design.
 
 ## 0. The honest baseline
 
@@ -19,17 +19,33 @@ And **profiles** already do part of the job categories were presumably meant for
 
 That overlap is the first thing this design has to resolve, because "a page for running all or some categories" is ambiguous until it is.
 
-## 0a. What is BUILT, as of 2026-08-10
+## 0a. What is BUILT, as of 2026-08-12
 
-This document is a design; most of it is still unbuilt. One page now exists and
-is served at **`/admin`** on the site origin (`servers/admin.py`, mounted by
-`servers/site.py`), implementing three things:
+This document is a design; most of it is still unbuilt. Three pages now exist on
+the site origin:
+
+| | | |
+|---|---|---|
+| **`/`** | the event list | `outputs/html_report.py` |
+| **`/calendar`** | the month grid — added 2026-08-12 | `outputs/calendar_html.py`, see `03 - Architecture/05 - Outputs.md` §0a |
+| **`/admin`** | the panels below | `servers/admin.py`, mounted by `servers/site.py` |
+
+**They are linked to each other, which they were not.** `/admin` shipped
+2026-08-10 mounted, tested and working, with nothing anywhere pointing at it —
+not from `/`, not from the CLI banner, not from this table. It was asked for
+again two days later by the person who had asked for it built, which is the
+clearest possible signal: **a page with no inbound link has not shipped.**
+`outputs/nav.py` is the fix, and `event-harvester site` now prints all three
+URLs on startup.
+
+`/admin` implements four panels:
 
 | Panel | Backing store | Notes |
 |---|---|---|
 | **Caps equalizer** — slider + number + an **∞** toggle per source, plus `total` | `data/settings.json` (`config.load_caps_overlay`) | Overlay only. Delete the file and `.env`/defaults apply again, unchanged. `-1` = unlimited (**the default**), `0` = drop that source, otherwise clamped to `5000`; unknown keys dropped. Any negative normalises to `-1` rather than `0`, so a typo cannot silently mean "drop everything from this source" |
 | **Keyword lists** | `data/keywords.json` (`keywords.py`) | Name + description + terms. Names are validated lowercase-kebab |
-| **Searches** — what each source will do with its keywords | derived, `keywords.plan_for_source` | Shows the **strength** of each: `native` / `category` / `local` |
+| **Profiles** — editor added 2026-08-12 | `data/profiles.json` | Name, description, and **checkbox** pickers for web sources and keyword lists. Per-profile cap overrides are displayed but edited in the file — the equalizer above is the place for caps |
+| **Searches** — what each source will do with its keywords | derived, `keywords.plan_for_source` | Shows the **strength** of each: `native` / `category` / `local`. Live on 2026-08-12: 1 native (meetup), 1 category (luma), **31 local** |
 
 The Searches panel is the one worth explaining. It exists because "search my
 keywords on Luma, Meetup and Instagram" **cannot be delivered uniformly** — see
@@ -38,10 +54,22 @@ be queried would be lying by omission. The table names the mechanism per
 source, so the degradation is visible *before* a run rather than inferred from
 disappointing output.
 
+**Sources and keyword lists are checkboxes, not text fields.** Both vocabularies
+are closed and already known to the page, and a typed source name that matches
+nothing fails *silently at harvest time*, hours later — the classic shape of a
+config bug that costs an evening. `__none__` gets its own checkbox ("skip web
+entirely") and is mutually exclusive with picking sources, because "none of
+them" and "these three" cannot both be the answer.
+
 Still unbuilt from this design: `/admin/sources`, the tag vocabulary, the
-`enabled` flag, and the run page. Profiles are editable through the API
-(`POST /admin/api/profiles`) but have no editor UI yet — the page reads them to
-scope the Searches table.
+`enabled` flag, and the run page.
+
+**`/admin` had no tests until 2026-08-12**, which is how a real defect survived
+in it: `api_profiles` clamped caps with `max(0, ...)`, so a profile carrying
+`-1` was rewritten to `0` on every save — turning "unlimited" into "drop this
+source entirely", the exact misreading `config._clamp_cap` exists to prevent.
+Unreachable while profiles were hand-edited; reachable the moment the editor
+above could round-trip one. `tests/test_admin.py` (25) is the regression.
 
 **On access control — answered 2026-08-10.** These routes write config and the
 origin carries no application-level auth, which earlier drafts of this document
@@ -167,6 +195,7 @@ test ruins, firing on "blockchain" and "said".
 | Route | Auth | What it is |
 |---|---|---|
 | `/` | — | The static grid. Unchanged |
+| `/calendar` | — | The month grid. **Built 2026-08-12** — a second static file, same projection |
 | `/events.json` | — | Unchanged |
 | `/healthz` | — | Unchanged |
 | `/admin` | ✅ | Dashboard: last run, per-source counts, what is stale |

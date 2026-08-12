@@ -32,6 +32,7 @@ from pathlib import Path
 
 from event_harvester.config import (
     CAP_MAX,
+    _clamp_cap,
     load_caps_overlay,
     save_caps_overlay,
 )
@@ -211,8 +212,13 @@ def build_routes():
             }
             caps = e.get("caps")
             if isinstance(caps, dict):
+                # `_clamp_cap`, not a local `max(0, ...)`. Clamping to zero
+                # would turn "unlimited" into "drop this source entirely" —
+                # the same misreading `config._clamp_cap` exists to prevent,
+                # and now reachable by round-tripping a profile through this
+                # page rather than only by hand-editing the file.
                 entry["caps"] = {
-                    str(k)[:20]: max(0, min(CAP_MAX, int(v)))
+                    str(k)[:20]: _clamp_cap(v)
                     for k, v in caps.items()
                     if isinstance(v, (int, float, str)) and str(v).lstrip("-").isdigit()
                 }
@@ -240,7 +246,12 @@ def render_page() -> str:
     """The admin page. Served from here rather than a template file so the
     service has no runtime asset dependency — same choice `html_report.py`
     made, for the same reason."""
-    return _PAGE
+    from event_harvester.outputs.nav import NAV_STYLE, nav_html
+
+    # This page only ever exists on the origin, so its nav is unconditional —
+    # unlike the two generated pages, which can be forwarded away from it.
+    return _PAGE.replace("<!--NAV-->", nav_html("/admin")).replace(
+        "/*NAV-STYLE*/", NAV_STYLE)
 
 
 _PAGE = r"""<!doctype html>
@@ -249,7 +260,9 @@ _PAGE = r"""<!doctype html>
 <title>Event Harvester — Admin</title>
 <style>
   :root{--bg:#0f1115;--card:#171a21;--line:#262b36;--fg:#e6e9ef;--dim:#9aa4b6;
-        --accent:#6ea8fe;--good:#57c98b;--warn:#e6b455;--flat:#7f8798}
+        --accent:#6ea8fe;--good:#57c98b;--warn:#e6b455;--flat:#7f8798;
+        /* aliases so the shared nav styles resolve here too */
+        --muted:#9aa4b6;--chip:#212530}
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--fg);
        font:15px/1.5 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
@@ -290,13 +303,25 @@ _PAGE = r"""<!doctype html>
   .kw{display:grid;gap:10px;margin-bottom:12px;padding:12px;
       border:1px solid var(--line);border-radius:8px}
   .kw .top{display:grid;grid-template-columns:180px 1fr auto;gap:10px}
+  .picks{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  @media(max-width:640px){.picks{grid-template-columns:1fr}
+    .kw .top{grid-template-columns:1fr}}
+  .pick{display:inline-flex;align-items:center;gap:6px;margin:0 12px 4px 0;
+        font-size:13.5px;white-space:nowrap}
+  .pick input{accent-color:var(--accent)}
   code{background:#0c0e13;padding:1px 5px;border-radius:4px;font-size:13px}
   .note{color:var(--dim);font-size:12.5px}
+  header{flex-direction:column;align-items:stretch;gap:0}
+  .headline{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap}
+/*NAV-STYLE*/
 </style></head><body>
 <header>
-  <h1>Event Harvester — Admin</h1>
-  <a href="/">events</a><a href="/healthz">health</a>
-  <span id="status" class="note"></span>
+  <!--NAV-->
+  <div class="headline">
+    <h1>Event Harvester — Admin</h1>
+    <a href="/healthz">health</a>
+    <span id="status" class="note"></span>
+  </div>
 </header>
 <main>
 
@@ -333,6 +358,18 @@ _PAGE = r"""<!doctype html>
   <div id="kws"></div>
   <div class="bar"><button class="ghost" onclick="addList()">Add list</button>
     <button onclick="saveKeywords()">Save keywords</button></div>
+</section>
+
+<section>
+  <h2>Profiles</h2>
+  <p class="hint">A saved selection: which web sources to run, which keyword
+     lists to carry, and optional caps that override the sliders above for that
+     run only. <code>__none__</code> in sources means "skip web entirely" — an
+     empty list means "all of them", so the two need different spellings.
+     Saved to <code>data/profiles.json</code>.</p>
+  <div id="profs"></div>
+  <div class="bar"><button class="ghost" onclick="addProfile()">Add profile</button>
+    <button onclick="saveProfiles()">Save profiles</button></div>
 </section>
 
 <section>
@@ -481,9 +518,101 @@ async function saveKeywords(){
   else say(j.error||"save failed", true);
 }
 
+// Sources and keyword lists are checkboxes rather than free text because both
+// vocabularies are closed and already known here. A typed source name that
+// matches nothing fails silently at harvest time, hours later — the classic
+// shape of a config bug that costs an evening.
 function renderProfiles(){
+  $("profs").innerHTML = S.profiles.map((p,i) => `
+    <div class="kw">
+      <div class="top">
+        <input type="text" value="${esc(p.name)}" data-i="${i}" data-f="name"
+               placeholder="name" aria-label="profile name">
+        <input type="text" value="${esc(p.description||'')}" data-i="${i}"
+               data-f="description" placeholder="what this profile is for"
+               aria-label="description">
+        <button class="ghost" onclick="delProfile(${i})">Remove</button>
+      </div>
+      <div class="picks">
+        <div>
+          <div class="note">Web sources</div>
+          ${pickList(i, "web_sources", S.sources.map(s=>s.name), p.web_sources||[])}
+          <label class="pick"><input type="checkbox" data-i="${i}" data-f="none"
+            ${(p.web_sources||[]).includes("__none__") ? "checked" : ""}>
+            <span>skip web entirely</span></label>
+        </div>
+        <div>
+          <div class="note">Keyword lists</div>
+          ${pickList(i, "keywords", S.keywords.map(k=>k.name), p.keywords||[])}
+        </div>
+      </div>
+      <div class="note">${capSummary(p)}</div>
+    </div>`).join("") || '<p class="note">No profiles yet.</p>';
+
+  for (const el of $("profs").querySelectorAll('input[type=text]')){
+    el.oninput = () => { S.profiles[+el.dataset.i][el.dataset.f] = el.value; };
+  }
+  for (const el of $("profs").querySelectorAll('input[type=checkbox]')){
+    el.onchange = () => {
+      const p = S.profiles[+el.dataset.i], f = el.dataset.f;
+      if (f === "none"){
+        // Mutually exclusive with picking sources: "none of them" and "these
+        // three" cannot both be the answer.
+        p.web_sources = el.checked ? ["__none__"] : [];
+        renderProfiles();
+        return;
+      }
+      const set = new Set((p[f]||[]).filter(v => v !== "__none__"));
+      el.checked ? set.add(el.value) : set.delete(el.value);
+      p[f] = [...set];
+      if (f === "web_sources") renderProfiles();
+    };
+  }
+  renderProfileOptions();
+}
+
+function pickList(i, field, options, chosen){
+  const picked = new Set(chosen||[]);
+  return options.map(o => `
+    <label class="pick"><input type="checkbox" value="${esc(o)}" data-i="${i}"
+      data-f="${field}" ${picked.has(o) ? "checked" : ""}>
+      <span>${esc(o)}</span></label>`).join("") ||
+    '<span class="note">none defined</span>';
+}
+
+// Caps are editable above, per-profile caps are not — they are shown so the
+// override is visible rather than a surprise at harvest time.
+function capSummary(p){
+  const caps = p.caps || {};
+  const keys = Object.keys(caps);
+  if (!keys.length) return "No cap overrides — the sliders above apply.";
+  return "Cap overrides: " +
+    keys.map(k => `${k}=${caps[k]}`).join(", ") +
+    " (edit in data/profiles.json)";
+}
+
+function addProfile(){
+  S.profiles.push({name:"", description:"", web_sources:[], keywords:[]});
+  renderProfiles();
+}
+function delProfile(i){ S.profiles.splice(i,1); renderProfiles(); }
+
+async function saveProfiles(){
+  const r = await fetch("/admin/api/profiles", {method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({profiles: S.profiles})});
+  const j = await r.json();
+  if(j.ok){ S.profiles=j.profiles; renderProfiles(); loadPlan();
+            say("Profiles saved. Applies to the next harvest."); }
+  else say(j.error||"save failed", true);
+}
+
+function renderProfileOptions(){
+  const keep = $("prof").value;
   $("prof").innerHTML = '<option value="">All sources</option>' +
-    S.profiles.map(p=>`<option value="${esc(p.name)}">${esc(p.name)}</option>`).join("");
+    S.profiles.filter(p=>p.name)
+      .map(p=>`<option value="${esc(p.name)}">${esc(p.name)}</option>`).join("");
+  $("prof").value = keep;
 }
 
 async function loadPlan(){

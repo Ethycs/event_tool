@@ -2,7 +2,9 @@
 
 **Status:** Living Document · **Date:** 2026-07-29 (row added 2026-08-06) · **Applies to:** `tests/`
 
-> **Counts below are stale and were already stale before 2026-08-06.** Measured 2026-08-10: **1179 collected, 0 failed, ~36s** (989 on 2026-08-06, 1018 on 2026-08-07). Recent passes added `test_instagram.py` (51), `test_gmail_bodies.py` (36) and `test_gmail_labels.py` (25) and amended the rows they touched, rather than re-auditing all 35 files; the per-file numbers elsewhere in §1 have not been re-counted since 2026-07-30.
+> **Counts below are stale and were already stale before 2026-08-06.** Measured 2026-08-12: **1340 collected, 0 failed, ~44s** (1314 before the calendar pass; 1179 on 2026-08-10, 1018 on 2026-08-07, 989 on 2026-08-06). Recent passes added `test_instagram.py` (51), `test_gmail_bodies.py` (36), `test_gmail_labels.py` (25), `test_llm_ini.py` (23), `test_keywords.py`, `test_regions.py`, `test_thumbnails.py`, `test_web_luma_partiful.py` and `test_calendar_html.py` (26) and amended the rows they touched, rather than re-auditing all 40-odd files; the per-file numbers elsewhere in §1 have not been re-counted since 2026-07-30.
+>
+> **`test_calendar_html.py` pins two things by asserting on absence**, which is unusual enough to note: that the page contains no `new Date('…')` and no `toISOString`, because the month grid has no DOM to inspect from pytest and a UTC-parsed date would be wrong in all 42 cells at once. Its `_code()` helper strips `//` comments first — the comment explaining why `toISOString` is wrong contains the word `toISOString`, and the first version of the test failed on its own documentation.
 >
 > **Running `pytest` outside `pixi run` costs you 8 tests.** `tests/test_link_extraction_dom.py` needs Playwright, which finds its Node driver via `CONDA_PREFIX` — set only by pixi's activation. Invoking `.pixi/envs/dev/Scripts/pytest.exe` directly reports `1074 passed, 8 errors`, and those errors are the harness, not the code. Same root cause as the LocalSystem service failure of 2026-08-07.
 

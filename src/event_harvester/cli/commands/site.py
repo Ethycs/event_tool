@@ -12,6 +12,7 @@ tracer = get_tracer("event_harvester.cli.commands.site")
 async def site_cmd(args, cfg) -> int:
     """Build the events site, then serve it unless --build-only."""
     from event_harvester.servers.site import (
+        SITE_CALENDAR,
         SITE_HTML,
         SiteState,
         refresh,
@@ -31,10 +32,17 @@ async def site_cmd(args, cfg) -> int:
                 print(f"  {YELLOW}Build failed: {snapshot['error']}{RESET}")
                 return 1
             print(f"\n  {BOLD}{snapshot['events']}{RESET} event(s) -> {SITE_HTML}")
+            print(f"  {DIM}{'':>{len(str(snapshot['events']))}}   calendar -> "
+                  f"{SITE_CALENDAR}{RESET}")
             print(f"  {DIM}Open it directly, or serve it: event-harvester site{RESET}\n")
             return 0
 
-        print(f"\n  {BOLD}Events site{RESET}  http://{args.host}:{args.port}")
+        base = f"http://{args.host}:{args.port}"
+        print(f"\n  {BOLD}Events site{RESET}  {base}")
+        # Named here because a page nobody can find is a page nobody has. Both
+        # /calendar and /admin were reachable and unlinked before this.
+        print(f"  {DIM}{base}/calendar   month grid{RESET}")
+        print(f"  {DIM}{base}/admin      caps, keywords, profiles{RESET}")
         print(f"  {DIM}refresh every {args.interval_hours}h · Ctrl-C to stop{RESET}")
         if args.host not in ("127.0.0.1", "localhost", "::1"):
             print(f"  {YELLOW}No authentication — do not expose this without a "
