@@ -180,9 +180,11 @@ class TestPage:
             assert f"<h2>{heading}</h2>" in body
 
     def test_it_carries_the_shared_nav(self, client):
+        """Relative hrefs — this origin is also reached through a proxy at
+        `/harvester`. See `tests/test_subpath_mount.py`."""
         body = client.get("/admin").text
-        assert 'href="/calendar"' in body and 'href="/"' in body
-        assert 'href="/admin" title="Caps, keyword lists and profiles" '\
+        assert 'href="calendar"' in body and 'href="."' in body
+        assert 'href="admin" title="Caps, keyword lists and profiles" '\
                'aria-current="page"' in body
 
     def test_the_nav_style_is_substituted_not_left_as_a_marker(self):

@@ -38,6 +38,15 @@ clearest possible signal: **a page with no inbound link has not shipped.**
 `outputs/nav.py` is the fix, and `event-harvester site` now prints all three
 URLs on startup.
 
+**The paths above are relative, not root-relative.** This origin is reached
+through a reverse proxy at `central-dev.zt/harvester` as well as directly on
+`:8800`, so a link to `/admin` lands on the proxy's root — a different
+application. D2 below says "`/admin/*` served by the same process on the same
+port", which remains true; what changed is that nothing may *spell* it with a
+leading slash. `/admin`'s five API fetches were the worst of it — the page
+rendered under the proxy and could not reach its own backend. See
+`03 - Architecture/05 - Outputs.md`, "Sub-path mounts".
+
 `/admin` implements four panels:
 
 | Panel | Backing store | Notes |

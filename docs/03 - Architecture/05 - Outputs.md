@@ -63,7 +63,19 @@ JavaScript source, not Python: the pages are self-contained files with no server
 
 `/admin` was mounted, tested and working for a full day with **nothing anywhere pointing at it** — which is functionally the same as not having shipped it. A page with no inbound link is not a feature.
 
-`nav_html(active)` renders the bar; `NAV_STYLE` carries its CSS. Both generated pages take `nav=False` by default and `servers/site.py` passes `nav=True`, because a forwarded copy has no origin — `/calendar` and `/admin` in an emailed file resolve against whatever site the recipient has open, or against `file:///admin`. `/admin` renders it unconditionally, since that page only ever exists on the origin. Links are root-relative: the site is reached as `localhost`, as a LAN address and as a ZeroTier address, and hard-coding any one would break the other two.
+`nav_html(active)` renders the bar; `NAV_STYLE` carries its CSS; `base_script(active)` pins the mount root (below). Both generated pages take `nav=False` by default and `servers/site.py` passes `nav=True`, because a forwarded copy has no origin — `calendar` and `admin` in an emailed file resolve against whatever directory the recipient opened it from. `/admin` renders both unconditionally, since that page only ever exists on the origin.
+
+### Sub-path mounts — **corrected 2026-08-12**
+
+The site is reached through a reverse proxy at **`central-dev.zt/harvester`**, as well as directly on `:8800`. The first version of the nav emitted root-relative links (`/calendar`, `/admin`) and `/admin` used root-relative `fetch()` for all five of its API calls. Under the proxy every one of them resolves against the *proxy's* root — `central-dev.zt/calendar` — so the nav pointed off the application and the admin page could not talk to its own backend.
+
+**No served page emits a root-relative URL.** Links and fetch targets are relative (`calendar`, `admin`, `admin/api/state`, `events.json`, `healthz`), which resolve correctly under any mount depth and on `:8800` too. There is deliberately **no configured base URL**: the same bytes are reached as `localhost`, as a LAN address, as a ZeroTier address and through the proxy, and hard-coding one breaks the other three. `tests/test_subpath_mount.py::TestNoAbsolutePaths` is the regression — a reintroduced `/` prefix breaks *only* behind the proxy and looks fine in every local check.
+
+Relative URLs have exactly one failure case, and it is the URL that was reported: **`/harvester` with no trailing slash**, where the browser's base is `/` and `calendar` resolves to `/calendar` again. `base_script` closes it — each page strips its own name off `location.pathname` and inserts a `<base>` while `<head>` is still parsing, so the element is in place before anything uses it. The static hrefs are already relative, so a page whose script never runs is still correct wherever the path has a trailing slash: degradation, not dependence.
+
+Resolved for all three pages × three mount spellings (`/`, `/harvester/`, `/harvester`), 15 distinct same-origin URLs, 2026-08-12.
+
+**`servers/site.py` also takes `root_path`** (`--root-path /harvester`, `EH_SITE_ROOT_PATH`) which mounts every route under the prefix *in addition to* the bare ones. That is for the other proxy shape — one that forwards `/harvester/calendar` unchanged rather than stripping it. It is not how the pages find each other and is not needed for a stripping proxy. `normalise_prefix` accepts every spelling (`harvester`, `/harvester/`, `//harvester//`) because `Mount` accepts exactly one.
 
 ## 1. `outputs/report.py` — Markdown report · **DEPRECATED 2026-07-30**
 
@@ -107,6 +119,8 @@ Built on Starlette + uvicorn, which `mcp`/`fastmcp` already pull in — **no new
 | `/healthz`, `POST /refresh` | — | state, identity, queue |
 
 `/` and `/calendar` are written together in one `_write` pass, so they cannot show different harvests. A calendar built lazily on first request would have been one more thing that can be stale. Both are served `no-store`: the point of the URL is that it is current.
+
+**Every route above is also reachable under a prefix** when `--root-path` is set, and the pages link relatively regardless — see "Sub-path mounts" above. The site is proxied at `central-dev.zt/harvester`.
 
 | Property | Why |
 |---|---|

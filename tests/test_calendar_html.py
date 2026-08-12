@@ -164,21 +164,23 @@ class TestWhatThePageOffers:
 
 class TestNav:
     def test_off_by_default_because_a_forwarded_file_has_no_origin(self, page):
-        assert 'href="/admin"' not in page
+        assert 'href="admin"' not in page
         assert "sitenav" not in page
 
     def test_on_when_served(self, tmp_path):
         path = tmp_path / "c.html"
         generate_calendar_html(_events(), output_path=str(path), nav=True)
         html = path.read_text(encoding="utf-8")
-        for target, label, _ in PAGES:
-            assert f'href="{target}"' in html
+        for _page, href, label, _hint in PAGES:
+            assert f'href="{href}"' in html
             assert f">{label}</a>" in html
 
     def test_the_current_page_is_marked(self):
-        assert 'href="/calendar" title="The same events on a month grid" '\
-               'aria-current="page"' in nav_html("/calendar")
-        assert nav_html("/calendar").count("aria-current") == 1
+        """Keyed by page id, not by path — the hrefs are relative so the site
+        can be mounted at `/harvester`. See `tests/test_subpath_mount.py`."""
+        assert 'href="calendar" title="The same events on a month grid" '\
+               'aria-current="page"' in nav_html("calendar")
+        assert nav_html("calendar").count("aria-current") == 1
 
     def test_no_active_page_means_no_nav(self):
         assert nav_html("") == ""
@@ -189,8 +191,8 @@ class TestNav:
         path = tmp_path / "index.html"
         generate_html_report(_events(), output_path=str(path), nav=True)
         html = path.read_text(encoding="utf-8")
-        assert 'href="/calendar"' in html and 'href="/admin"' in html
-        assert 'href="/" title="Everything found, newest harvest" '\
+        assert 'href="calendar"' in html and 'href="admin"' in html
+        assert 'href="." title="Everything found, newest harvest" '\
                'aria-current="page"' in html
 
     def test_the_list_page_stays_linkless_by_default(self, tmp_path):
@@ -198,7 +200,7 @@ class TestNav:
 
         path = tmp_path / "index.html"
         generate_html_report(_events(), output_path=str(path))
-        assert 'href="/admin"' not in path.read_text(encoding="utf-8")
+        assert 'href="admin"' not in path.read_text(encoding="utf-8")
 
 
 class TestEmpty:

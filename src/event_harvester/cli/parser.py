@@ -318,6 +318,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Serve the cached events; do not harvest at startup")
     p_site.add_argument("--build-only", action="store_true",
                         help="Build the page and exit without serving")
+    p_site.add_argument("--root-path", default="", metavar="PREFIX",
+                        help="Also serve every route under PREFIX, e.g. /harvester. "
+                             "Only needed when a reverse proxy forwards the prefix "
+                             "instead of stripping it; the pages themselves use "
+                             "relative URLs and need no configuration either way")
     p_site.add_argument("--reload", action="store_true",
                         help="Dev: restart on source changes (uvicorn --reload). "
                              "Serves cached events and does not harvest per restart")

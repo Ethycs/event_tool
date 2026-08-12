@@ -15,6 +15,7 @@ async def site_cmd(args, cfg) -> int:
         SITE_CALENDAR,
         SITE_HTML,
         SiteState,
+        normalise_prefix,
         refresh,
         run_site,
         run_site_reload,
@@ -37,12 +38,16 @@ async def site_cmd(args, cfg) -> int:
             print(f"  {DIM}Open it directly, or serve it: event-harvester site{RESET}\n")
             return 0
 
-        base = f"http://{args.host}:{args.port}"
+        prefix = normalise_prefix(getattr(args, "root_path", ""))
+        base = f"http://{args.host}:{args.port}{prefix}"
         print(f"\n  {BOLD}Events site{RESET}  {base}")
         # Named here because a page nobody can find is a page nobody has. Both
         # /calendar and /admin were reachable and unlinked before this.
         print(f"  {DIM}{base}/calendar   month grid{RESET}")
         print(f"  {DIM}{base}/admin      caps, keywords, profiles{RESET}")
+        if prefix:
+            print(f"  {DIM}also unprefixed on this port; the pages link "
+                  f"relatively either way{RESET}")
         print(f"  {DIM}refresh every {args.interval_hours}h · Ctrl-C to stop{RESET}")
         if args.host not in ("127.0.0.1", "localhost", "::1"):
             print(f"  {YELLOW}No authentication — do not expose this without a "
@@ -60,6 +65,7 @@ async def site_cmd(args, cfg) -> int:
                 interval_hours=args.interval_hours,
                 harvest_on_start=not args.no_harvest_on_start and args.harvest_on_reload,
                 schedule=not args.no_schedule and args.harvest_on_reload,
+                root_path=prefix,
             )
 
         return await run_site(
@@ -69,4 +75,5 @@ async def site_cmd(args, cfg) -> int:
             interval_hours=args.interval_hours,
             harvest_on_start=not args.no_harvest_on_start,
             schedule=not args.no_schedule,
+            root_path=prefix,
         )

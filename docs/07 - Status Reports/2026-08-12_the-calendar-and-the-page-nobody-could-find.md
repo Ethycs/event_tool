@@ -1,8 +1,8 @@
 # Session Report — a month grid, and the page that shipped without a link
 
 **Date**: 2026-08-12 (second pass) · **Status**: ✅ LANDED
-**Scope**: `/calendar` · shared nav · profile editor · the `/admin` cap-clamping defect · a destroyed config file
-**Tests**: 1365 passed, 0 failed (1314 at start) · **Lint**: 43, unchanged
+**Scope**: `/calendar` · shared nav · profile editor · the `/admin` cap-clamping defect · a destroyed config file · **the sub-path mount**
+**Tests**: 1395 passed, 0 failed (1314 at start) · **Lint**: 43, unchanged
 **Follows**: [2026-08-12_email-extraction-discovery-and-the-percent-bug.md](2026-08-12_email-extraction-discovery-and-the-percent-bug.md)
 
 ---
@@ -130,7 +130,51 @@ Three things worth carrying forward:
 
 ---
 
+## 4a. The nav I had just built was wrong behind the proxy
+
+The site is served at **`central-dev.zt/harvester`** through a reverse proxy,
+not only on `:8800`. I had written the nav with root-relative links —
+`/calendar`, `/admin` — and the docstring justifying them ("reached by several
+names, so no hard-coded base URL") was right about the goal and wrong about the
+mechanism: **a root-relative URL is still absolute about the mount point.**
+Under the proxy they all resolve against `central-dev.zt/`, off the application
+entirely.
+
+`/admin` was the worst of it. Five root-relative `fetch()` calls meant the page
+rendered under the proxy and could not reach its own backend — the panels would
+have come up empty with nothing in the UI to say why.
+
+Now nothing served emits a leading slash. 15 same-origin URLs across the three
+pages, all relative, resolved against three mount spellings:
+
+| | `/` | `/harvester/` | `/harvester` |
+|---|---|---|---|
+| index · calendar · admin | ✓ | ✓ | ✓ |
+
+The third column is the one relative URLs cannot do alone: with no trailing
+slash the browser's base is `/`, so `calendar` resolves to `/calendar` again.
+`base_script` closes it — each page strips its own name off
+`location.pathname` and inserts a `<base>` while `<head>` is still parsing. The
+static hrefs stay relative, so a page whose script never runs is still correct
+wherever the path has a trailing slash. **Degradation, not dependence.**
+
+`servers/site.py` also gained `--root-path` / `EH_SITE_ROOT_PATH`, which mounts
+every route under the prefix *in addition to* the bare ones. That is for the
+other proxy shape — one that forwards `/harvester/calendar` unchanged instead
+of stripping it. **Not needed for a stripping proxy, and not how the pages find
+each other.** Unset by default; the service command line is unchanged.
+
+`tests/test_subpath_mount.py` (30) pins both halves. The regression that matters
+is `TestNoAbsolutePaths`: a reintroduced `/` prefix breaks **only** behind the
+proxy and looks correct in every local check, which is exactly how this one got
+written in the first place.
+
+---
+
 ## 5. What is where now
+
+Reachable both directly on `:8800` and through the proxy at
+`central-dev.zt/harvester`:
 
 | | |
 |---|---|
@@ -169,13 +213,21 @@ after a disappointing one.
 ## Verification
 
 ```powershell
-pixi run test                                   # 1365 passed
+pixi run test                                   # 1395 passed
 pixi run lint                                   # 43, all pre-existing
 pixi run event-harvester site --build-only      # writes index.html + calendar.html
 curl http://127.0.0.1:8800/calendar             # 200, ~247 KB
 curl http://127.0.0.1:8800/admin                # Caps / Keywords / Profiles / Searches
+curl -s http://127.0.0.1:8800/admin | Select-String 'href="/'   # must find nothing
 ```
 
 `unverified` — the grid has been built, served, and read from `/calendar`, but
 its interaction (day panel, month paging, month export) has been exercised only
 by reading the code, not by clicking it in a browser.
+
+`unverified` — the sub-path fix is proven by resolving all 15 URLs against all
+three mount spellings in Python, and by the served pages containing no leading
+slash. **It has not been loaded through the actual proxy**, and which of the two
+proxy shapes `central-dev.zt` uses is unknown here. If pages 404 rather than
+mislink, it is the forwarding shape: add `--root-path /harvester` to the
+service command line.

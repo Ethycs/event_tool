@@ -222,12 +222,33 @@ def _write(events: list[dict], source_counts: dict[str, int], total_messages: in
     )
 
 
+def normalise_prefix(prefix: str) -> str:
+    """`harvester`, `/harvester/`, `//harvester` → `/harvester`. Empty stays empty.
+
+    Every spelling an operator might reasonably type or paste out of an nginx
+    config maps to the one form `Mount` accepts — it requires a leading slash
+    and rejects a trailing one.
+    """
+    p = (prefix or "").strip().strip("/")
+    return f"/{p}" if p else ""
+
+
 def build_app(cfg, *, interval_hours: float = DEFAULT_INTERVAL_HOURS,
-              harvest_on_start: bool = True, schedule: bool = True):
-    """Build the Starlette app that serves the site."""
+              harvest_on_start: bool = True, schedule: bool = True,
+              root_path: str = ""):
+    """Build the Starlette app that serves the site.
+
+    ``root_path`` additionally mounts every route under a prefix, for the case
+    where a reverse proxy forwards `/harvester/calendar` **unchanged** rather
+    than stripping the prefix first. It is not needed for a stripping proxy,
+    and it is not how the pages find each other — they use relative URLs and
+    work under any mount depth without being told about it (`outputs/nav.py`).
+    The unprefixed routes stay registered either way, so `:8800/calendar`
+    keeps working while the proxy path does too.
+    """
     from starlette.applications import Starlette
     from starlette.responses import FileResponse, JSONResponse, PlainTextResponse
-    from starlette.routing import Route
+    from starlette.routing import Mount, Route
 
     state = SiteState()
     tracer = get_tracer(_TRACER)
@@ -324,18 +345,24 @@ def build_app(cfg, *, interval_hours: float = DEFAULT_INTERVAL_HOURS,
     # that module's docstring for what this origin still lacks.
     from event_harvester.servers.admin import build_routes as admin_routes
 
-    app = Starlette(
-        debug=False,
-        routes=[
-            Route("/", index),
-            Route("/calendar", calendar_page),
-            Route("/events.json", events_json),
-            Route("/healthz", healthz),
-            Route("/refresh", refresh_now, methods=["POST"]),
-            *admin_routes(),
-        ],
-        lifespan=lifespan,
-    )
+    routes = [
+        Route("/", index),
+        Route("/calendar", calendar_page),
+        Route("/events.json", events_json),
+        Route("/healthz", healthz),
+        Route("/refresh", refresh_now, methods=["POST"]),
+        *admin_routes(),
+    ]
+    prefix = normalise_prefix(root_path)
+    if prefix:
+        # Mounted *first* so the prefixed path wins, and the bare routes kept
+        # after it so direct access on the port is unaffected. `Mount` also
+        # redirects `/harvester` to `/harvester/`, which is the one case
+        # relative URLs alone cannot resolve.
+        routes = [Mount(prefix, routes=list(routes)), *routes]
+        logger.info("site: also serving under %s", prefix)
+
+    app = Starlette(debug=False, routes=routes, lifespan=lifespan)
     app.state.site = state
     return app
 
@@ -362,12 +389,14 @@ def make_app():
         interval_hours=float(os.environ.get("EH_SITE_INTERVAL_HOURS", DEFAULT_INTERVAL_HOURS)),
         harvest_on_start=_flag("EH_SITE_HARVEST_ON_START"),
         schedule=_flag("EH_SITE_SCHEDULE"),
+        root_path=os.environ.get("EH_SITE_ROOT_PATH", ""),
     )
 
 
 def run_site_reload(*, host: str = "127.0.0.1", port: int = 8800,
                     interval_hours: float = DEFAULT_INTERVAL_HOURS,
-                    harvest_on_start: bool = False, schedule: bool = False) -> int:
+                    harvest_on_start: bool = False, schedule: bool = False,
+                    root_path: str = "") -> int:
     """Serve with uvicorn's auto-reloader, in a subprocess.
 
     A subprocess rather than in-process because uvicorn implements reload by
@@ -382,6 +411,7 @@ def run_site_reload(*, host: str = "127.0.0.1", port: int = 8800,
     env["EH_SITE_INTERVAL_HOURS"] = str(interval_hours)
     env["EH_SITE_HARVEST_ON_START"] = "1" if harvest_on_start else "0"
     env["EH_SITE_SCHEDULE"] = "1" if schedule else "0"
+    env["EH_SITE_ROOT_PATH"] = root_path
 
     cmd = [
         sys.executable, "-m", "uvicorn",
@@ -400,7 +430,8 @@ def run_site_reload(*, host: str = "127.0.0.1", port: int = 8800,
 
 async def run_site(cfg, *, host: str = "127.0.0.1", port: int = 8800,
                    interval_hours: float = DEFAULT_INTERVAL_HOURS,
-                   harvest_on_start: bool = True, schedule: bool = True) -> int:
+                   harvest_on_start: bool = True, schedule: bool = True,
+                   root_path: str = "") -> int:
     """Serve the site until interrupted. Returns an exit code.
 
     A coroutine, not a sync function, and `uvicorn.Server.serve()` rather than
@@ -415,7 +446,8 @@ async def run_site(cfg, *, host: str = "127.0.0.1", port: int = 8800,
     import uvicorn
 
     app = build_app(cfg, interval_hours=interval_hours,
-                    harvest_on_start=harvest_on_start, schedule=schedule)
+                    harvest_on_start=harvest_on_start, schedule=schedule,
+                    root_path=root_path)
     if host not in ("127.0.0.1", "localhost", "::1"):
         logger.warning(
             "site: binding to %s — these events are personal and this server has "

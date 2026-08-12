@@ -40,7 +40,7 @@ from event_harvester.observability.metrics import count, record
 from event_harvester.observability.tracing import set_span_attrs, traced
 from event_harvester.outputs.deeplinks import ticktick_deep_link
 from event_harvester.outputs.ics import ICS_JS
-from event_harvester.outputs.nav import NAV_STYLE, nav_html
+from event_harvester.outputs.nav import NAV_STYLE, base_script, nav_html
 from event_harvester.outputs.regions import HINTS as REGION_HINTS
 from event_harvester.outputs.regions import LABELS as REGION_LABELS
 from event_harvester.outputs.regions import REGIONS
@@ -726,9 +726,11 @@ def generate_html_report(
     sites. `links` is deliberately absent — the Markdown report's "Top Links"
     section is a debugging aid, and this file is meant to be forwarded.
 
-    ``nav`` adds the cross-page links (`/calendar`, `/admin`) and defaults to
-    off: those paths only exist on the origin that serves this, and a forwarded
-    copy would carry three dead links. `servers/site.py` turns it on.
+    ``nav`` adds the cross-page links and the mount-root `<base>`, and defaults
+    to off: those paths only exist on the origin that serves this, and a
+    forwarded copy would carry three dead links. `servers/site.py` turns it on.
+    Every URL it emits is **relative**, because the site is also reached
+    through a reverse proxy at a sub-path — see `outputs/nav.py`.
 
     ``today`` defaults to the **local** date, and that is load-bearing. Event
     dates are local wall-clock dates scraped from venue pages: a 9pm SF show is
@@ -801,12 +803,13 @@ def generate_html_report(
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
+{base_script("index" if nav else "")}
 <title>{title} — {len(prepared)}</title>
 <style>{_STYLE}{NAV_STYLE if nav else ""}</style>
 </head>
 <body>
 <header>
-  {nav_html("/" if nav else "")}
+  {nav_html("index" if nav else "")}
   <h1>{title}</h1>
   <div class="meta">{len(prepared)} event(s) · generated
     <span id="generated">{generated}</span></div>

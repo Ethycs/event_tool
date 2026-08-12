@@ -246,17 +246,21 @@ def render_page() -> str:
     """The admin page. Served from here rather than a template file so the
     service has no runtime asset dependency — same choice `html_report.py`
     made, for the same reason."""
-    from event_harvester.outputs.nav import NAV_STYLE, nav_html
+    from event_harvester.outputs.nav import NAV_STYLE, base_script, nav_html
 
-    # This page only ever exists on the origin, so its nav is unconditional —
-    # unlike the two generated pages, which can be forwarded away from it.
-    return _PAGE.replace("<!--NAV-->", nav_html("/admin")).replace(
-        "/*NAV-STYLE*/", NAV_STYLE)
+    # This page only ever exists on the origin, so its nav and its <base> are
+    # unconditional — unlike the two generated pages, which can be forwarded
+    # away from the origin entirely.
+    return (_PAGE
+            .replace("<!--BASE-->", base_script("admin"))
+            .replace("<!--NAV-->", nav_html("admin"))
+            .replace("/*NAV-STYLE*/", NAV_STYLE))
 
 
 _PAGE = r"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<!--BASE-->
 <title>Event Harvester — Admin</title>
 <style>
   :root{--bg:#0f1115;--card:#171a21;--line:#262b36;--fg:#e6e9ef;--dim:#9aa4b6;
@@ -319,7 +323,7 @@ _PAGE = r"""<!doctype html>
   <!--NAV-->
   <div class="headline">
     <h1>Event Harvester — Admin</h1>
-    <a href="/healthz">health</a>
+    <a href="healthz">health</a>
     <span id="status" class="note"></span>
   </div>
 </header>
@@ -403,7 +407,7 @@ function say(msg, bad){ const el=$("status");
   setTimeout(()=>{el.textContent="";}, 4000); }
 
 async function load(){
-  const r = await fetch("/admin/api/state");
+  const r = await fetch("admin/api/state");
   S = await r.json();
   renderEq(); renderKeywords(); renderProfiles(); renderPlan(S.plan);
 }
@@ -475,7 +479,7 @@ function capsPayload(){
 }
 
 async function saveCaps(){
-  const r = await fetch("/admin/api/caps", {method:"POST",
+  const r = await fetch("admin/api/caps", {method:"POST",
     headers:{"Content-Type":"application/json"},
     body: JSON.stringify({caps: capsPayload()})});
   const j = await r.json();
@@ -509,7 +513,7 @@ function addList(){ S.keywords.push({name:"", description:"", terms:[]}); render
 function delList(i){ S.keywords.splice(i,1); renderKeywords(); }
 
 async function saveKeywords(){
-  const r = await fetch("/admin/api/keywords", {method:"POST",
+  const r = await fetch("admin/api/keywords", {method:"POST",
     headers:{"Content-Type":"application/json"},
     body: JSON.stringify({keywords: S.keywords})});
   const j = await r.json();
@@ -598,7 +602,7 @@ function addProfile(){
 function delProfile(i){ S.profiles.splice(i,1); renderProfiles(); }
 
 async function saveProfiles(){
-  const r = await fetch("/admin/api/profiles", {method:"POST",
+  const r = await fetch("admin/api/profiles", {method:"POST",
     headers:{"Content-Type":"application/json"},
     body: JSON.stringify({profiles: S.profiles})});
   const j = await r.json();
@@ -617,7 +621,7 @@ function renderProfileOptions(){
 
 async function loadPlan(){
   const p = $("prof").value;
-  const r = await fetch("/admin/api/plan" + (p ? `?profile=${encodeURIComponent(p)}` : ""));
+  const r = await fetch("admin/api/plan" + (p ? `?profile=${encodeURIComponent(p)}` : ""));
   const j = await r.json();
   renderPlan(j.plan || []);
 }
