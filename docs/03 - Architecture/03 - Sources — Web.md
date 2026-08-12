@@ -92,7 +92,40 @@ The structural difference from `feed_probe` is that **validation is impossible h
 
 ## Modes
 
-**The modes are** `calendar`, `feed`, `search`, `raw`, `ics`, `chat`, `steps` (2026-07-30), and `instagram` (2026-08-06). Each has its own file, OTel span, and dispatch branch in `fetch_web_sources`; `web_modes/__init__.py` re-exports them and `__all__` is the count.
+**The modes are** `calendar`, `feed`, `search`, `raw`, `ics`, `chat`, `steps` (2026-07-30), `instagram` (2026-08-06), `rss` (2026-08-07), and `luma` + `partiful` (2026-08-10). Each has its own file, OTel span, and dispatch branch in `fetch_web_sources`; `web_modes/__init__.py` re-exports them and `__all__` is the count.
+
+**Four of the eleven are browser-free** — `ics`, `rss`, `luma`, `partiful` — and that group keeps growing for one reason: a platform that publishes structured data does not need to be scraped, and scraping it is *worse*, not merely more expensive. See below.
+
+## Modules: `luma.py` and `partiful.py` — read what the platform already publishes
+
+**Added 2026-08-10.** **Domain:** turn an event platform's own structured payload into one message per event. **Runs at:** harvest, dispatched before any page is opened. **Inputs:** a URL and (Partiful) a city. **Outputs:** message records.
+
+**Why they exist.** `luma` was already configured — `mode: "calendar"` against `lu.ma/discover` — and measured 2026-08-10 it produced **1 message and 1 event**, from a page whose own directory reads "San Francisco 80 Events". This is precisely the failure `rss` was written for three days earlier, recurring on the largest event platform in the city: **one blob in, one event out, however many the page lists.**
+
+Three findings came from probing rather than reasoning, and each changed the design:
+
+| Probed | Found |
+|---|---|
+| `lu.ma` | 301s to `luma.com`. The old URL worked, at a redirect per fetch |
+| `luma.com/discover` | server-renders **zero** events — its `__NEXT_DATA__` `data` block is empty. The city pages render 20. *The URL you are given is not the page with the events*, again |
+| `api.lu.ma/discover/get-paginated-events` | a **keyless** JSON API behind the city page, returning `entries` / `has_more` / `next_cursor` — **45 SF events to one unauthenticated GET** |
+
+So `luma` paginates the API rather than parsing a 400 KB page, and resolves the opaque `place_api_id` from the human-readable city URL by default, because a hardcoded id is a thing that silently rots.
+
+`partiful` has no API — Partiful is invitation-shaped — but `/explore` inlines its trending events into the Next.js props, bucketed by city. **`city` is the load-bearing field:** the live sections are `NYC`, `LA`, `SF` **in that order**, so a mode that took the first would have filled an SF calendar with New York. That is the `ma.to` trap from `10 - Blueprints/01`, and it is why a missing city logs the available ones and returns nothing rather than falling back.
+
+**Measured 2026-08-10**, end-to-end through the real pipeline:
+
+| Source | Before | After |
+|---|---|---|
+| `luma` | 1 message → **1 event** | 60 messages → **13 events** |
+| `partiful` | *(did not exist)* | 4 messages → **4 events** |
+
+`known rough edge`: **`luma.com/sf` is Bay Area-wide, not San Francisco.** The 13 events included Fremont, Stanford, Santa Clara, Mountain View and Saratoga. That is Luma's own definition of the place, not a bug here, but a city-proper calendar wants a distance filter that does not exist yet.
+
+`known rough edge`: 60 messages yielding 13 events is a lower conversion than `rss` achieves (105 → 65) and has not been diagnosed. Candidates: virtual events the prompt is told to ignore, dedup collapsing recurring series, and per-batch extraction variance.
+
+`unverified`: neither API is documented or contractual. Luma's `next_cursor` shape and Partiful's `trendingSections` path are both observed, not promised, and either can change without notice. Both modes degrade to an empty list with an error log rather than an exception.
 
 *Two places once said "five" and were fixed 2026-07-29. The durable half of that fix was deleting the number from the `web_modes/__init__.py` docstring and pointing at `__all__` — this section is now on its fourth count, which is the argument.*
 

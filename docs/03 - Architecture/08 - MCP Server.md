@@ -28,6 +28,8 @@ Two processes rather than one because the economics differ. The backend holds a 
 
 **The backend has no authentication of its own.** That is deliberate *given* it binds loopback — but it means the backend's bind address is a security control, not a preference. `--host 0.0.0.0` on the backend puts every tool on every interface with nothing in front of it, bypassing the gateway entirely. `known rough edge`: nothing in the code enforces this; only the gateway refuses to expose itself unauthenticated.
 
+**Scoped 2026-08-10:** these services run **inside a ZeroTier mesh whose peers are all authenticated**, so "every interface" means every mesh interface, not the public internet — reaching the port requires already being an authorized member. That materially reduces the severity of the `0.0.0.0` bind recorded above and in `07 - Status Reports/2026-08-07` §6, and it is why "no auth on the origin" is not tracked as open work. It does **not** retire the rule that the bind address is a control: the mesh is the boundary, so anything that moves a bind outside it — a public interface, a port forward, a cloud host — puts unauthenticated tools that spend LLM tokens and drive a logged-in browser on the open internet.
+
 `verified 2026-07-31` — with a single backend, FastMCP 3.4.5 proxies tool names through **unprefixed** (`harvest_events`, not `event-harvester_harvest_events`). Adding a second backend without re-checking is where a name collision would surface.
 
 Both run as Windows services; see `servers/service.py` and `docs/04 - Reference/CLI Command Reference.md`. `EventHarvesterGateway` declares `DependOnService EventHarvesterMCP`.

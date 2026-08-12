@@ -104,7 +104,7 @@ before   1 of 31 sources          after   Web sources: 499 messages from 31 sour
 - **`extract_event_links.js` compares hostnames exactly**, so a site serving `example.com` while linking `www.example.com` loses every link. Measured: 0 of ~40 on Bottom of the Hill, 2 with the `www` URL.
 - **The message cache keys on the platform set, not the web-source selection**, so `--web-source A` can return B's messages. The code comment says this was a symptom of a fixed path bug; the cache-key half is still live. There is no `--skip-cache` flag.
 - **stdio MCP bypasses the queue** — a per-client subprocess must not own a runner. `data/.harvest.lock` is the recorded fix.
-- **`EventHarvesterMCP` binds `0.0.0.0` with no auth** and is a *service*, so it survives reboots. Flagged three times; deliberately not changed, because it alters a binding that may be reached from elsewhere.
+- ~~**`EventHarvesterMCP` binds `0.0.0.0` with no auth**~~ — **resolved as a non-issue 2026-08-10.** These services run inside a **ZeroTier mesh whose peers are all authenticated**, so the bind is mesh-wide, not internet-wide, and reaching it requires already being an authorized member. Flagged three times across sessions on an assumption nobody had checked with the operator; the answer was one question away. Still true that moving any bind *outside* the mesh would make it a real exposure.
 - **`data/.web_traces` is 124 MB** with no cleanup policy.
 
 ---
@@ -118,7 +118,7 @@ before   1 of 31 sources          after   Web sources: 499 messages from 31 sour
 | Git | `main` **25 ahead** of `origin/main`. **31 of 70 modules do not import — see §1.** `origin/main` itself is clean |
 | Services | `EventHarvesterSite` RUNNING @`c081004` (restarted 2026-08-07, no longer stale), `EventHarvesterMCP` RUNNING, `EventHarvesterGateway` not installed |
 | Queue | empty |
-| Site | `http://192.168.1.67:8800`, firewall rule scoped to LocalSubnet, **no auth** |
+| Site | `http://192.168.1.67:8800`, firewall rule scoped to LocalSubnet. No application auth — **served inside an authenticated ZeroTier mesh**, see §6 |
 | Not mine | `.dvc/` + 6 pointers, and the **Instagram work** (§1) — neither committed by me |
 
 `service doctor` reproduces most of this in one command, and did in fact discover the stale site on its own.

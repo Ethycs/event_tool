@@ -50,15 +50,35 @@ def _normalize_queries(src: dict) -> list[str]:
     Returns ``[]`` when none is set, which means "don't search, just scroll
     whatever the URL already shows".
     """
+    # A source may name shared keyword lists instead of inlining its queries.
+    # Those are the operator's own words (`data/keywords.json`) and this is the
+    # one mode that can actually type them into a site, so they come first.
+    if src.get("keywords"):
+        from event_harvester.keywords import terms_for
+
+        shared = terms_for(src["keywords"])
+        if shared:
+            inline = src.get("queries", src.get("query")) or []
+            if isinstance(inline, str):
+                inline = [inline]
+            return _dedupe_queries([*shared, *inline])
+
     raw = src.get("queries", src.get("query"))
     if raw is None:
         return []
     if isinstance(raw, str):
         raw = [raw]
+    return _dedupe_queries(raw)
+
+
+def _dedupe_queries(raw) -> list[str]:
+    """Trim, drop blanks, de-duplicate case-insensitively, preserve order."""
     out: list[str] = []
-    for q in raw:
-        q = str(q).strip()
-        if q and q not in out:
+    seen: set[str] = set()
+    for q in raw or []:
+        q = " ".join(str(q).split())
+        if q and q.lower() not in seen:
+            seen.add(q.lower())
             out.append(q)
     return out
 

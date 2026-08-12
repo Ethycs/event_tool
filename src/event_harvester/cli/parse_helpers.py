@@ -48,10 +48,13 @@ def parse_cap_arg(raw: str) -> dict[str, int]:
             raise argparse.ArgumentTypeError(
                 f"--cap {k} must be an integer, got {v!r}"
             ) from e
+        # -1 is "unlimited" — the config default since 2026-08-11 and the way
+        # `prioritize_with_caps` has always spelled it. Rejecting it here left
+        # the flag unable to express the value the config itself defaults to.
+        # Any other negative normalises to -1 rather than erroring, matching
+        # `config._clamp_cap`, so the two paths cannot disagree.
         if n < 0:
-            raise argparse.ArgumentTypeError(
-                f"--cap {k} must be >= 0, got {n}"
-            )
+            n = -1
         out[k] = n
     return out
 

@@ -19,6 +19,44 @@ And **profiles** already do part of the job categories were presumably meant for
 
 That overlap is the first thing this design has to resolve, because "a page for running all or some categories" is ambiguous until it is.
 
+## 0a. What is BUILT, as of 2026-08-10
+
+This document is a design; most of it is still unbuilt. One page now exists and
+is served at **`/admin`** on the site origin (`servers/admin.py`, mounted by
+`servers/site.py`), implementing three things:
+
+| Panel | Backing store | Notes |
+|---|---|---|
+| **Caps equalizer** — slider + number + an **∞** toggle per source, plus `total` | `data/settings.json` (`config.load_caps_overlay`) | Overlay only. Delete the file and `.env`/defaults apply again, unchanged. `-1` = unlimited (**the default**), `0` = drop that source, otherwise clamped to `5000`; unknown keys dropped. Any negative normalises to `-1` rather than `0`, so a typo cannot silently mean "drop everything from this source" |
+| **Keyword lists** | `data/keywords.json` (`keywords.py`) | Name + description + terms. Names are validated lowercase-kebab |
+| **Searches** — what each source will do with its keywords | derived, `keywords.plan_for_source` | Shows the **strength** of each: `native` / `category` / `local` |
+
+The Searches panel is the one worth explaining. It exists because "search my
+keywords on Luma, Meetup and Instagram" **cannot be delivered uniformly** — see
+§2.5 — and a UI that listed sources without saying which of them can actually
+be queried would be lying by omission. The table names the mechanism per
+source, so the degradation is visible *before* a run rather than inferred from
+disappointing output.
+
+Still unbuilt from this design: `/admin/sources`, the tag vocabulary, the
+`enabled` flag, and the run page. Profiles are editable through the API
+(`POST /admin/api/profiles`) but have no editor UI yet — the page reads them to
+scope the Searches table.
+
+**On access control — answered 2026-08-10.** These routes write config and the
+origin carries no application-level auth, which earlier drafts of this document
+and several status reports flagged as an open exposure. **It is not: the
+services are served inside a ZeroTier mesh whose peers are all authenticated**,
+so reaching the port requires being an authorized member. "Add auth to /admin"
+is settled, not outstanding, and should not keep resurfacing as a blocker on UI
+work.
+
+The handlers still validate against closed vocabularies and write atomically
+(temp + `os.replace`). That guards against *mistakes* rather than intruders —
+a mistyped cap costs money at the LLM stage, and a half-written `keywords.json`
+breaks the next harvest hours later, far from its cause. Worth keeping on those
+grounds alone. A genuine escalation would be binding beyond the mesh.
+
 ## 1. Decisions taken
 
 ### D1 — Categories are tags, many per source
@@ -84,6 +122,45 @@ So the run page must always offer an explicit **"untagged"** pseudo-tag, and mig
 ```
 
 Resolution order, and it must be stated because it is where surprises live: **tag query → union with explicit `web_sources` → subtract `none` → drop `enabled: false`**. A disabled source is never harvested, however it was selected. `unverified` — no code implements this yet; it is a specification.
+
+### 2.5 `data/keywords.json` — the operator's own words
+
+**Built 2026-08-10.** Named lists, referenced by a source's `keywords` field
+(`EH-STD-WEBSRC-v0`) so one list can feed several sources instead of each
+inlining its own strings — which is how `meetup` came to be the only source
+with any queries at all.
+
+```jsonc
+{"lists": [
+  {"name": "ai", "description": "…", "terms": ["AI", "machine learning", "LLM"]}
+]}
+```
+
+**A keyword cannot mean the same thing on every platform, and this is the
+finding the whole feature rests on.** Measured 2026-08-10:
+
+| Platform | Free-text search? | A keyword becomes |
+|---|---|---|
+| Meetup | yes | a query typed into the site — `native` |
+| Luma | **no**, `api.lu.ma/search/get-results` → *"You are not signed in"* | one of 5 public categories if it matches, else `local` |
+| Partiful | **no**, 5 trending per city is the whole public surface | `local` |
+| Instagram | hashtag search needs a login | `local`, over the configured accounts |
+
+So `keywords.plan_for_source` returns a **strength** — `native`, `category` or
+`local` — and `/admin` renders it. The alternative, listing every source as
+"searched", would have been a lie the user only discovered from thin results.
+
+**Local matching tags rather than filters**, and that was a decision, not an
+oversight. Everything fetched still reaches the pipeline; a match sets
+`_keywords` and earns +4 in `analysis.score_message`, so it wins a cap slot
+instead of the non-matches being deleted. Filtering was rejected because the
+caps already discard ~98% of what is fetched (`07 - Status Reports/2026-08-07`
+§4) — a keyword filter on top would narrow the funnel twice, and Luma is
+currently the largest single source of real events.
+
+Matching is word-boundary and case-insensitive. That is not a detail: the most
+valuable short keywords — `AI`, `VC`, `ML` — are exactly the ones a substring
+test ruins, firing on "blockchain" and "said".
 
 ## 3. Route map
 

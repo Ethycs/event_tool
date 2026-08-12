@@ -76,16 +76,86 @@ Four independent message sources — Discord, Telegram, Gmail, Signal — each e
 
 - `_get_credentials()` — builds an ordered candidate list, (1) `GMAIL_TOKEN_JSON` env, base64→JSON→`Credentials.from_authorized_user_info`, then (2) the `token.json` file, and hands each to `_use_token()`, which returns usable credentials or `None` so the loop moves on. A refreshed token is persisted back to `token_file` (note: refreshing an env-sourced token still gets written to the *file* path, not back to the env var — on a redeploy from env vars only, this refreshed token is lost unless something re-reads the file into the env). Only when every stored token is dead does it reach (3) fresh interactive OAuth via `GMAIL_CREDENTIALS_JSON` env (written to a temp file for `InstalledAppFlow`, deleted after) or `credentials.json` file, using `flow.run_local_server(port=0)` — **gated on `_oauth_flow_allowed()`**, i.e. a TTY or `GMAIL_OAUTH_INTERACTIVE=1`.
   **The loop is the point, and it is load-bearing.** Until 2026-07-30 the file was guarded by `if creds is None`, so an env token that merely *parsed* claimed the slot — and when its refresh failed, control skipped a working on-disk credential entirely. That combination (stale `.env` copy, live `token.json`) had Gmail silently returning nothing. Each candidate is now tried *to completion, refresh included*, before the next is considered.
-- `fetch_messages()` — builds query as `f"{cfg.query} after:{since:%Y/%m/%d}"`, paginates in batches of ≤100 up to `cfg.max_results`, and per message calls `messages().get(format="metadata")` (headers + snippet only, **not the full body**). `content` is `f"{subject}\n{snippet}"` — the snippet is Gmail's short preview text, not the full email.
+- `fetch_messages()` — builds query as `f"{cfg.query} after:{since:%Y/%m/%d}"`, paginates in batches of ≤100 up to `cfg.max_results`, and per message calls `messages().get(format="metadata")` (headers + snippet only). That yields `content = f"{subject}\n{snippet}"`, where the snippet is Gmail's preview text — **hard-capped by the API at 200 characters**. Since 2026-08-10 it then calls `hydrate_bodies()` unless `cfg.fetch_bodies` is off. Hydration happens *here*, inside the source, so `data/.message_cache.json` stores real bodies and the extra API calls are paid once per harvest rather than once per cache miss.
 - `channel` is derived by picking the first label on the message that isn't a system prefix (`CATEGORY_`, `UNREAD`, `IMPORTANT`, `SENT`, `DRAFT`), falling back to `"INBOX"` — this is a Gmail *label*, semantically unlike every other source's `channel` (which means a chat/room name).
-- `filter_read_sent()` — module-level filter (not called inside `fetch_messages`; called separately by `pipeline/orchestrator.py` after all sources are merged) that drops Gmail messages with `is_sent=True` or `is_read=True`, and passes every non-Gmail message through untouched.
-- `fetch_full_bodies()` — separate on-demand call (`format="full"`) used by `cli/commands/recruiters.py`; recursively walks MIME parts, prefers `text/plain`, falls back to HTML-with-tags-stripped via regex.
+- `filter_read_sent(messages, *, drop_read=True)` — module-level filter (not called inside `fetch_messages`; called separately by `pipeline/orchestrator.py` after all sources are merged). Always drops `is_sent=True`; drops `is_read=True` only when `drop_read`. The **parameter default stays `True`** because that is what the recruiter-triage callers mean by "actionable"; `orchestrator.py` passes `cfg.gmail.drop_read`, which defaults to **False**. Non-Gmail messages pass through untouched.
+- `fetch_full_bodies()` — `format="full"` fetch returning `dict[id, body]`; recursively walks MIME parts, prefers `text/plain`, falls back to HTML-with-tags-stripped via regex. Callers: `hydrate_bodies` and `cli/commands/recruiters.py`. **Sequential**, one `get` per message.
+- `hydrate_bodies()` — **added 2026-08-10.** Replaces the 200-char snippet with the real body. See "Why the snippet was not enough" below.
+- `ensure_label()` / `apply_label()` / `label_event_messages()` — **added 2026-08-10**, see "Labelling the mail that produced an event" below.
 - `reply()`/`trash()`/`delete()`/`mark_read()`/`mark_unread()` — straightforward wrappers; `reply` threads via `In-Reply-To`/`References` headers pulled from the original message's metadata.
   **Only `reply` and `trash` have callers**, both in the recruiter-triage lane (`outputs/obsidian.py:382,396`, `cli/commands/recruiters.py:85`). `delete`, `mark_read` and `mark_unread` are not re-exported from `sources/__init__.py` and are called by nothing — dead code, and `delete` is an irreversible `messages().delete`. Tracked as roadmap 2.12.
+
+### Why the snippet was not enough — and why content *order* is load-bearing
+
+**Added 2026-08-10.** Until then the pipeline read `subject + snippet` and nothing else. Measured over a live 85-message window: median body **2505 chars** against a 200-char snippet cap, so **the pipeline was reading ~8% of every email**. 32 of those 85 reached the reranker carrying neither a date nor a link and were dropped for exactly that — while 4 of them held an Eventbrite or Luma URL that sat just past the cut. `fetch_full_bodies` had existed the whole time with a single caller in the recruiter lane; the harvest path never used it.
+
+**Fetching the body is only half the fix, and the other half is the Instagram permalink-first lesson repeating.** `analysis.build_prompt` truncates every message to **400 characters** *and* derives its `dates=`/`times=` hints from that same slice — so a date past char 400 is invisible twice over. Concatenating a 5 KB newsletter would have handed the LLM a letterhead and an unsubscribe notice. `content` is therefore assembled in signal order:
+
+```
+<subject>
+<up to 2 event-platform URLs>       ← eventbrite / lu.ma / meetup / partiful / dice.fm …
+<body, decimated to its date-densest window>
+```
+
+- **Links before prose** because a ticketing URL is the single most reliable event signal an email carries, and its slug (`…-aug-6-2026-tickets-…`) is often a better date source than the surrounding text. Capped at 2: a tracking URL runs 150+ chars and three would crowd out the window.
+- **Decimation reuses `web_utils._decimate_text`**, the web path's date-cluster centring. Two adjustments were needed. It no-ops on text already under its threshold, so the target is `_DIGEST_CHARS = 1500` rather than the 5000-char storage ceiling — sized at the ceiling, a typical 2.5 KB newsletter passes through whole and defeats the point. And its backward reach for a title was a hardcoded 300 chars, which would consume three quarters of the prompt window; it is now a `context_before` parameter, **default 300 so the web path is unchanged**, and Gmail passes 80.
+- A body that will not fetch leaves that message on its snippet. Enrichment never costs a message.
+
+**Measured on the same 63-message window** (`--only gmail --days 7 --dry-run`):
+
+| | reranker "no date/link" drops | events |
+|---|---|---|
+| snippets, read mail dropped *(before)* | 27 of 44 — **61%** | 8 |
+| full bodies, read mail dropped | 9 of 34 — **26%** | 11 |
+| full bodies, read mail kept *(shipped)* | 18 of 59 — 31% | **21** |
+
+Three of the four body-only links became events (`65labs Unconference`, `Vibe Space Interview`, `Founder-Led GTM`). **The read filter turned out to be the larger effect of the two** — worth knowing before tuning the body path further.
+
+### Following the link — schema.org from the event page
+
+**Added 2026-08-10, immediately after the above**, because the body carries the invitation and the *page* carries the facts. "You are invited to Vibe Space" tells the extractor nothing about when.
+
+`expand_event_links()` fetches each event-platform URL found in a body and reads its schema.org JSON-LD, reusing `feed_probe._fetch_page` (browser-free, sets a UA) and `web_utils._extract_structured_data` (the same reader the web calendar path uses). **No new fetching or parsing machinery.**
+
+**Measured 2026-08-10 over 14 live links: 12 returned a full `Event`** with exact `startDate`, `endDate` and a resolved postal address. **Luma serves JSON-LD server-side despite being a React SPA** — that is the fact that made this cheap, and it is not safe to assume of the next platform. The two misses render event data client-side and degrade to the og: tags already in the body text.
+
+The result goes at the **front** of `content`, ahead of even the links:
+
+```
+<subject>
+EVENT: Networking Event … | WHEN: 2026-08-26 18:00 | WHERE: Bar Darling, 2263 Chestnut Street, …
+<links>
+<decimated body>
+```
+
+Same reasoning as everywhere else in this file — `build_prompt` keeps 400 chars, and these ~90 are exact where every other 90 are suggestive.
+
+Fetches are pooled (`expand_workers`, default 8) and **deduplicated across the whole harvest before fetching**, because the same event is routinely linked from several emails — that keeps the request count near the number of *events*, not the number of mails. Ceiling `expand_max` (default 40); overflow is logged, never silent. `GMAIL_EXPAND_LINKS=0` disables.
+
+**Effect on field coverage**, live run: every extracted event carried a date **and** a time, and all but one a resolved venue. Before expansion, 5 of 22 had no date at all and roughly half had no location. Event *count* barely moved (18 vs 21) — this raises quality, not recall, and those are separate axes.
+
+`known rough edge`: more text also means more newsletters read as events. Roughly 3–4 of the 22 extracted are not real events (`Top AI Demos #39`, `Final workflow shape`) against 8 total before, so precision fell while recall rose a lot. No reject bucket distinguishes them.
+
+### Labelling the mail that produced an event
+
+**Added 2026-08-10.** Harvest applies a Gmail label (`GmailConfig.events_label`, default `"events"`, empty disables) to every message that produced an event. **This is the only part of the harvest that writes to a mailbox**, and the design is shaped by that:
+
+- **Additive.** `batchModify` with `addLabelIds` only — it never removes a label and never archives, so a labelled message stays in the inbox and re-running is a no-op rather than a second edit. It adds a label; it does not *move* mail.
+- **`--dry-run` prints the pairings, not a count.** "Would tag 16 messages" is not something a reader can check; `event title <- message subject` is, and a wrong pairing is obvious on sight. That output is what caught the dedup false positive recorded below.
+- **Runs before the TickTick sink**, which returns early when TickTick is unconfigured. Labelling your own mail should not depend on a third-party task service being set up.
+- **Confident links only.** See `EH-STD-EVENT-v0 §3.2a` — the `_source_ids` back-reference resolves within the LLM batch, requires a verbatim link or an author-address match, and yields nothing on ambiguity. Events with no resolved source are reported and skipped, never guessed at.
+
+`ensure_label` is case-insensitive on lookup: Gmail rejects a new label differing from an existing one only by case, so asking for `events` when `Events` exists must adopt it.
+
+**Measured 2026-08-10**, first live run: created label `events`, tagged **12 messages** from 13 events, 3 events unresolved. Verified against the API (`q=label:events` → 12).
+
+`known rough edge`: `dedup_events` unions `_source_ids` when it collapses a duplicate — right in general, but it faithfully propagates dedup's own false positives. One pairing in 19 was wrong (`SkyPilot AI Infra Meetup` absorbed a `SUPERNOVA 2026` email; both fell on 2026-08-18 and scored 2). That is the non-transitive-matching hazard in `00 - System Overview.md` §5.4 becoming visible, not a new defect.
 
 ### Hard constraints / failure modes
 
 - No credentials at all → `_get_service` returns `None` → every function short-circuits to `[]`/`False`/`None`, all logged at `info`/`warning`, never raised.
+- **Labelling needs the `gmail.modify` scope**, already in `SCOPES`. A token minted before this feature still carries it — no re-consent was needed.
+- **Hydration costs one extra `messages().get(format="full")` per message, sequentially.** 63 messages added roughly a minute to the run. `GMAIL_FETCH_BODIES=0` turns it off. Batching or threading it is unclaimed work — the `googleapiclient` service object is not thread-safe, so it needs `new_batch_http_request` rather than a naive pool.
 - A stored token that cannot be refreshed logs a warning and is skipped, not raised. `_get_service` is called **once per operation**, not once per run, so a stale-but-present token costs a failed network round-trip on every single Gmail call.
 - ~~**unverified:** whether a fully headless run … hangs on `run_local_server`~~ — **resolved 2026-07-30**: it would have. The flow is now gated on `_oauth_flow_allowed()` and a headless run logs an actionable error and returns `None` instead. Pinned by `tests/test_gmail_credentials.py`.
 
@@ -170,7 +240,7 @@ All four production sources (Discord, Telegram, Gmail, Signal) share the base sh
 | `timestamp` | message's own ISO timestamp | message's own date (UTC) | `Date` header, parsed (falls back to raw header string on parse failure, or `""` if missing) | `sent_at` (ms epoch → UTC ISO) | `read_cache_messages`: source's own field; `read_cached_pages`: **`datetime.now()` — capture time, not authored time** |
 | `author` | Discord `username` | Telegram `username`/`first_name`/`"unknown"` | raw `From:` header (`"Name <addr>"`, unparsed) | `"You"` (outgoing) or `source`/conv. name (incoming) | domain (`read_cached_pages`) or mapped field (`read_cache_messages`) |
 | `channel` | numeric `channel_id` (str) | dialog title | **Gmail label** (e.g. a custom label, or `"INBOX"`) — semantically not a chat room | conversation display name | URL (truncated to 120 chars) or mapped field |
-| `content` | full message text | full message text (`msg.text`) | **`"{subject}\n{snippet}"`** — truncated preview, not the full body (full body requires a separate `fetch_full_bodies` call) | full message body | JSON-dumped object (2000 chars) or extracted HTML text (2000 chars) |
+| `content` | full message text | full message text (`msg.text`) | **assembled, since 2026-08-10**: `subject` + a schema.org `EVENT:` facts line (when a linked event page answered) + up to 2 event-platform URLs + the body decimated to its date-densest window, capped at 5000. Was a ≤200-char `"{subject}\n{snippet}"` preview. Falls back to that shape if the body will not fetch. **Part order is normative** — see EH-STD-MSG-v0 | full message body | JSON-dumped object (2000 chars) or extracted HTML text (2000 chars) |
 | `pinned` | present (`True`) only if pinned; absent otherwise | present (`True`) only if pinned; absent otherwise | — (not emitted) | — (not emitted) | — |
 | `mention_everyone` | present (`True`) only if set; absent otherwise | — | — | — | — |
 | `thread_id` | — | — | **always present** (str, possibly empty) | — | — |
@@ -180,7 +250,7 @@ All four production sources (Discord, Telegram, Gmail, Signal) share the base sh
 **Divergence hazards for anything consuming the merged list:**
 
 - `channel` means three different things (chat/dialog name for Discord/Telegram/Signal, a Gmail *label* for Gmail, a URL for the generic cache reader) — any downstream grouping/report "by channel" silently mixes incompatible concepts.
-- `content` truncation is inconsistent: Gmail's default `content` is a short snippet unless a caller separately invokes `fetch_full_bodies`; every other source's `content` is the full message text. A length- or keyword-based filter tuned against Discord/Telegram/Signal content will behave very differently on Gmail.
+- `content` truncation is inconsistent, though less so since 2026-08-10. Gmail's `content` was a ≤200-char snippet; it is now a subject + links + date-decimated-body pack capped at 5000. It is still the only source whose `content` is *assembled* rather than quoted, and the only one that is lossy by design — a length- or keyword-based filter tuned against Discord/Telegram/Signal will still behave differently on Gmail.
 - `is_sent`/`pinned`/`mention_everyone`/`thread_id`/`is_read` follow two different conventions: Gmail always sets its booleans explicitly (`True`/`False`); Discord/Telegram/Signal use "key present ⇒ true, key absent ⇒ false/unknown." Code using `.get(key)` (as `filter_read_sent` and `is_sent` checks do today) is safe either way, but `"key" in msg` would not be.
 - `filter_read_sent()` only inspects `platform == "gmail"`; Signal's `is_sent` flag is real data but nothing reads it — your own outgoing Signal messages are not excluded from downstream LLM event extraction, unlike your own sent Gmail.
 - `read_cached_pages`'s `timestamp` is harvest-time, not message-time — if this module's output were ever wired into a caller that also passes it through the standard `cutoff` filtering pattern used elsewhere (`ts < cutoff: continue`), it would trivially always pass, defeating the point of a days-back window.

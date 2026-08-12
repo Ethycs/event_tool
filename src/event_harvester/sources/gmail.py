@@ -7,6 +7,7 @@ import base64
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 from datetime import datetime
@@ -294,16 +295,33 @@ def fetch_messages(cfg: GmailConfig, since: datetime) -> list[dict]:
         len(messages),
         since.strftime("%Y-%m-%d %H:%M"),
     )
+
+    # Hydrate here, not in the pipeline, so the message cache stores real
+    # bodies and the extra API calls are paid once per harvest rather than
+    # once per cache miss.
+    if cfg.fetch_bodies and messages:
+        try:
+            hydrate_bodies(cfg, messages)
+        except Exception as e:  # noqa: BLE001 -- never lose a harvest to enrichment
+            logger.warning("Gmail: body hydration failed, keeping snippets: %s", e)
+
     set_span_attrs(**{"message.count": len(messages)})
     return messages
 
 
-def filter_read_sent(messages: list[dict]) -> list[dict]:
+def filter_read_sent(messages: list[dict], *, drop_read: bool = True) -> list[dict]:
     """Keep only Gmail messages that still need attention.
 
     Filters out:
-    - Messages already read (no UNREAD label)
-    - Messages you sent yourself (SENT label)
+    - Messages you sent yourself (SENT label) — always
+    - Messages already read (no UNREAD label) — only when ``drop_read``
+
+    ``drop_read`` defaults to True because that is what the recruiter-triage
+    callers mean by "actionable". **Event harvesting passes False** (see
+    ``GmailConfig.drop_read``): read mail was 42% of the mailbox measured
+    2026-08-10, and an invite you opened is still an invite. The default is
+    left alone so `cli/commands/recruiters.py` and `training/eval_classifier.py`
+    keep their existing behaviour without a change.
 
     Non-Gmail messages pass through unchanged.
     """
@@ -317,14 +335,14 @@ def filter_read_sent(messages: list[dict]) -> list[dict]:
         if m.get("is_sent"):
             n_sent += 1
             continue
-        if m.get("is_read"):
+        if drop_read and m.get("is_read"):
             n_read += 1
             continue
         result.append(m)
 
     if n_read or n_sent:
         logger.info(
-            "Gmail: filtered %d read + %d sent, %d unread remain.",
+            "Gmail: filtered %d read + %d sent, %d remain.",
             n_read, n_sent, sum(1 for m in result if m.get("platform") == "gmail"),
         )
     return result
@@ -376,6 +394,239 @@ def _extract_body(payload: dict) -> str:
     return ""
 
 
+# Marketing mail pads the preview line with zero-width characters, and
+# HTML-stripped bodies arrive full of hard-wrap artefacts. Neither is content.
+_INVISIBLE_RE = re.compile(r"[­​‌‍⁠﻿͏]+")
+_WHITESPACE_RE = re.compile(r"[ \t ]+")
+_BLANKLINES_RE = re.compile(r"\n{3,}")
+
+# Platforms whose URL *is* a dated event reference. A link to one of these is
+# the single most reliable event signal an email carries -- measured
+# 2026-08-10, 4 of 32 otherwise-starved messages carried one, and every one
+# was a real event.
+_EVENT_HOST_RE = re.compile(
+    r"https?://[^\s\"'<>)\]]*(?:"
+    r"eventbrite|lu\.ma|luma\.com|meetup\.com|partiful|dice\.fm|"
+    r"ticketmaster|withfriends|splashthat|eventzilla"
+    r")[^\s\"'<>)\]]*",
+    re.I,
+)
+
+
+# Everything below is sized against one downstream constant:
+# `analysis.build_prompt` truncates each message to 400 characters *and*
+# derives its `dates=`/`times=` hints from that same slice. So a date past
+# char 400 is invisible twice -- to the LLM and to the hint extractor.
+_PROMPT_WINDOW = 400
+# Keep the date-dense digest well under the storage ceiling so decimation
+# actually engages on a typical 2.5 KB newsletter.
+_DIGEST_CHARS = 1500
+# Reach back only far enough for the sentence carrying the date. The web path
+# uses 300; that much preamble would consume three quarters of the window.
+_CONTEXT_BEFORE = 80
+# Two links, not three: they are the strongest signal an email carries, but a
+# tracking URL runs 150+ chars and three of them would crowd out the prose.
+_MAX_LINKS = 2
+
+
+def clean_body(text: str) -> str:
+    """Strip the padding and hard-wrap noise out of a decoded body."""
+    if not text:
+        return ""
+    text = _INVISIBLE_RE.sub("", text)
+    text = _WHITESPACE_RE.sub(" ", text)
+    text = _BLANKLINES_RE.sub("\n\n", text)
+    return text.strip()
+
+
+def event_links(text: str, limit: int = 3) -> list[str]:
+    """Event-platform URLs in document order, deduplicated.
+
+    Not truncated: half a URL is not a URL, and these carry the event slug
+    (`...downtown-first-thursdays-w-eric-rhodes-aug-6-2026-tickets-...`),
+    which is often a better date source than the prose around it.
+    """
+    seen: list[str] = []
+    for m in _EVENT_HOST_RE.finditer(text or ""):
+        url = m.group(0).rstrip(".,;")
+        if url not in seen:
+            seen.append(url)
+        if len(seen) >= limit:
+            break
+    return seen
+
+
+def expand_event_links(
+    urls: list[str], timeout_s: int = 12, workers: int = 8,
+) -> dict[str, dict]:
+    """Fetch event pages and read their schema.org JSON-LD. No browser.
+
+    **Why bother when the body is already in `content`.** The body says "You
+    are invited" and puts the date on the *page*. Measured 2026-08-10 over 14
+    links from a live mailbox, **12 returned a full JSON-LD `Event`** with
+    exact `startDate`, `endDate` and a resolved venue address. That is ground
+    truth handed to the extractor, in place of prose for it to infer from.
+
+    **Luma serves it server-side despite being a React SPA** -- that is the
+    fact that made this cheap, and it is not something to assume of the next
+    platform. Both misses in the sample were pages that render their event
+    data client-side; they degrade to og: tags in the body text, which is the
+    behaviour that already existed.
+
+    Reuses `feed_probe._fetch_page` (browser-free, sets a UA) and
+    `web_utils._extract_structured_data` (the same JSON-LD reader the web
+    calendar path uses), so this adds no new parsing or fetching machinery.
+
+    Returns ``{url: event_dict}`` for the URLs that yielded one. Failures are
+    simply absent -- an unreachable page must never cost the message.
+    """
+    import concurrent.futures
+
+    from event_harvester.sources.feed_probe import _fetch_page
+    from event_harvester.sources.web_utils import _extract_structured_data
+
+    unique = list(dict.fromkeys(u for u in urls if u))
+    if not unique:
+        return {}
+
+    def _one(url: str) -> tuple[str, Optional[dict]]:
+        try:
+            html = _fetch_page(url, timeout_s=timeout_s)
+            return url, _extract_structured_data(html) if html else None
+        except Exception as e:  # noqa: BLE001 -- a third-party page, anything goes
+            logger.debug("Gmail: link expansion failed for %s: %s", url, e)
+            return url, None
+
+    out: dict[str, dict] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        for url, data in pool.map(_one, unique):
+            if data and data.get("title"):
+                out[url] = data
+    logger.info(
+        "Gmail: expanded %d/%d event link(s) into structured data",
+        len(out), len(unique),
+    )
+    return out
+
+
+def format_event_facts(data: dict) -> str:
+    """One line of authoritative event facts, for the top of `content`.
+
+    Deliberately terse and first: `build_prompt` keeps only 400 characters,
+    and these ~90 are worth more than any 90 in the body.
+    """
+    when = " ".join(p for p in [data.get("date", ""), data.get("time", "")] if p)
+    parts = [
+        f"EVENT: {data.get('title', '')}".strip(),
+        f"WHEN: {when}" if when else "",
+        f"WHERE: {data['location']}" if data.get("location") else "",
+    ]
+    return " | ".join(p for p in parts if p)
+
+
+def hydrate_bodies(cfg: GmailConfig, messages: list[dict]) -> list[dict]:
+    """Replace Gmail's 200-char snippet with the real body, in place.
+
+    **Why this exists.** `fetch_messages` uses `format="metadata"`, so
+    `content` is `subject + snippet` and Gmail caps that snippet at 200
+    characters. Measured 2026-08-10 over 85 messages: median body 2505 chars,
+    so the pipeline was reading ~8% of every email. 32 of those 85 reached the
+    reranker carrying neither a date nor a link and were dropped for it --
+    while 4 of them held an Eventbrite or Luma link that sat past the cut.
+
+    **The shape of `content` is load-bearing, and it is the Instagram
+    permalink-first lesson again.** `analysis.build_prompt` truncates content
+    to **400 chars**, so simply concatenating a 5 KB body would hand the LLM a
+    letterhead and an unsubscribe notice. So the order is: subject, then any
+    event-platform links, then the body *decimated to its date-densest
+    window* by the same helper the web path uses. What survives the 400-char
+    cut is then the part that names the event.
+
+    Failure is per-message and silent-but-logged: a body that will not fetch
+    leaves that message on its snippet rather than losing the message.
+    """
+    if not messages:
+        return messages
+    ids = [m["id"] for m in messages if m.get("platform") == "gmail"]
+    if not ids:
+        return messages
+
+    bodies = fetch_full_bodies(cfg, ids)
+    if not bodies:
+        logger.warning("Gmail: no bodies fetched; keeping snippets for %d message(s)", len(ids))
+        return messages
+
+    # Imported here rather than at module scope: this is the one place the
+    # mail path touches the web path, and a top-level import would put
+    # web_utils on the import graph of every Gmail caller.
+    from event_harvester.sources.web_utils import _decimate_text
+
+    limit = max(200, cfg.body_max_chars)
+
+    # Pass 1: find the links. Pass 2 fetches them all at once, because one
+    # pooled round of requests beats a sequential fetch inside the loop -- and
+    # the same event is routinely linked from several emails, so deduplicating
+    # first is what keeps the fetch count near the number of *events*.
+    cleaned: dict[str, str] = {}
+    wanted: list[str] = []
+    for m in messages:
+        if m.get("platform") != "gmail":
+            continue
+        body = clean_body(bodies.get(m["id"], ""))
+        if not body:
+            continue
+        cleaned[m["id"]] = body
+        wanted.extend(u for u in event_links(body, limit=_MAX_LINKS) if u not in wanted)
+
+    expanded: dict[str, dict] = {}
+    if cfg.expand_links and wanted:
+        expanded = expand_event_links(
+            wanted[: max(0, cfg.expand_max)],
+            timeout_s=cfg.expand_timeout_s,
+            workers=cfg.expand_workers,
+        )
+        if len(wanted) > cfg.expand_max:
+            logger.warning(
+                "Gmail: %d event link(s) over the expand_max=%d ceiling were not "
+                "fetched", len(wanted) - cfg.expand_max, cfg.expand_max,
+            )
+
+    hydrated = 0
+    for m in messages:
+        if m.get("platform") != "gmail":
+            continue
+        body = cleaned.get(m["id"], "")
+        if not body:
+            continue
+        subject = m["content"].partition("\n")[0]
+        # Decimate against the body alone -- the subject is prepended after,
+        # so it can never be decimated away. The target is _DIGEST_CHARS, not
+        # `body_max_chars`: decimation no-ops on text already under its
+        # threshold, so sizing it at the 5000-char storage ceiling would let a
+        # typical 2.5 KB newsletter through whole and hand the prompt window a
+        # letterhead. Sized for the prompt, it engages where it matters.
+        core = _decimate_text(
+            body, max_chars=min(_DIGEST_CHARS, limit), context_before=_CONTEXT_BEFORE,
+        )
+        links = event_links(body, limit=_MAX_LINKS)
+        # Facts before links before prose. The JSON-LD line is exact where the
+        # body is only suggestive, so it gets the front of the 400-char window.
+        facts = [format_event_facts(expanded[u]) for u in links if u in expanded]
+        parts = [subject, *facts, *links, core]
+        m["content"] = "\n".join(p for p in parts if p)[:limit]
+        m["body_chars"] = len(body)
+        if facts:
+            m["event_facts"] = True
+        hydrated += 1
+
+    logger.info(
+        "Gmail: hydrated %d/%d message(s) with full bodies (snippet cap was 200 chars)",
+        hydrated, len(ids),
+    )
+    set_span_attrs(**{"gmail.hydrated": hydrated})
+    return messages
+
+
 def fetch_full_bodies(
     cfg: GmailConfig, message_ids: list[str],
 ) -> dict[str, str]:
@@ -401,6 +652,104 @@ def fetch_full_bodies(
             logger.debug("Gmail: failed to fetch body for %s: %s", msg_id, e)
 
     return bodies
+
+
+# ── Labels ──────────────────────────────────────────────────────────────
+
+
+def ensure_label(cfg: GmailConfig, name: str) -> Optional[str]:
+    """Return the id of label ``name``, creating it if it does not exist.
+
+    Gmail label names are case-sensitive but *uniqueness* is not, so the
+    lookup is case-insensitive: asking for "events" when "Events" already
+    exists must adopt it rather than fail to create a duplicate.
+    """
+    service = _get_service(cfg)
+    if service is None:
+        return None
+
+    try:
+        existing = service.users().labels().list(userId="me").execute()
+        for lbl in existing.get("labels", []):
+            if lbl.get("name", "").lower() == name.lower():
+                return lbl.get("id")
+    except Exception as e:
+        logger.error("Gmail: could not list labels: %s", e)
+        return None
+
+    try:
+        created = (
+            service.users()
+            .labels()
+            .create(
+                userId="me",
+                body={
+                    "name": name,
+                    "labelListVisibility": "labelShow",
+                    "messageListVisibility": "show",
+                },
+            )
+            .execute()
+        )
+        logger.info("Gmail: created label %r", name)
+        return created.get("id")
+    except Exception as e:
+        logger.error("Gmail: could not create label %r: %s", name, e)
+        return None
+
+
+def apply_label(cfg: GmailConfig, message_ids: list[str], label_id: str) -> int:
+    """Add ``label_id`` to every message. Returns how many were labelled.
+
+    Uses ``batchModify``, which takes up to 1000 ids in one call and returns
+    no body. It is **additive** — this adds a label, it never removes one and
+    never moves a message out of the inbox. Relabelling an already-labelled
+    message is a no-op, so this is safe to re-run.
+    """
+    if not message_ids or not label_id:
+        return 0
+    service = _get_service(cfg)
+    if service is None:
+        return 0
+
+    done = 0
+    for i in range(0, len(message_ids), 1000):
+        chunk = message_ids[i:i + 1000]
+        try:
+            service.users().messages().batchModify(
+                userId="me", body={"ids": chunk, "addLabelIds": [label_id]},
+            ).execute()
+            done += len(chunk)
+        except Exception as e:
+            logger.error("Gmail: failed to label %d message(s): %s", len(chunk), e)
+    if done:
+        logger.info("Gmail: labelled %d message(s)", done)
+    return done
+
+
+def label_event_messages(
+    cfg: GmailConfig, events: list[dict], name: str = "events",
+) -> int:
+    """Apply ``name`` to every Gmail message that produced an event.
+
+    Reads the ``_source_ids`` back-reference that `analysis` attaches during
+    extraction. Events with no confident back-reference are skipped rather
+    than guessed at — this writes to a real mailbox, and a mislabelled
+    message is worse than an unlabelled one.
+    """
+    ids: list[str] = []
+    for ev in events:
+        for mid in ev.get("_source_ids") or []:
+            if mid not in ids:
+                ids.append(mid)
+    if not ids:
+        logger.info("Gmail: no event had a resolved source message; nothing labelled")
+        return 0
+
+    label_id = ensure_label(cfg, name)
+    if not label_id:
+        return 0
+    return apply_label(cfg, ids, label_id)
 
 
 # ── Reply ───────────────────────────────────────────────────────────────

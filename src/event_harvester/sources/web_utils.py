@@ -365,7 +365,9 @@ _DECIMATE_TIME_RE = re.compile(
 )
 
 
-def _decimate_text(text: str, max_chars: int = 2000) -> str:
+def _decimate_text(
+    text: str, max_chars: int = 2000, context_before: int = 300,
+) -> str:
     """Extract the event-relevant region from page text.
 
     Adaptive: if the text is already small, return it whole.
@@ -373,6 +375,12 @@ def _decimate_text(text: str, max_chars: int = 2000) -> str:
 
     This reduces LLM input from ~5000 chars of nav junk to ~1000 chars
     of pure event content.
+
+    ``context_before`` is how far to reach back from the densest anchor to
+    catch the title that usually precedes a date. The Gmail path passes a
+    much smaller value: `analysis.build_prompt` truncates each message to 400
+    characters *and* derives its date hints from that same slice, so 300
+    characters of preamble would push the date out of both.
     """
     if len(text) <= max_chars:
         return text
@@ -403,7 +411,6 @@ def _decimate_text(text: str, max_chars: int = 2000) -> str:
             best_start = pos
 
     # Expand backwards to capture title (usually before the first date)
-    context_before = 300
     region_start = max(0, best_start - context_before)
     region_end = min(len(text), best_start + max_chars)
 
@@ -414,7 +421,43 @@ def _decimate_text(text: str, max_chars: int = 2000) -> str:
     return text[region_start:region_end].strip()
 
 
+def parse_next_data(html: str) -> dict | None:
+    """Return the `__NEXT_DATA__` payload a Next.js page server-renders.
+
+    Next.js inlines the props it rendered the page with. On an event platform
+    that is the event list itself — already structured, already typed, and
+    already there without running a line of JavaScript. Measured 2026-08-10:
+    `luma.com/sf` carries 20 whole events this way and `partiful.com/explore`
+    carries 5 per city, against the **1** event the browser-driven `raw`/
+    `calendar` scrape of Luma's own discover page produced.
+
+    Returns None when the tag is absent or unparseable — the caller decides
+    whether that is fatal.
+    """
+    if not html:
+        return None
+    m = re.search(
+        r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL,
+    )
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(1))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
 # ── Schema.org JSON-LD extraction + dead-page detection ──────────────
+
+def _first_image(value) -> str:
+    """schema.org `image`: a URL, a list of them, or an ImageObject."""
+    if isinstance(value, list):
+        value = value[0] if value else ""
+    if isinstance(value, dict):
+        value = value.get("url") or value.get("contentUrl") or ""
+    return str(value or "").strip()
+
 
 def _extract_structured_data(html: str) -> dict | None:
     """Extract schema.org Event JSON-LD from HTML.
@@ -465,7 +508,15 @@ def _extract_structured_data(html: str) -> dict | None:
                 if isinstance(address, dict):
                     loc_parts = [address.get("streetAddress", ""),
                                  address.get("addressLocality", "")]
-                    loc_str = ", ".join(p for p in [loc_name] + loc_parts if p)
+                    # Venues routinely repeat themselves across `name` and
+                    # `streetAddress` ("DG717, DG717, San Francisco"), so drop
+                    # case-insensitive repeats while keeping document order.
+                    seen_parts: list[str] = []
+                    for p in [loc_name] + loc_parts:
+                        p = (p or "").strip()
+                        if p and p.lower() not in {s.lower() for s in seen_parts}:
+                            seen_parts.append(p)
+                    loc_str = ", ".join(seen_parts)
                 elif isinstance(address, str):
                     loc_str = f"{loc_name}, {address}" if loc_name else address
                 else:
@@ -491,6 +542,10 @@ def _extract_structured_data(html: str) -> dict | None:
                     "location": loc_str,
                     "link": url,
                     "details": desc[:500] if desc else "",
+                    # Added 2026-08-12 for report thumbnails. schema.org
+                    # allows a bare URL, a list, or an ImageObject, so the
+                    # shape is normalised here rather than at each caller.
+                    "image": _first_image(item.get("image")),
                 }
 
     return None

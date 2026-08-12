@@ -123,6 +123,7 @@ signal when the extra text is a nav menu.
 |---|---|
 | `ics` | A real iCalendar feed exists. Always prefer it |
 | `rss` | An RSS/Atom feed exists. Prefer it over scraping — one item per event |
+| `luma` / `partiful` | The site *is* Luma or Partiful. Never scrape these — see below |
 | `calendar` | Dated event links on the page |
 | `feed` | Infinite-scroll or XHR-driven; needs `api_pattern` |
 | `search` | A **results** page that takes a query. Needs `queries` |
@@ -137,6 +138,32 @@ grep -oiE '(rss|atom)[^"<>]{0,30}\.xml' /tmp/page.html | sort -u
 ```
 
 Beware false positives — `ical` matches CSS `vertical-align`.
+
+**Before concluding "no feed", check whether the page is a modern JS app that
+server-renders its data anyway.** Added 2026-08-10, after `luma` — configured
+as `calendar` — was found returning 1 event from a listing of 80.
+
+```bash
+curl -sL --max-time 20 -A "Mozilla/5.0" https://<domain>/<page> \
+  | grep -o '__NEXT_DATA__\|__NUXT__\|application/ld+json' | sort -u
+```
+
+A hit means the event list is probably sitting in the HTML as JSON, already
+typed, with no browser required. Two things it is worth checking next, because
+both paid off immediately:
+
+- **Does an API sit behind it?** Luma's city page led to
+  `api.lu.ma/discover/get-paginated-events`, keyless, cursor-paginated, 45
+  events per call. Open devtools' network tab, or look for `api.` hostnames in
+  the payload.
+- **Is the payload city-bucketed?** Partiful's is, `NYC` first. See step 3's
+  warning — this is the same failure in a new place.
+
+`application/ld+json` is the cheapest win of all: `web_utils._extract_structured_data`
+already parses schema.org `Event`, and Gmail link expansion uses it to pull
+exact date/time/venue off Luma and Eventbrite pages **without a browser**,
+despite Luma being a React SPA. Do not assume a SPA renders client-side —
+measure it.
 
 Two overrides worth knowing:
 

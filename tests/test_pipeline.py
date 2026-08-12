@@ -87,7 +87,11 @@ def patch_pipeline_deps(monkeypatch):
         state["last_harvest_kwargs"] = kwargs
         return list(state["messages"])
 
-    def fake_filter(msgs):
+    def fake_filter(msgs, *, drop_read=True):
+        # `drop_read` is recorded rather than acted on: the double does not
+        # model Gmail read state, but the pipeline must pass the configured
+        # value through, and test_pipeline_forwards_drop_read asserts it.
+        state["last_drop_read"] = drop_read
         if state["filter_drops"] == 0:
             return list(msgs)
         return list(msgs[state["filter_drops"]:])
@@ -230,6 +234,42 @@ async def test_source_counts_reflect_platform_field(patch_pipeline_deps):
     assert result.source_counts["gmail"] == 1
     assert result.source_counts["web"] == 1
     assert result.source_counts["telegram"] == 0
+
+
+# ── the Gmail read filter ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("configured", [True, False])
+async def test_pipeline_forwards_drop_read(patch_pipeline_deps, configured):
+    """The filter must take its value from config, not from its own default.
+
+    `GmailConfig.drop_read` defaults to False so event harvesting stops
+    discarding mail you have already opened — 42% of the mailbox, measured
+    2026-08-10. A config flag nothing reads is exactly the failure this pins.
+    """
+    state = patch_pipeline_deps
+    state["messages"] = [_msg(id="a", platform="gmail")]
+    state["events"] = []
+
+    cfg = AppConfig()
+    cfg.gmail.drop_read = configured
+    await Pipeline(cfg).run(no_kwargs=_no_kwargs())
+
+    assert state["last_drop_read"] is configured
+
+
+@pytest.mark.asyncio
+async def test_harvesting_keeps_read_mail_by_default(patch_pipeline_deps):
+    state = patch_pipeline_deps
+    state["messages"] = [_msg(id="a", platform="gmail")]
+    state["events"] = []
+
+    await Pipeline(AppConfig()).run(no_kwargs=_no_kwargs())
+
+    assert state["last_drop_read"] is False, (
+        "a default-constructed harvest must not discard read mail"
+    )
 
 
 # ── unlimited_caps flag ──────────────────────────────────────────────

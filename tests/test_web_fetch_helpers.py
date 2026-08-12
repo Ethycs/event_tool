@@ -448,6 +448,30 @@ def test_extract_structured_data_finds_event():
     assert out["link"] == "https://example.com/summit"
 
 
+def test_extract_structured_data_does_not_repeat_the_venue_name():
+    """Venues put the same string in `name` and `streetAddress`.
+
+    Seen live 2026-08-10 via Gmail link expansion: "DG717, DG717, San
+    Francisco" and "Microsoft, Microsoft, Mountain View".
+    """
+    html = """<html><script type="application/ld+json">
+{"@type": "Event", "name": "Meetup", "startDate": "2026-08-18T17:30",
+ "location": {"name": "DG717", "address": {
+     "streetAddress": "DG717", "addressLocality": "San Francisco"}}}
+</script></html>"""
+    out = _extract_structured_data(html)
+    assert out["location"] == "DG717, San Francisco"
+
+
+def test_extract_structured_data_venue_dedup_is_case_insensitive():
+    html = """<html><script type="application/ld+json">
+{"@type": "Event", "name": "M", "startDate": "2026-08-18T17:30",
+ "location": {"name": "The Bank", "address": {
+     "streetAddress": "the bank", "addressLocality": "SF"}}}
+</script></html>"""
+    assert _extract_structured_data(html)["location"] == "The Bank, SF"
+
+
 def test_extract_structured_data_handles_graph_wrapper():
     html = """<script type="application/ld+json">
 {"@context":"x","@graph":[

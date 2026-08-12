@@ -28,6 +28,8 @@ from event_harvester.sources.web_modes.chat import _do_chat
 from event_harvester.sources.web_modes.feed import _do_feed
 from event_harvester.sources.web_modes.ics import _do_ics
 from event_harvester.sources.web_modes.instagram import _do_instagram
+from event_harvester.sources.web_modes.luma import _do_luma
+from event_harvester.sources.web_modes.partiful import _do_partiful
 from event_harvester.sources.web_modes.raw import _do_raw
 from event_harvester.sources.web_modes.rss import _do_rss
 from event_harvester.sources.web_modes.search import _do_search
@@ -216,6 +218,30 @@ def fetch_web_sources(
                             logger.info("%s: %d messages.", name, len(msgs))
                             continue
 
+                        # Luma and Partiful publish their event lists as
+                        # structured JSON — Luma via a keyless discovery API,
+                        # Partiful in its server-rendered Next.js props. Both
+                        # are browser-free for the same reason ICS and RSS
+                        # are, and both replace a scrape that produced one
+                        # event from a page listing dozens.
+                        if mode == "luma":
+                            msgs = _do_luma(uc, src, tracer=nav_tracer, capture=capture)
+                            messages.extend(msgs)
+                            if msgs:
+                                _save_cooldown(src["url"])
+                            logger.info("%s: %d messages.", name, len(msgs))
+                            continue
+
+                        if mode == "partiful":
+                            msgs = _do_partiful(
+                                uc, src, tracer=nav_tracer, capture=capture,
+                            )
+                            messages.extend(msgs)
+                            if msgs:
+                                _save_cooldown(src["url"])
+                            logger.info("%s: %d messages.", name, len(msgs))
+                            continue
+
                         # Instagram mode drives its own pages (one per
                         # account, each recorded from first paint), so the
                         # shared page-open + Cloudflare wait below would only
@@ -347,5 +373,34 @@ def fetch_web_sources(
         retry_msgs, _ = _process_group(all_cf_retries, native_chrome=True)
         all_messages.extend(retry_msgs)
 
+    # Universal keyword pass. Native search and Luma's categories narrow what
+    # gets *fetched*; this marks what came back, and is the only thing that
+    # works on a source with no query surface at all (partiful, ics, rss...).
+    # It tags rather than filters — see `keywords` module docstring.
+    _tag_keywords(active, all_messages)
+
     logger.info("Web sources: %d messages from %d sources.", len(all_messages), len(active))
     return all_messages
+
+
+def _tag_keywords(sources: list[dict], messages: list[dict]) -> None:
+    """Tag each source's messages with the keyword terms they match."""
+    by_name = {s.get("name"): s for s in sources if s.get("keywords")}
+    if not by_name:
+        return
+    from event_harvester.keywords import tag_messages, terms_for
+
+    total = 0
+    for name, src in by_name.items():
+        terms = terms_for(src["keywords"])
+        if not terms:
+            continue
+        # `channel` carries the source name for every web mode; sub-source
+        # modes suffix it (`partiful-sf`), so match on the prefix.
+        mine = [
+            m for m in messages
+            if str(m.get("channel", "")).split("-")[0] == str(name).split("-")[0]
+        ]
+        total += tag_messages(mine, terms)
+    if total:
+        logger.info("Keywords: %d message(s) matched.", total)

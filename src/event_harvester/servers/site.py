@@ -192,6 +192,11 @@ def _write(events: list[dict], source_counts: dict[str, int], total_messages: in
         total_messages=total_messages,
         output_path=str(SITE_HTML),
         title="Events",
+        # The site is the one caller that should pay for pictures: it rebuilds
+        # on a schedule on a machine with a network, and thumbnails are cached
+        # on disk by URL so a rebuild re-costs only the newly-seen links.
+        thumbnails=os.environ.get("SITE_THUMBNAILS", "1").lower()
+        not in ("0", "false", "no"),
     )
     # The JSON is the same projection the page embeds, so a client reading it
     # cannot see a different set of events than a browser does.
@@ -288,6 +293,12 @@ def build_app(cfg, *, interval_hours: float = DEFAULT_INTERVAL_HOURS,
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    # /admin lives on this origin by deliberate choice — `01 - Design/02 - The
+    # Control UI.md` §2, "one origin, split routes". It writes config, so its
+    # handlers validate against closed vocabularies and write atomically; see
+    # that module's docstring for what this origin still lacks.
+    from event_harvester.servers.admin import build_routes as admin_routes
+
     app = Starlette(
         debug=False,
         routes=[
@@ -295,6 +306,7 @@ def build_app(cfg, *, interval_hours: float = DEFAULT_INTERVAL_HOURS,
             Route("/events.json", events_json),
             Route("/healthz", healthz),
             Route("/refresh", refresh_now, methods=["POST"]),
+            *admin_routes(),
         ],
         lifespan=lifespan,
     )

@@ -1,9 +1,15 @@
 [
   {
-    "url": "https://lu.ma/discover",
+    "url": "https://luma.com/sf",
     "name": "luma",
-    "mode": "calendar",
-    "scroll_seconds": 5
+    "mode": "luma",
+    "forward_days": 21,
+    "max_events": 60,
+    "cooldown_hours": 6,
+    "keywords": [
+      "ai",
+      "tech"
+    ]
   },
   {
     "url": "https://business.sfchamber.com/events/calendar",
@@ -107,13 +113,12 @@
     "name": "meetup",
     "mode": "search",
     "queries": [
-      "AI",
-      "machine learning",
-      "startup",
-      "tech networking",
       "queer"
     ],
-    "scroll_seconds": 10
+    "scroll_seconds": 10,
+    "keywords": [
+      "ai"
+    ]
   },
   {
     "url": "https://ma.to/events/san-francisco",
@@ -304,5 +309,17 @@
     "category": "venues",
     "cooldown_hours": 12,
     "forward_days": 120
+  },
+  {
+    "url": "https://partiful.com/explore",
+    "name": "partiful",
+    "mode": "partiful",
+    "city": "SF",
+    "forward_days": 30,
+    "cooldown_hours": 12,
+    "keywords": [
+      "queer",
+      "music"
+    ]
   }
 ]

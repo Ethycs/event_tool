@@ -23,7 +23,7 @@ Four sinks turn harvested/validated events into something a human (or TickTick) 
 
 **Per event:** title, date/time, location, source, expandable details, plus three actions — *Add to calendar* (a `data:text/calendar` iCalendar URI built client-side, so it works with no server), *Open* (the source listing), and *TickTick* (the existing `ticktick://` deep link).
 
-**Interaction:** client-side search across title/location/details/source, per-platform filter chips, and date bucketing — `Today`, `Tomorrow`, `This week`, `This month`, `Later`, `Undated`, `Past`. `Undated` and `Past` sort **last** so a stale event never heads the page.
+**Interaction:** client-side search across title/location/details/source, per-platform filter chips (see "The filter bar" below), and date bucketing — `Today`, `Tomorrow`, `This week`, `This month`, `Later`, `Undated`, `Past`. `Undated` and `Past` sort **last** so a stale event never heads the page.
 
 ### Two properties worth not breaking
 
@@ -75,6 +75,101 @@ Built on Starlette + uvicorn, which `mcp`/`fastmcp` already pull in — **no new
 | The page **re-renders**, it does not reload | A reload discards the search term, active filter and scroll position — the state a browsing session has built up |
 | Live polling gated on `location.protocol` | The same file opened from disk has no server; polling from `file://` fails CORS and would log an error a minute, forever |
 | `--reload` does **not** harvest per restart | A file save every few seconds would otherwise open browsers and spend tokens every few seconds. It shells out to `python -m uvicorn --factory --reload`, because uvicorn reloads by supervising child processes and cannot be driven from inside the CLI's loop |
+
+### Rendering 240 cards without freezing — 2026-08-12
+
+The page was built for 33 events. At **240**, with ~95 inline JPEGs, it locked the tab until everything was ready rather than filling progressively. Three compounding causes, and the images were the *least* of them:
+
+| Cause | Fix |
+|---|---|
+| **240 forced reflows in one loop.** `syncDetailToggles` read `scrollHeight`/`clientHeight` for every `.details` in the document to decide whether the "More" button was needed. Each read forces a synchronous layout — the classic thrash, and the dominant cost | An `IntersectionObserver` measures each card once, when it comes within 400px of the viewport, then unobserves it |
+| **Every card built in one synchronous pass** | The work list is flattened to individual cards and appended across animation frames on an 8ms budget. A `renderToken` cancels an in-flight build, because typing in the search box starts a new render almost per keystroke |
+| **Offscreen cards still laid out, painted and decoded** | `content-visibility: auto` with `contain-intrinsic-size: auto 260px`. One CSS line, the single largest win, and the intrinsic size stops the scrollbar lurching |
+
+The observer and `content-visibility` reinforce each other: under `content-visibility` an offscreen card has **no layout to measure**, so the old eager loop would have produced wrong answers as well as slow ones.
+
+Both degrade cleanly. A browser without `IntersectionObserver` measures immediately, exactly as before; one without `content-visibility` renders everything, as before.
+
+`known rough edge`: the file is still 1.5 MB and every byte must arrive before the first card can be built, because the events are embedded in the document. Chunking fixes the *freeze*, not the *download*. If that becomes the complaint, the fix is a smaller thumbnail budget or `SITE_THUMBNAILS=0` — not a second network request, which would cost the self-contained property.
+
+### Thumbnails — added 2026-08-12
+
+Cards carry a preview image when the event's `link` publishes one, read the way a chat app reads a link: `og:image`, then `twitter:image`, then schema.org `Event.image`. Generic on purpose — Luma, Eventbrite, Partiful and a venue's own site all publish one, and a per-platform path would need a new branch per source forever.
+
+**Images are downscaled and inlined as `data:` URIs, never linked.** That is forced by what this file *is*. `test_no_external_resources` fails the build on any external `src`, and the footer promises "forwarding it forwards them" — a remote `<img>` would call home to `images.lumacdn.com` every time anyone opened a forwarded copy, from wherever they opened it. Inlining keeps both properties, and the page still works on a plane.
+
+**Off by default** (`thumbnails=False`). This is the only part of report generation that touches the network, and a caller rebuilding from cached events should not silently acquire a dependency on the internet. The site turns it on (`SITE_THUMBNAILS=0` to stop it); `--build-only` and the tests do not.
+
+Bounded three ways: a disk cache at `data/.thumbnails/` keyed by URL (a rebuild costs nothing), `max_links`, and a total byte budget so the page cannot quietly become a 40 MB attachment. Every failure is soft — a missing image is a missing thumbnail, never a failed report.
+
+**Measured 2026-08-12** on 33 live events (22 with a link): **20 illustrated**, page 49 KB → 388 KB, 1.7 s cold and ~1 s warm.
+
+| Source | Result |
+|---|---|
+| Eventbrite | **12 of 12** — after unwrapping its `og:image`, which points at a `/_next/image?url=…` proxy that answers 400 to anyone but its own front end. The real CDN URL is in the `url` parameter |
+| Instagram | **8 of 8** — see below |
+| Luma, Partiful | work directly |
+| `forms.gle`, `lonelyhackers.club` | no `og:image` — correctly skipped |
+
+#### The escaping bug that looked like an access restriction
+
+Worth recording in full, because it was misdiagnosed **twice** as a property of the remote host.
+
+Instagram's images returned 403. The first theory was a missing `Referer` — hotlink protection being the usual cause. Adding one changed nothing. The second theory, written into the code and the docs as fact, was that *"those URLs are session-signed and not reachable from here."*
+
+Both were wrong, and the evidence was one `print` away the whole time. Dumping the parsed query parameters showed:
+
+```
+{'stp': 'c400…', 'amp;_nc_cat': '100', 'amp;oh': '00_AQFG…', 'amp;oe': '6A81F015'}
+```
+
+**Every parameter after the first was named `amp;…`.** A `content="…"` attribute is HTML, so a multi-parameter URL is written with `&amp;` between parameters, and reading it literally renames them all. The two that matter — `oh` (signature) and `oe` (expiry) — arrived under names the CDN does not read, so the request was genuinely unsigned and the 403 was correct. `html.unescape` on the extracted value fixed all 8, and a plain bot User-Agent then gets a 200 with no `Referer` at all.
+
+The lesson is the one this codebase keeps relearning: **an error from a remote system describes our request at least as often as it describes their policy.** Two plausible stories about Instagram's access control were built before anyone looked at what was actually being sent. `_unescape` carries this history in its docstring; the `Referer` header is kept as a courtesy but is explicitly documented as **not** load-bearing, so its presence is never read as evidence that some host demanded it.
+
+`known rough edge`: the Eventbrite unwrap must decode **exactly once**. The value looks doubly-encoded (`https%253A%252F%252F`) and unquoting until stable is the obvious thing to write — it produces a 400, because the inner host expects the CDN URL as an *encoded* path segment. `parse_qs` already performs the outer decode. Same family of bug as the above: encoding layers, counted wrong.
+
+### The place filter — added 2026-08-12
+
+A second chip row: **San Francisco · Oakland · Broader · Unplaced**, ANDed with the source row rather than replacing it, so "SF" + "web" means SF events from web sources. Both rows share one click handler that reads which axis a chip belongs to from its `data-` attribute, so a third axis costs a row of markup and a table entry, not a parallel copy of the logic.
+
+**Classification is three signals, not a substring match**, because the same city arrives four ways — measured over 27 located events:
+
+```
+'San Francisco, CA'                          a city name
+'484 5th Street, San Francisco, CA 94107'    a postal address
+'Mother Bar, SF'                             an abbreviation
+'El Rio'                                     a bare venue, no city at all
+```
+
+ZIP first (unambiguous), then city name, then a venue table. **That last case is why the venue table exists and is not optional**: the `raw`-mode sources are SF bars scraping their own homepages, and a bar does not write its own city on its own site. A city-name matcher files all of them under "unplaced" — which is exactly where the local queer nightlife would land, the events most likely to be wanted and least likely to be labelled.
+
+Two ordering rules that matter, both learned from the data:
+
+- **Named elsewhere-places are checked before the venue table.** `"DoubleTree San Jose"` would otherwise hit an SF venue substring and be filed as local.
+- **`unknown` is its own bucket, never folded into `broader`.** "We could not tell" and "definitely elsewhere" are different answers, and only the first is a reason to extend this module. It is labelled *Unplaced* rather than *Other* for the same reason.
+
+`oakland` covers the near East Bay — Berkeley, Emeryville, Alameda — rather than the city limits. A fourth chip for three events would be worse than a slightly wide one; the chip's `title` says so on hover rather than leaving it to be discovered.
+
+**Measured 2026-08-12** on 33 live events: SF 23, Broader 4, Unplaced 6. The unplaced are genuinely unplaceable — five carry no location string at all and one is `"DEF CON, TBD"`.
+
+`known rough edge`: the venue table is hand-maintained and only holds venues observed without a city. A new SF bar is `unplaced` until someone adds it. The durable fix is a `city` field on the web-source config, which does not exist yet.
+
+### The filter bar — rebuilt 2026-08-11
+
+Reported by a screenshot, not a test: **22 chips for 33 events, three of them completely blank**, and the same sender listed twice. All three symptoms had one cause — the chip label was `source.split(" in ")[0]`, i.e. the LLM's free-text *author*, because `EH-STD-EVENT-v0` defines no `platform` field on an event.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| 3 blank chips | `<llamalounge@calendar.luma-mail.com>` interpolated **unescaped** into the markup, so the browser parsed it as an unknown element | `html.escape` on the label and the attribute. Model-derived text reaches the document as data, never as markup |
+| 22 chips | one per sender — a filter with one option per row is not a filter | label by platform: `web 20 · gmail 10 · telegram 3` |
+| `www.eventbrite.com` **and** `@www.eventbrite.com` | two spellings of one sender | same — both are `web` now |
+
+**Where the platform came from is the part worth remembering.** It was never missing: `build_prompt` groups messages under `f"{platform.capitalize()} / {channel}"`, and the model echoes that group key back inside `source` — `"@someone in Gmail / INBOX"`. The old code split on `" in "` and kept the **wrong half**. So the fix needed no re-harvest and healed the already-cached page immediately, which a `_platforms` field alone would not have done (it is recorded too, by `analysis.attach_source_ids`, as the exact answer for events extracted from here on).
+
+**A `platform` outside the known vocabulary is ignored rather than trusted.** `data/.site/events.json` stores *already-prepared* output, so rebuilding feeds `_prepare` the `platform` an older build wrote — the author's email. Without the vocabulary check the bad chips survived every rebuild and would have healed only after a fresh harvest. Measured: 22 chips → **4**, on the same cache file.
+
+Also in this pass: search, sort and the layout toggle moved onto one row (they were stacked across three); chips wrap instead of scrolling horizontally, since horizontal scroll hid every filter past the viewport edge with no affordance saying so; each chip carries its own count, so a filter says how much it will show before it is clicked; and an explicit **All** chip replaced "re-click the active chip to clear", which was discoverable only by accident.
 
 `n × m` layout: the grid is `repeat(auto-fill, minmax(270px, 1fr))`, so *n* comes from the viewport and *m* from how many events are in that date bucket — one column on a phone, four on a desktop, from the same file with no media-query ladder. The Grid/Carousel toggle switches a single body class, so the cards are identical in both modes and switching costs a repaint rather than a re-render. Measured: 1 column at 390px, 4 at 1440px, zero horizontal overflow at both.
 

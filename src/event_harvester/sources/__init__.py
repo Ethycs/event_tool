@@ -8,8 +8,16 @@ from event_harvester.sources.chromium_cache import (
 )
 from event_harvester.sources.discord import find_discord_cache, read_discord_messages
 from event_harvester.sources.gmail import (
+    apply_label,
+    clean_body,
+    ensure_label,
+    event_links,
+    expand_event_links,
     fetch_full_bodies,
     filter_read_sent,
+    format_event_facts,
+    hydrate_bodies,
+    label_event_messages,
 )
 from event_harvester.sources.gmail import (
     fetch_messages as fetch_gmail_messages,
@@ -43,6 +51,14 @@ __all__ = [
     "fetch_gmail_messages",
     "fetch_full_bodies",
     "filter_read_sent",
+    "clean_body",
+    "event_links",
+    "hydrate_bodies",
+    "apply_label",
+    "ensure_label",
+    "label_event_messages",
+    "expand_event_links",
+    "format_event_facts",
     "gmail_reply",
     "gmail_trash",
     "read_signal_messages",

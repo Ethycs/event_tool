@@ -28,16 +28,24 @@ knowing before sending one on.
 from __future__ import annotations
 
 import json
+import logging
 import re
+from collections import Counter
 from datetime import date, datetime
+from html import escape
 from pathlib import Path
 from typing import Any
 
 from event_harvester.observability.metrics import count, record
 from event_harvester.observability.tracing import set_span_attrs, traced
 from event_harvester.outputs.deeplinks import ticktick_deep_link
+from event_harvester.outputs.regions import HINTS as REGION_HINTS
+from event_harvester.outputs.regions import LABELS as REGION_LABELS
+from event_harvester.outputs.regions import REGIONS
+from event_harvester.outputs.regions import classify as classify_region
 
 _TRACER = "event_harvester.outputs.html_report"
+logger = logging.getLogger(_TRACER)
 
 _ISO_DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})")
 
@@ -85,6 +93,83 @@ def _bucket(iso_date: str | None, today: date) -> str:
 _BUCKET_ORDER = ("Today", "Tomorrow", "This week", "This month", "Later", "Undated", "Past")
 
 
+_KNOWN_PLATFORMS = ("discord", "telegram", "gmail", "signal", "web")
+
+
+def _platform_of(ev: dict, source: str) -> str:
+    """Which platform an event came from — for the filter chips.
+
+    **This used to be `source.split(" in ")[0]`, i.e. the author.** With 33
+    events that produced **22 chips**, one per sender, several of them raw
+    email addresses, and the filter row ran off the side of the page. A filter
+    with one option per row is not a filter.
+
+    Three sources of truth, strongest first:
+
+    1. an explicit `platform` on the event;
+    2. `_platforms`, recorded by `analysis.attach_source_ids` from the batch
+       the event was extracted in;
+    3. **the channel half of `source`** — `"@someone in Gmail / INBOX"`. This
+       one is the quiet win: `build_prompt` groups messages under
+       ``f"{platform.capitalize()} / {channel}"`` and the model echoes that
+       group key back, so the platform has been sitting in the string all
+       along, on the *other* side of the `" in "` the old code split on.
+       It needs no re-harvest, which is why it is worth having as well as (2).
+    """
+    # Only a value from the known vocabulary counts. `data/.site/events.json`
+    # is *already-prepared* output, so re-rendering it feeds this function the
+    # `platform` an older build wrote — which, before this fix, was the
+    # author's email address. Trusting any non-empty string would make the old
+    # chips survive every rebuild and heal only after a fresh harvest.
+    explicit = str(ev.get("platform") or "").strip().lower()
+    if explicit in _KNOWN_PLATFORMS or explicit == "mixed":
+        return explicit
+
+    plats = [p for p in (ev.get("_platforms") or []) if p in _KNOWN_PLATFORMS]
+    if plats:
+        return plats[0] if len(plats) == 1 else "mixed"
+
+    return _platform_from_channel(source)
+
+
+def _platform_from_channel(source: str) -> str:
+    """Read the platform out of a `source` string.
+
+    Two shapes occur, because the model writes this field freely. The prompt
+    asks for `"@author in #channel"`, and it often obliges — but it also
+    frequently echoes the group header verbatim, giving a bare
+    `"Telegram / Frolic Party SF"` with no `" in "` at all. Requiring the
+    separator left **148 of 240 events with no source chip** (2026-08-12).
+    Take the channel half when there is one, otherwise read the whole string.
+    """
+    channel = source.split(" in ", 1)[1] if " in " in source else source
+    head = channel.strip().split("/", 1)[0].strip().lower()
+    if head in _KNOWN_PLATFORMS:
+        return head
+    # Instagram arrives as `instagram/@handle` — it is a web sub-source, and
+    # giving it its own chip would start the per-sender sprawl over again.
+    if head == "instagram":
+        return "web"
+    return ""
+
+
+def _clean_author(source: str) -> str:
+    """Human-readable sender, for the card — not the raw From header.
+
+    `"Ben Holfeld <BenHolfeld@user.luma-mail.com>"` becomes `"Ben Holfeld"`,
+    and a bare `"<noreply@reminder.eventbrite.com>"` becomes the address
+    without its angle brackets. Those brackets were not merely ugly: rendered
+    unescaped they were parsed as an HTML tag, which is why three filter chips
+    appeared completely blank.
+    """
+    who = source.split(" in ")[0].strip()
+    if "<" in who and ">" in who:
+        name = who[:who.index("<")].strip().strip('"')
+        addr = who[who.index("<") + 1:who.rindex(">")].strip()
+        who = name or addr
+    return who.strip().strip('"')
+
+
 def _prepare(events: list[dict], today: date) -> list[dict[str, Any]]:
     """Flatten harvest events into the shape the page renders.
 
@@ -106,7 +191,9 @@ def _prepare(events: list[dict], today: date) -> list[dict[str, Any]]:
             "link": str(ev.get("link") or ""),
             "details": details[:1200],
             "source": source,
-            "platform": str(ev.get("platform") or source.split(" in ")[0] or ""),
+            "author": _clean_author(source),
+            "platform": _platform_of(ev, source),
+            "region": classify_region(str(ev.get("location") or ""), source),
             "priority": ev.get("priority", ev.get("score", 3)),
             "bucket": _bucket(iso, today),
             "ticktick": ticktick_deep_link(title, iso or None, not ev.get("time"), details[:400]),
@@ -143,14 +230,30 @@ input[type=search] {
   width: 100%; padding: 11px 12px; font-size: 16px; color: var(--fg);
   background: var(--chip); border: 1px solid var(--line); border-radius: 10px;
 }
-.chips { display: flex; gap: 8px; overflow-x: auto; padding-top: 10px; scrollbar-width: none; }
-.chips::-webkit-scrollbar { display: none; }
+/* One row, search + sort + layout, because they are all "how do I look at
+   this" and were previously stacked across three rows. */
+.bar { display: flex; gap: 8px; align-items: center; }
+.bar input[type=search] { flex: 1 1 auto; min-width: 0; }
+.filters { display: flex; gap: 12px; align-items: center; padding-top: 10px; }
+/* Chips wrap rather than scroll. Horizontal scroll hid every filter past the
+   viewport edge with no affordance saying so — and there are now few enough
+   to fit, since they are platforms and not one chip per sender. */
+.chips { display: flex; gap: 8px; flex-wrap: wrap; flex: 1 1 auto; }
 .chip {
-  flex: 0 0 auto; padding: 7px 13px; border-radius: 999px; border: 1px solid var(--line);
+  flex: 0 0 auto; display: inline-flex; align-items: center; gap: 7px;
+  padding: 7px 13px; border-radius: 999px; border: 1px solid var(--line);
   background: var(--chip); color: var(--muted); font-size: 13px; cursor: pointer;
   min-height: 34px;
 }
+.chip:hover { border-color: var(--accent); color: var(--fg); }
 .chip[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+/* The count rides inside the chip so the filter says what it will show
+   before you click it. */
+.tally {
+  font-size: 11px; font-weight: 700; padding: 1px 6px; border-radius: 999px;
+  background: rgba(127,127,127,.22); color: inherit; font-variant-numeric: tabular-nums;
+}
+.chip[aria-pressed="true"] .tally { background: rgba(255,255,255,.25); }
 main { padding: 0 16px 48px; max-width: 1400px; margin: 0 auto; }
 h2.bucket {
   font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
@@ -177,15 +280,36 @@ body.carousel .shelf .card {
   background: var(--card); border: 1px solid var(--line); border-radius: 12px;
   padding: 14px; box-shadow: var(--shadow);
   display: flex; flex-direction: column;
+  /* Skip layout, paint and image decode for cards that are off screen. With
+     240 cards and ~95 inline JPEGs this is the single largest win available,
+     and it costs one line. `contain-intrinsic-size` supplies a placeholder
+     height so the scrollbar does not lurch as cards are skipped and restored;
+     `auto` lets the browser remember each card's real size once measured.
+     Unsupported browsers simply render everything, as before. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 260px;
 }
 .card .actions { margin-top: auto; }
-.toolbar { display: flex; gap: 8px; align-items: center; padding-top: 10px; flex-wrap: wrap; }
-.toolbar select, .toolbar button {
-  padding: 7px 11px; min-height: 34px; font-size: 13px; color: var(--fg);
-  background: var(--chip); border: 1px solid var(--line); border-radius: 8px;
-  cursor: pointer;
+.bar select, .bar button {
+  flex: 0 0 auto; padding: 9px 12px; min-height: 40px; font-size: 13px;
+  color: var(--fg); background: var(--chip); border: 1px solid var(--line);
+  border-radius: 10px; cursor: pointer;
 }
-.count { color: var(--muted); font-size: 13px; margin-left: auto; }
+.count {
+  flex: 0 0 auto; color: var(--muted); font-size: 13px; white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+@media (max-width: 560px) {
+  /* The layout toggle is the least-used control and the first to go. */
+  .bar #layout { display: none; }
+  .filters { flex-direction: column; align-items: flex-start; gap: 6px; }
+}
+/* Fixed aspect box, so a card with a picture and one without stay the same
+   width and the grid does not jump as images load. */
+.thumb {
+  display: block; width: calc(100% + 2px); margin: -1px -1px 10px; aspect-ratio: 300 / 168;
+  object-fit: cover; border-radius: 11px 11px 0 0; background: var(--chip);
+}
 .card h3 { margin: 0 0 6px; font-size: 16px; line-height: 1.35; }
 .when { color: var(--accent); font-weight: 600; font-size: 14px; }
 .where, .src { color: var(--muted); font-size: 13px; }
@@ -234,6 +358,7 @@ const BUCKETS = JSON.parse(document.getElementById('bucket-order').textContent);
 const main = document.getElementById('list');
 const search = document.getElementById('q');
 let activeSource = null;
+let activeRegion = null;
 
 function icsFor(ev) {
   const esc = (s) => String(s || '').replace(/([,;\\])/g, '\\$1').replace(/\n/g, '\\n');
@@ -286,6 +411,18 @@ function card(ev) {
   const el = document.createElement('article');
   el.className = 'card';
 
+  // Thumbnail first, and only when there is one — an empty box where a
+  // picture should be reads as broken, whereas no box just reads as text.
+  if (ev.thumb) {
+    const fig = document.createElement('img');
+    fig.className = 'thumb';
+    fig.src = ev.thumb;          // a data: URI, embedded at build time
+    fig.alt = '';                // decorative: the title says the same thing
+    fig.loading = 'lazy';
+    fig.decoding = 'async';
+    el.appendChild(fig);
+  }
+
   const h = document.createElement('h3');
   h.textContent = ev.title;                       // textContent, never innerHTML
   el.appendChild(h);
@@ -299,9 +436,14 @@ function card(ev) {
     const w = document.createElement('div');
     w.className = 'where'; w.textContent = ev.location; el.appendChild(w);
   }
-  if (ev.source) {
+  // `author` is the From header with the angle-bracket address stripped;
+  // `source` is the raw string, kept for search. Show the readable one.
+  const who = ev.author || ev.source;
+  if (who) {
     const s = document.createElement('div');
-    s.className = 'src'; s.textContent = ev.source; el.appendChild(s);
+    s.className = 'src';
+    s.textContent = ev.platform ? `${who} · ${ev.platform}` : who;
+    el.appendChild(s);
   }
 
   const actions = document.createElement('div');
@@ -328,6 +470,10 @@ function card(ev) {
       toggle.textContent = open ? 'Less' : 'More';
     };
     actions.appendChild(toggle);
+    // Register for measurement instead of measuring now: `card()` runs inside
+    // the render loop, and reading layout there would reintroduce exactly the
+    // per-card reflow this replaced.
+    watchToggle(body);
   }
 
   const ics = icsFor(ev);
@@ -370,7 +516,10 @@ function matching() {
   // matching either word.
   const terms = q ? q.split(/\s+/) : [];
   return DATA.filter(ev => {
+    // The two chip rows are independent axes and AND together: "SF" plus
+    // "web" means SF events from web sources, not one or the other.
     if (activeSource && ev.platform !== activeSource) return false;
+    if (activeRegion && ev.region !== activeRegion) return false;
     if (!terms.length) return true;
     const hay = (ev.title + ' ' + ev.location + ' ' + ev.details + ' ' +
                  ev.source + ' ' + ev.date).toLowerCase();
@@ -378,7 +527,17 @@ function matching() {
   });
 }
 
+// Cards are built across animation frames rather than in one pass. At 33
+// events the difference was invisible; at 240 — with ~95 inline JPEGs to
+// decode — building them all synchronously blocked the main thread until the
+// whole set was done, so the page appeared frozen rather than progressively
+// filling. A render token cancels an in-flight build, because typing in the
+// search box starts a new render on nearly every keystroke.
+let renderToken = 0;
+const FRAME_BUDGET_MS = 8;   // half a 60fps frame, leaving room to paint
+
 function render() {
+  const token = ++renderToken;
   main.textContent = '';
   const matches = matching().sort(SORTS[sortBy.value] || SORTS.date);
   countEl.textContent = matches.length + ' of ' + DATA.length;
@@ -391,33 +550,78 @@ function render() {
     return;
   }
 
+  // Flatten to a work list first so slicing is by *card*, not by bucket — one
+  // bucket can hold a hundred events, which would defeat the whole point.
+  const work = [];
   for (const bucket of BUCKETS) {
     const inBucket = matches.filter(ev => ev.bucket === bucket);
     if (!inBucket.length) continue;
-    const h = document.createElement('h2');
-    h.className = 'bucket';
-    h.textContent = bucket + ' · ' + inBucket.length;
-    main.appendChild(h);
-    const shelf = document.createElement('div');
-    shelf.className = 'shelf';
-    for (const ev of inBucket) shelf.appendChild(card(ev));
-    main.appendChild(shelf);
+    work.push({heading: bucket + ' · ' + inBucket.length});
+    for (const ev of inBucket) work.push({ev});
   }
-  requestAnimationFrame(syncDetailToggles);
+
+  let i = 0;
+  let shelf = null;
+  const step = () => {
+    if (token !== renderToken) return;   // superseded by a newer render
+    const started = performance.now();
+    while (i < work.length && performance.now() - started < FRAME_BUDGET_MS) {
+      const item = work[i++];
+      if (item.heading !== undefined) {
+        const h = document.createElement('h2');
+        h.className = 'bucket';
+        h.textContent = item.heading;
+        main.appendChild(h);
+        shelf = document.createElement('div');
+        shelf.className = 'shelf';
+        main.appendChild(shelf);
+      } else {
+        (shelf || main).appendChild(card(item.ev));
+      }
+    }
+    if (i < work.length) requestAnimationFrame(step);
+  };
+  step();
 }
 
 // Whether the clamp actually bit can only be known after layout, and it
-// changes with card width — so this re-runs on layout switch and on resize,
-// not just after render.
+// changes with card width — so it re-runs on layout switch and on resize.
+//
+// **It is measured per card, when the card is near the viewport.** The old
+// version looped every `.details` in the document reading `scrollHeight` and
+// `clientHeight`, which forces a synchronous layout each time: 240 cards meant
+// 240 forced reflows in a tight loop, and that — more than the images — was
+// what froze the page. An IntersectionObserver defers each measurement to the
+// moment it can matter, and pairs with `content-visibility: auto`, under which
+// an offscreen card has no layout to measure anyway.
+function measureToggle(body) {
+  const toggle = body.parentElement.querySelector('.detail-toggle');
+  if (!toggle) return;
+  if (body.classList.contains('open')) { toggle.hidden = false; return; }
+  // +1 absorbs sub-pixel rounding, which otherwise shows a "More" button
+  // that expands to reveal nothing.
+  toggle.hidden = body.scrollHeight <= body.clientHeight + 1;
+}
+
+const toggleObserver = ('IntersectionObserver' in window)
+  ? new IntersectionObserver((entries, obs) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        measureToggle(entry.target);
+        obs.unobserve(entry.target);   // one measurement per card per layout
+      }
+    }, {rootMargin: '400px'})          // measure just before it scrolls in
+  : null;
+
+function watchToggle(body) {
+  if (toggleObserver) toggleObserver.observe(body);
+  else measureToggle(body);            // no observer: behave as before
+}
+
+// A width change invalidates every previous measurement, so re-observe rather
+// than re-measure — the observer will fire for whatever is on screen now.
 function syncDetailToggles() {
-  for (const body of main.querySelectorAll('.details')) {
-    const toggle = body.parentElement.querySelector('.detail-toggle');
-    if (!toggle) continue;
-    if (body.classList.contains('open')) { toggle.hidden = false; continue; }
-    // +1 absorbs sub-pixel rounding, which otherwise shows a "More" button
-    // that expands to reveal nothing.
-    toggle.hidden = body.scrollHeight <= body.clientHeight + 1;
-  }
+  for (const body of main.querySelectorAll('.details')) watchToggle(body);
 }
 
 let resizeTimer = null;
@@ -426,12 +630,28 @@ addEventListener('resize', () => {
   resizeTimer = setTimeout(syncDetailToggles, 150);
 });
 
+// One handler for both rows. A chip declares which axis it belongs to by
+// which data attribute it carries, so adding a third axis later needs a row
+// of markup and an entry here, not a parallel copy of this logic.
+const AXES = [
+  {attr: 'source', get: () => activeSource, set: v => { activeSource = v; }},
+  {attr: 'region', get: () => activeRegion, set: v => { activeRegion = v; }},
+];
+
 document.querySelectorAll('.chip').forEach(chip => {
+  const axis = AXES.find(a => a.attr in chip.dataset);
+  if (!axis) return;
   chip.onclick = () => {
-    const value = chip.dataset.source || null;
-    activeSource = (activeSource === value) ? null : value;
-    document.querySelectorAll('.chip').forEach(c =>
-      c.setAttribute('aria-pressed', String(c.dataset.source === activeSource)));
+    // The "All"/"Everywhere" chip carries an empty value, so it clears its
+    // axis by the same path as re-clicking an active chip. One rule, not two.
+    const value = chip.dataset[axis.attr] || null;
+    axis.set(axis.get() === value ? null : value);
+    const active = axis.get();
+    document.querySelectorAll(`.chip[data-${axis.attr}]`).forEach(c => {
+      const mine = c.dataset[axis.attr] || null;
+      c.setAttribute('aria-pressed',
+        String(active === null ? mine === null : mine === active));
+    });
     render();
   };
 });
@@ -527,6 +747,7 @@ def generate_html_report(
     output_path: str = "events_report.html",
     title: str = "Events",
     today: date | None = None,
+    thumbnails: bool = False,
 ) -> str:
     """Write a self-contained mobile-friendly HTML report. Returns the path.
 
@@ -545,7 +766,22 @@ def generate_html_report(
     today = today or datetime.now().astimezone().date()
     prepared = _prepare(events, today)
 
-    platforms = sorted({ev["platform"] for ev in prepared if ev["platform"]})
+    # Off by default: this is the only part of report generation that touches
+    # the network, and a caller writing a report from cached events should not
+    # silently acquire a dependency on the internet being up. The site turns it
+    # on; `--build-only` and the tests do not.
+    if thumbnails:
+        from event_harvester.outputs.thumbnails import thumbnails_for
+
+        try:
+            by_link = thumbnails_for([ev["link"] for ev in prepared if ev["link"]])
+            for ev in prepared:
+                uri = by_link.get(ev["link"])
+                if uri:
+                    ev["thumb"] = uri
+        except Exception as e:  # noqa: BLE001 -- a picture is never worth a report
+            logger.warning("thumbnails skipped: %s", e)
+
     # Local, to match the buckets. A header reading "generated 2026-07-31 UTC"
     # above a card headed "TODAY · 2026-07-30" invites exactly the doubt the
     # bucketing fix was about.
@@ -553,10 +789,35 @@ def generate_html_report(
     counts = source_counts or {}
     summary = ", ".join(f"{name} {n}" for name, n in counts.items() if n) or "no source counts"
 
+    # Counts on the chips, so the filter says how much it will show before it
+    # is clicked. Ordered by size — the useful one is rarely alphabetically
+    # first.
+    tallies = Counter(ev["platform"] for ev in prepared if ev["platform"])
+    ordered = [p for p, _ in tallies.most_common()]
+
+    # `escape` is not decoration. These labels come from LLM-extracted `source`
+    # strings, and three of them were literally `<someone@example.com>`, which
+    # the browser parsed as an unknown element and rendered as an empty chip.
+    # Anything derived from model output reaches this file as data, never
+    # markup.
     chips = "\n".join(
         f'<button class="chip" type="button" aria-pressed="false" '
-        f'data-source="{p}">{p}</button>'
-        for p in platforms
+        f'data-source="{escape(p, quote=True)}">{escape(p)}'
+        f'<span class="tally">{tallies[p]}</span></button>'
+        for p in ordered
+    )
+
+    # Region chips are a second, independent axis — they AND with the source
+    # filter rather than replacing it. Rendered in a fixed order (SF, Oakland,
+    # Broader, Unplaced) rather than by size, because unlike sources these are
+    # a known scale the reader is navigating, not a discovered set.
+    region_counts = Counter(ev["region"] for ev in prepared)
+    region_chips = "\n".join(
+        f'<button class="chip" type="button" aria-pressed="false" '
+        f'data-region="{r}" title="{escape(REGION_HINTS[r], quote=True)}">'
+        f'{escape(REGION_LABELS[r])}'
+        f'<span class="tally">{region_counts[r]}</span></button>'
+        for r in REGIONS if region_counts[r]
     )
 
     html = f"""<!doctype html>
@@ -576,11 +837,9 @@ def generate_html_report(
   <div class="meta">{summary} · {total_messages} message(s) scanned</div>
 </header>
 <div class="controls">
-  <input id="q" type="search" placeholder="Search events" autocomplete="off"
-         aria-label="Search events">
-  <div class="chips">{chips}</div>
-  <div class="toolbar">
-    <label for="sort" class="meta">Sort</label>
+  <div class="bar">
+    <input id="q" type="search" placeholder="Search events, venues, people"
+           autocomplete="off" aria-label="Search events">
     <select id="sort" aria-label="Sort events">
       <option value="date">Date</option>
       <option value="priority">Priority</option>
@@ -588,6 +847,20 @@ def generate_html_report(
     </select>
     <button id="layout" type="button" data-mode="grid"
             aria-label="Toggle grid or carousel layout">Grid</button>
+  </div>
+  <div class="filters">
+    <div class="chips" role="group" aria-label="Filter by place">
+      <button class="chip" type="button" aria-pressed="true"
+              data-region="">Everywhere<span class="tally">{len(prepared)}</span></button>
+      {region_chips}
+    </div>
+  </div>
+  <div class="filters">
+    <div class="chips" role="group" aria-label="Filter by source">
+      <button class="chip" type="button" aria-pressed="true"
+              data-source="">All<span class="tally">{len(prepared)}</span></button>
+      {chips}
+    </div>
     <span class="count" id="count"></span>
   </div>
 </div>
@@ -609,7 +882,7 @@ forwarding it forwards them.</footer>
     set_span_attrs(**{
         "report.events": len(prepared),
         "report.bytes": len(html),
-        "report.platforms": len(platforms),
+        "report.platforms": len(tallies),
     })
     count("report.generated", fmt="html", description="Reports written")
     record("report.size", len(html), unit="By", fmt="html",

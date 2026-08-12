@@ -106,6 +106,11 @@ def _events_for_report(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "source": source,
             "author": author,
             "channel": channel,
+            # Carried through so the report can label its filter chips by
+            # platform. Without it the report falls back to parsing `source`,
+            # which the model writes inconsistently — 148 of 240 events had no
+            # source chip at all until this was preserved (2026-08-12).
+            "_platforms": event.get("_platforms") or [],
         })
     return out
 

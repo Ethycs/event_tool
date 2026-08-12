@@ -171,6 +171,12 @@ def score_message(m: dict) -> int:
         s += 2
     if any(kw in content.lower() for kw in _get_actionable_signals()):
         s += 1
+    # Your own keywords outrank every built-in signal. This is what makes
+    # keywords do something on sources that cannot be queried: matching is
+    # local and never drops a message, so the only way a match matters is by
+    # surviving `prioritize_with_caps`, and the caps are where ~98% is lost.
+    if m.get("_keywords"):
+        s += 4
     return s
 
 
@@ -249,8 +255,25 @@ def prioritize_with_caps(messages: list[dict], caps) -> list[dict]:
             len(merged), caps.total,
         )
         merged = merged[: caps.total]
+    elif caps.total < 0:
+        # Caps default to unlimited since 2026-08-11, which moves the whole
+        # cost of a run onto the LLM stage. Say the number out loud: an
+        # expensive harvest should be visible in the log that caused it, not
+        # discovered on a bill. `_LOUD_MESSAGE_COUNT` is a "you probably meant
+        # to cap this" line, not a limit.
+        level = logger.warning if len(merged) >= _LOUD_MESSAGE_COUNT else logger.info
+        level(
+            "No global cap: %d message(s) going to extraction%s",
+            len(merged),
+            " — set a cap in /admin or CAP_TOTAL if that is more than intended."
+            if len(merged) >= _LOUD_MESSAGE_COUNT else ".",
+        )
 
     return merged
+
+
+# Roughly 100 LLM batches at the default batch size of 10.
+_LOUD_MESSAGE_COUNT = 1000
 
 
 def prioritize_grouped(messages: list[dict], caps) -> dict[str, list[dict]]:
@@ -434,8 +457,14 @@ def _extract_events_cloud(
                 # up to 5 pool workers called the same function -- so a batch
                 # could read a sibling batch's dropped list.
                 _, tasks, dropped = _parse_event_ini(raw)
+                # Resolve the back-reference here: this is the only scope that
+                # holds both the events and the messages they came from.
+                attach_source_ids(tasks, batch)
                 span.set_attribute("events.extracted", len(tasks))
                 span.set_attribute("events.dropped_past", len(dropped))
+                span.set_attribute(
+                    "events.source_linked", sum(1 for t in tasks if t.get("_source_ids")),
+                )
                 return tasks, raw, dropped, batch if not tasks else []
             except Exception as e:
                 logger.exception("Batch failed (%s)", type(e).__name__)
@@ -469,6 +498,68 @@ def _extract_events_cloud(
         span.set_attribute("events.out", len(unique))
 
     return "", unique, {"llm_past": llm_dropped, "llm_no_events": llm_no_events}
+
+
+def attach_source_ids(events: list[dict], batch: list[dict]) -> None:
+    """Link each event back to the message in ``batch`` that produced it.
+
+    **`EH-STD-EVENT-v0` §3.1 is explicit that `source` is free text and "NOT a
+    structured back-reference".** That was fine while every sink only
+    displayed it, and stopped being fine when Gmail labelling needed to know
+    which mail to label. Resolution is confined to the batch the event came
+    out of (≤10 messages), which is what makes it tractable at all.
+
+    **Confident matches only, and the bar is deliberately high**: the consumer
+    writes to a real mailbox, and a mislabelled message is worse than an
+    unlabelled one. Two signals qualify --
+
+    - the event's ``link`` appears verbatim in the message content, or
+    - the event's ``source`` names the message's author.
+
+    A title-word overlap heuristic was considered and rejected: LLM titles are
+    rewritten, not quoted, so it produced matches that looked plausible and
+    were not checkable. Ambiguity (two messages matching equally) resolves to
+    *no* id rather than a guess. Events keep ``_source_ids: []`` when nothing
+    resolves, so a caller can tell "unlinked" from "never attempted".
+    """
+    for ev in events:
+        ev.setdefault("_source_ids", [])
+        link = (ev.get("link") or "").strip()
+        source = (ev.get("source") or "").strip().lower()
+
+        hits: list[str] = []
+        for m in batch:
+            content = m.get("content") or ""
+            author = (m.get("author") or "").strip().lower()
+            matched = bool(link) and len(link) > 12 and link in content
+            if not matched and author and source:
+                # `source` is prompt-documented as "@author in #channel"; for
+                # Gmail the author is a From header, so compare the address.
+                addr = author.partition("<")[2].partition(">")[0] or author
+                matched = bool(addr) and addr in source
+            if matched and m.get("id"):
+                hits.append(m["id"])
+
+        # Exactly one message must claim it. Two equally-good matches means
+        # the signal did not discriminate, and guessing is not allowed here.
+        if len(hits) == 1:
+            ev["_source_ids"] = hits
+
+        # Platform is safe to take from the whole batch even when the message
+        # is ambiguous: batches are built from the scored message list, which
+        # routinely mixes platforms, but an event can only have come from one
+        # of the platforms present. Where the batch is single-platform this is
+        # exact; where it is not, a wrong-but-plausible platform is still
+        # better than the current fallback, which labels the event with the
+        # *author's email address* and produces one filter chip per person.
+        ev.setdefault("_platforms", sorted({
+            str(m.get("platform")) for m in batch if m.get("platform")
+        }))
+        if hits:
+            exact = {str(m.get("platform")) for m in batch
+                     if m.get("id") in hits and m.get("platform")}
+            if exact:
+                ev["_platforms"] = sorted(exact)
 
 
 _PRIO_MAP = {"HIGH": 5, "MED": 3, "MEDIUM": 3, "LOW": 1}

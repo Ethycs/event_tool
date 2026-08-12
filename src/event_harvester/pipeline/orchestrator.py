@@ -189,7 +189,12 @@ class Pipeline:
             # ── Filter read/sent (Gmail) ────────────────────────────────
             await self._checkpoint()
             with self._stage("filter") as span:
-                actionable = filter_read_sent(all_messages)
+                # drop_read is False by default for harvesting: read mail was
+                # 42% of the mailbox measured 2026-08-10, and an invite you
+                # opened is still an invite. Your own sent mail is still cut.
+                actionable = filter_read_sent(
+                    all_messages, drop_read=self.cfg.gmail.drop_read,
+                )
                 span.set_attribute("message.in", len(all_messages))
                 span.set_attribute("message.actionable", len(actionable))
                 span.set_attribute("message.dropped", len(all_messages) - len(actionable))

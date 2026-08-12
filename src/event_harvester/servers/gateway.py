@@ -119,6 +119,14 @@ def check_exposure(
     Raises rather than warns. The tools behind this gateway harvest, spend
     tokens, write to TickTick and drive a logged-in browser; a warning in a
     service log nobody reads is not a control.
+
+    **`EH_GATEWAY_ALLOW_INSECURE` exists for exactly one situation, and this
+    deployment is it:** a non-loopback bind that is nonetheless private because
+    the *network* authenticates. These services run inside a ZeroTier mesh
+    whose peers are all authenticated (2026-08-10), so the bind is mesh-wide
+    rather than internet-wide. The default still raises, because a process
+    cannot tell a mesh interface from a public one — that is the operator's
+    knowledge, and the flag is how they assert it.
     """
     if mode not in OPEN_MODES or is_loopback(host):
         return

@@ -1,5 +1,6 @@
 """Centralized configuration with validation."""
 
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -97,6 +98,33 @@ class GmailConfig:
     query: str = ""
     max_results: int = 200
 
+    # Fetch each message's real body instead of Gmail's 200-char snippet.
+    # Measured 2026-08-10 over 85 messages: median body 2505 chars, so the
+    # snippet is ~8% of an email. 32 of those 85 reached the reranker with no
+    # date and no link and were dropped for it; 4 carried an Eventbrite/Luma
+    # link that existed only past the 200-char cut. Costs one extra
+    # `messages().get(format="full")` per message.
+    fetch_bodies: bool = True
+    # Ceiling on hydrated `content`. Matches the web path's detail-page cap.
+    # A newsletter runs to 15 KB of footer; the event is at the top.
+    body_max_chars: int = 5000
+    # Drop mail you have already read. False for event harvesting -- an
+    # invite you opened is still an invite, and this was dropping 42% of the
+    # mailbox. `True` is the recruiter-triage meaning ("still needs action").
+    drop_read: bool = False
+    # Follow event-platform links (Luma, Eventbrite, …) found in a body and
+    # read their schema.org JSON-LD. Measured 2026-08-10: 12 of 14 links
+    # returned exact date, time AND venue to a plain GET -- no browser. That
+    # is ground truth, where the body only ever offered prose to infer from.
+    expand_links: bool = True
+    expand_max: int = 40        # ceiling on outbound fetches per harvest
+    expand_timeout_s: int = 12
+    expand_workers: int = 8     # plain `requests` calls; IO-bound
+    # Gmail label applied to mail that produced an event. Empty disables it.
+    # Additive only -- it adds a label, never removes one, and never moves a
+    # message out of the inbox. Skipped entirely on --dry-run.
+    events_label: str = "events"
+
     @property
     def is_configured(self) -> bool:
         return (
@@ -172,6 +200,14 @@ class SourceConfig:
         }
 
 
+# What an interactive `event-harvester` run falls back to — the ceilings that
+# were the global default until 2026-08-11. See `CapConfig.apply_cli_defaults`.
+CLI_DEFAULT_CAPS = {
+    "discord": 50, "telegram": 50, "gmail": 30,
+    "signal": 30, "web": 30, "total": 150,
+}
+
+
 @dataclass
 class CapConfig:
     """Per-source caps applied at the analysis stage.
@@ -180,14 +216,49 @@ class CapConfig:
     the global `total` ceiling. Caps prevent any single noisy source from
     crowding out higher-signal events from other sources.
     """
-    discord: int = 50
-    telegram: int = 50
-    gmail: int = 30
-    signal: int = 30
-    web: int = 30
-    total: int = 150           # global ceiling after per-source caps
+    # **Unlimited by default since 2026-08-11.** -1 means "no ceiling for this
+    # bucket"; 0 means "drop this source entirely", which is a different and
+    # still-useful thing.
+    #
+    # The old defaults (50/50/30/30/30, total 150) were the pipeline's binding
+    # constraint and were losing whole sources silently. Measured: caps
+    # discarded ~98% of what the classifier passed, and because every web
+    # sub-source shares one `web` bucket, luma's 60 messages took all 30 web
+    # slots on their own — erobay fetched **121 messages every run for weeks
+    # and produced no events**, with nothing in any log saying so.
+    #
+    # The decision (2026-08-11) is that dropping candidates belongs at the
+    # *view*, not the pipeline: the site can filter, search and sort, and it
+    # cannot show an event that was discarded before extraction.
+    #
+    # The cost is real and lands on the LLM stage — see `prioritize_with_caps`,
+    # which logs the count being sent so an expensive run is visible rather
+    # than surprising. Dial a bucket down from `/admin` when that matters.
+    discord: int = -1
+    telegram: int = -1
+    gmail: int = -1
+    signal: int = -1
+    web: int = -1
+    total: int = -1            # global ceiling after per-source caps; -1 = none
     group_by_source: bool = False  # if True, output is bucketed by source
     no_cap: bool = False       # if True, all per-source and total caps are bypassed
+
+    def apply_cli_defaults(self) -> None:
+        """Restore the pre-2026-08-11 ceilings for an interactive CLI run.
+
+        **The CLI keeps caps; the long-running surfaces do not.** They are
+        different jobs. A scheduled harvest feeding the site should collect
+        everything and let the page filter it — the site cannot show an event
+        that was discarded before extraction. Somebody typing
+        `event-harvester --days 7` wants a bounded run with a bounded bill.
+
+        Only fields still at the unlimited default are touched, so an explicit
+        `--cap`, a profile, a `/admin` overlay or a `CAP_*` env var all keep
+        their value.
+        """
+        for key, value in CLI_DEFAULT_CAPS.items():
+            if getattr(self, key, None) == -1:
+                setattr(self, key, value)
 
     def get(self, platform: str) -> int:
         """Look up cap for a platform name (case-insensitive).
@@ -282,6 +353,16 @@ def load_config() -> AppConfig:
             token_file=os.getenv("GMAIL_TOKEN_FILE", "token.json"),
             query=os.getenv("GMAIL_QUERY", ""),
             max_results=int(os.getenv("GMAIL_MAX_RESULTS", "200")),
+            # Both default ON/eligible; the env vars exist to turn them back
+            # off, so absence must read as the default, not as False.
+            fetch_bodies=os.getenv("GMAIL_FETCH_BODIES", "1").lower()
+            in ("1", "true", "yes"),
+            body_max_chars=int(os.getenv("GMAIL_BODY_MAX_CHARS", "5000")),
+            drop_read=os.getenv("GMAIL_DROP_READ", "").lower() in ("1", "true", "yes"),
+            expand_links=os.getenv("GMAIL_EXPAND_LINKS", "1").lower()
+            in ("1", "true", "yes"),
+            expand_max=int(os.getenv("GMAIL_EXPAND_MAX", "40")),
+            events_label=os.getenv("GMAIL_EVENTS_LABEL", "events"),
         ),
         signal=SignalConfig(
             db_path=os.getenv("SIGNAL_DB_PATH"),
@@ -315,12 +396,14 @@ def load_config() -> AppConfig:
             debug_screenshots=os.getenv("WEB_DEBUG_SCREENSHOTS", "").lower() in ("1", "true", "yes"),
         ),
         caps=CapConfig(
-            discord=int(os.getenv("CAP_DISCORD", "50")),
-            telegram=int(os.getenv("CAP_TELEGRAM", "50")),
-            gmail=int(os.getenv("CAP_GMAIL", "30")),
-            signal=int(os.getenv("CAP_SIGNAL", "30")),
-            web=int(os.getenv("CAP_WEB", "30")),
-            total=int(os.getenv("CAP_TOTAL", "150")),
+            # -1 = unlimited. Set a CAP_* env var to put a ceiling back
+            # everywhere, including the scheduled site harvest.
+            discord=int(os.getenv("CAP_DISCORD", "-1")),
+            telegram=int(os.getenv("CAP_TELEGRAM", "-1")),
+            gmail=int(os.getenv("CAP_GMAIL", "-1")),
+            signal=int(os.getenv("CAP_SIGNAL", "-1")),
+            web=int(os.getenv("CAP_WEB", "-1")),
+            total=int(os.getenv("CAP_TOTAL", "-1")),
             group_by_source=os.getenv("CAP_GROUP_BY_SOURCE", "").lower() in ("1", "true", "yes"),
         ),
         sources=SourceConfig(
@@ -342,7 +425,85 @@ def load_config() -> AppConfig:
     # so capturing PNGs without recording the trace would lose them.
     if cfg.web.debug_screenshots:
         cfg.web.debug_trace = True
+    apply_caps_overlay(cfg)
     return cfg
+
+
+# ── Caps overlay (UI-writable) ───────────────────────────────────────
+#
+# Caps are the pipeline's binding constraint — measured 2026-08-07 they
+# discarded ~98% of what the classifier passed — so they are the one setting
+# worth tuning without editing `.env` and restarting. `/admin` writes this
+# file; env vars remain the source of truth for anything it does not set, so
+# deleting the file restores env/default behaviour exactly.
+
+CAPS_FILE = Path("data/settings.json")
+_CAP_FIELDS = ("discord", "telegram", "gmail", "signal", "web", "total")
+CAP_MAX = 5000  # a typo here costs real money at the LLM stage
+CAP_UNLIMITED = -1
+
+
+def _clamp_cap(value) -> int:
+    """Bound a cap, preserving -1 as "unlimited".
+
+    Any negative value normalises to exactly -1 rather than clamping to 0:
+    `prioritize_with_caps` tests `cap < 0`, so -5 already meant unlimited, and
+    silently turning it into "drop everything from this source" would be the
+    worst possible misreading of an operator's typo.
+    """
+    n = int(value)
+    if n < 0:
+        return CAP_UNLIMITED
+    return min(CAP_MAX, n)
+
+
+def load_caps_overlay(path: Path | None = None) -> dict[str, int]:
+    """Read UI-set caps. Unreadable or absent means "no overlay", never an error."""
+    p = Path(path or CAPS_FILE)
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+    caps = raw.get("caps") if isinstance(raw, dict) else None
+    if not isinstance(caps, dict):
+        return {}
+    out: dict[str, int] = {}
+    for k in _CAP_FIELDS:
+        if k in caps:
+            try:
+                out[k] = _clamp_cap(caps[k])
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+def save_caps_overlay(caps: dict, path: Path | None = None) -> dict[str, int]:
+    """Validate and write atomically. Returns what was actually stored."""
+    clean: dict[str, int] = {}
+    for k in _CAP_FIELDS:
+        if k in caps:
+            clean[k] = _clamp_cap(caps[k])
+    p = Path(path or CAPS_FILE)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    existing = {}
+    try:
+        existing = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        existing = {}
+    if not isinstance(existing, dict):
+        existing = {}
+    existing["caps"] = clean
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(p)
+    return clean
+
+
+def apply_caps_overlay(cfg, path: Path | None = None) -> None:
+    for k, v in load_caps_overlay(path).items():
+        setattr(cfg.caps, k, v)
 
 
 def validate_config(

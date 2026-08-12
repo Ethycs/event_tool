@@ -310,7 +310,21 @@ def dedup_events(events: list[dict]) -> list[dict]:
     set_span_attrs(**{"dedup.event.in": len(events)})
     unique: list[dict] = []
     unique_sigs: list[dict] = []
-    seen_links: set[str] = set()
+    seen_links: dict[str, dict] = {}
+
+    def _merge_provenance(kept: dict, dropped: dict) -> None:
+        """Carry the discarded twin's source messages onto the survivor.
+
+        A duplicate is otherwise thrown away whole. That is right for the
+        event — it *is* the same event — but wrong for its provenance: two
+        emails announcing one meetup are two emails, and the Gmail labeller
+        should mark both. Added 2026-08-10 with ``_source_ids``.
+        """
+        extra = dropped.get("_source_ids") or []
+        if not extra:
+            return
+        ids = kept.setdefault("_source_ids", [])
+        ids.extend(mid for mid in extra if mid not in ids)
 
     for event in events:
         sig = event_signature(event)
@@ -318,21 +332,23 @@ def dedup_events(events: list[dict]) -> list[dict]:
         # Fast path: exact link match
         link = sig["link"]
         if link and link in seen_links:
+            _merge_provenance(seen_links[link], event)
             continue
 
         # Slow path: fuzzy match against existing unique events
         matched = False
-        for existing_sig in unique_sigs:
+        for i, existing_sig in enumerate(unique_sigs):
             score = _sig_match_score(sig, existing_sig)
             if score >= 2:
                 matched = True
+                _merge_provenance(unique[i], event)
                 break
 
         if not matched:
             unique.append(event)
             unique_sigs.append(sig)
             if link:
-                seen_links.add(link)
+                seen_links[link] = event
 
     set_span_attrs(**{
         "dedup.event.out": len(unique),

@@ -67,7 +67,22 @@ A **message record** is the atomic unit the harvest pipeline operates on: one ch
 
 **Telegram** (`sources/telegram.py`): base fields + optional `pinned`. `author` resolution order: `username` → `first_name` → `"unknown"`. `channel` = dialog title/first_name/`"unknown"`. Requires `TelegramConfig.is_configured` (`TELEGRAM_API_ID`/`TELEGRAM_API_HASH`); pinned messages are fetched separately (last 10 per dialog, `include_pinned=True` by default) regardless of the `cutoff` date filter.
 
-**Gmail** (`sources/gmail.py:fetch_messages`): base fields + `thread_id`, `is_read`, `is_sent` (both always present). `content` = `f"{subject}\n{snippet}"` (Gmail API snippet, not full body — full body requires the separate `fetch_full_bodies()` call, which is not part of the standard message record). `channel` = first non-system label on the message, else `"INBOX"`. `timestamp` = parsed `Date` header via `email.utils.parsedate_to_datetime`; falls back to the raw header string if parsing fails (`gmail.py:131` — meaning `timestamp` is NOT guaranteed ISO-8601 in this one failure path; `inferred` edge case, not observed to trigger in normal operation).
+**Gmail** (`sources/gmail.py:fetch_messages`): base fields + `thread_id`, `is_read`, `is_sent` (both always present), and — since 2026-08-10, on hydrated messages only — `body_chars: int`, the pre-truncation length of the fetched body.
+
+`content` was `f"{subject}\n{snippet}"` until 2026-08-10, where `snippet` is Gmail's preview text, **hard-capped by the API at 200 characters**. Measured over a live 85-message window the median body was 2505 chars, so the record carried ~8% of the email and 32 of 85 reached the reranker with no date and no link. Since 2026-08-10 `fetch_messages` calls `hydrate_bodies()` (unless `GmailConfig.fetch_bodies` is off) and `content` becomes a **three-part pack, capped at `body_max_chars` (default 5000)**:
+
+```
+<subject>
+EVENT: <name> | WHEN: <date> <time> | WHERE: <venue>    ← schema.org, if the link answered
+<up to 2 event-platform URLs found anywhere in the body>
+<body decimated to its date-densest window>
+```
+
+The `EVENT:` line is present only when an event-platform link in the body resolved to schema.org JSON-LD (`GmailConfig.expand_links`, on by default); messages carrying one also set `event_facts: True`. It is **exact data, not inference** — a consumer may prefer it over anything parsed out of the prose.
+
+**The order is normative, not cosmetic.** `analysis.build_prompt` truncates `content` to 400 chars *and* derives its `dates=`/`times=` hints from that same slice, so anything past char 400 is invisible twice over — the same constraint that makes the `instagram` mode put its permalink first. A consumer that reorders these parts silently degrades extraction without failing. On a message whose body could not be fetched, `content` keeps the old `subject\nsnippet` shape — enrichment never costs a message.
+
+`channel` = first non-system label on the message, else `"INBOX"`. Since 2026-08-10 harvest may also *add* the `GmailConfig.events_label` label (default `"events"`) to messages that produced an event; that is a mailbox-side effect and does not change the record. `timestamp` = parsed `Date` header via `email.utils.parsedate_to_datetime`; falls back to the raw header string if parsing fails (`gmail.py:131` — meaning `timestamp` is NOT guaranteed ISO-8601 in this one failure path; `inferred` edge case, not observed to trigger in normal operation).
 
 **Signal** (`sources/signal.py`): base fields + optional `is_sent`. Reads Signal Desktop's local SQLCipher DB directly (key extraction via `sigexport.crypto`). `author` = `"You"` for outgoing, else `source` column or channel name. `timestamp` built from `sent_at` (ms epoch) via `datetime.fromtimestamp(ms/1000, tz=timezone.utc)` — always tz-aware.
 

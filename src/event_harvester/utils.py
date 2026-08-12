@@ -36,6 +36,20 @@ def parse_llm_ini(raw: str) -> dict[str, dict[str, str]]:
     """Parse INI-formatted LLM output into {section: {key: value}} dict.
 
     Handles LLM quirks like markdown code fences.
+
+    **`interpolation=None` is load-bearing.** `ConfigParser` treats `%` as a
+    substitution syntax, so a perfectly ordinary event — a URL containing
+    `%20`, a title saying "50% off" — raised `InterpolationSyntaxError` and
+    **lost the whole batch of ten events**. Diagnosed 2026-08-12 on `erobay`,
+    whose Calcium detail links are full of `%`: 121 messages reached the model
+    and produced zero events, run after run.
+
+    The failure was doubly hidden. `build_prompt` already escapes `%` on the
+    way *in*, which made `%` look like a solved problem; nothing escaped the
+    model's reply on the way *out*. And interpolation happens on **value
+    access**, not on parse — so `read_string` inside the `try` succeeded and
+    the exception came from the `dict(...)` comprehension below it, escaping
+    the `except configparser.Error` that was meant to contain exactly this.
     """
     import configparser
 
@@ -45,12 +59,14 @@ def parse_llm_ini(raw: str) -> dict[str, dict[str, str]]:
         lines = [ln for ln in lines if not ln.strip().startswith("```")]
         cleaned = "\n".join(lines)
 
-    parser = configparser.ConfigParser()
+    parser = configparser.ConfigParser(interpolation=None)
     try:
         parser.read_string(cleaned)
+        # Inside the try: reading values is its own failure point, and a
+        # malformed reply must cost this batch, never the run.
+        return {section: dict(parser[section]) for section in parser.sections()}
     except configparser.Error:
         return {}
-    return {section: dict(parser[section]) for section in parser.sections()}
 
 
 # ── JSON I/O ──────────────────────────────────────────────────────────────

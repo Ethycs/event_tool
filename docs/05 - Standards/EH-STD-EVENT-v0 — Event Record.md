@@ -28,6 +28,8 @@ IS NOT covered: the message record consumed as extraction input (see `EH-STD-MSG
 
 An **event record** starts life as one `[Event.N]` INI section parsed out of an LLM completion (one completion per batch of ≤10 messages — `analysis.py:_extract_events_cloud`/`_extract_events_local`). It is a flat dict with a fixed 9-key shape (`title`, `date`, `time`, `location`, `link`, `notes`, `source`, `priority`, `due_in_days`). Once extracted, it is deduplicated within the run, tagged with an internal `_status` field that reflects whether the user has already acted on a structurally-matching event in a prior run (via the on-disk fingerprint store, `data/.event_fingerprints.json`), and then handed unchanged to whichever sink the caller wants: a TickTick task, a Markdown report row, an Obsidian vault note, or an MCP tool response. Every sink independently re-derives display fields (`author`/`channel` by splitting the `source` string on `" in "`) rather than the record carrying them structurally — `source` is a free-text convenience string, not a normalized back-reference.
 
+**Amended 2026-08-10:** a structured back-reference now exists alongside it, `_source_ids` (§3.2a). `source` remains free text and unchanged; the new field was added rather than redefining `source`, because every existing sink parses `source` for display and would have broken.
+
 ## 3. Specification (field tables, value vocabularies, examples)
 
 ### 3.1 Core event-candidate fields (as produced by `_parse_event_ini`)
@@ -44,6 +46,7 @@ An **event record** starts life as one `[Event.N]` INI section parsed out of an 
 | `priority` | int | yes, always `3` at extraction | `analysis.py:563` (constant); mutated later by `outputs/ticktick.py:update_task_details:104-105` (kept-if-higher merge) | `outputs/ticktick.py` (TickTick task priority + `PRIORITY_LABEL` display), `mcp_server._public_event` | `PRIORITY_LABEL = {0: "none", 1: "low", 3: "medium", 5: "high"}`. |
 | `due_in_days` | None | yes, always `None` | `analysis.py:564` (constant, never set otherwise) | none found in-repo (`inferred` unused downstream — no reader grep-matched anywhere) | Dead field — reserved but unpopulated. |
 | `_status` | str | yes, added post-extraction | `pipeline/orchestrator.py:Pipeline._status_for`, `servers/mcp_server.py:_event_status` (mirror implementations) | `mcp_server._public_event` (`status`), `mcp_server.run_event_pipeline` (`include_known` filter, stats counts) | Lifecycle tag — see §3.2. |
+| `_source_ids` | list[str] | yes since 2026-08-10, added at extraction | `analysis.attach_source_ids` (inside `_extract_events_cloud`'s batch scope); unioned on collapse by `event_match.dedup_events` | `sources/gmail.py:label_event_messages`, `cli/commands/harvest.py:_label_event_mail` | Ids of the messages that produced this event — see §3.2a. Possibly empty; **never absent** on an extracted event. |
 
 ### 3.2 `_status` value vocabulary
 
@@ -54,6 +57,25 @@ An **event record** starts life as one `[Event.N]` INI section parsed out of an 
 | `"declined"` | User called `decline_event` (MCP) in a prior run and the event structurally matches | Fingerprint store has an entry with `status: "declined"` |
 
 Note: the fingerprint store itself (`data/.event_fingerprints.json`, via `event_match.save_fingerprint`) also writes a third status literal, `"auto"` — used only for pre-fetch web-link dedup hints (`_filter_known_links` in `web_utils.py`) and for **every** TickTick create/update, since `outputs/ticktick.py:164,207` calls `save_fingerprint(event, ticktick_id)` without an explicit `status=` argument, defaulting to `"auto"`. `"auto"` entries are structurally excluded from `find_acted_fingerprint` (`_ACTED_STATUSES = frozenset({"approved", "declined"})`) so they never surface as an event's `_status` value — but see §4 for why this is a real behavioral gap, not just an implementation detail.
+
+### 3.2a `_source_ids` — the back-reference, and why it is deliberately incomplete
+
+**Added 2026-08-10**, because Gmail labelling needed to know which mail to label and `source` could not answer it.
+
+`list[str]` of message `id` values (EH-STD-MSG-v0 `id`), in the platform's own id space. Empty list when nothing resolved — **the key is always present on an extracted event**, so a consumer can distinguish "no confident link" from "an older record that predates the field".
+
+**Resolution is confined to the LLM batch the event came out of** (≤10 messages, `analysis.py:_extract_events_cloud`). That is what makes it tractable: matching an event against the whole run would be guesswork, matching within its own batch is nearly determined. Two signals qualify, and both must identify **exactly one** message:
+
+| Signal | Rule |
+|---|---|
+| Link | the event's `link` appears verbatim in the message `content`, and is longer than 12 chars (so `TBD` cannot match) |
+| Author | the address inside the message's `author` header appears in the event's free-text `source` |
+
+**Ambiguity resolves to empty, never to a guess.** Two messages matching equally means the signal did not discriminate. A title-word overlap signal was considered and rejected: LLM titles are rewritten rather than quoted, so it produced matches that looked plausible and could not be checked. The consumer writes to a live mailbox, and a mislabelled message is worse than an unlabelled one.
+
+**`dedup_events` unions rather than discards.** When a duplicate event collapses, its `_source_ids` are merged onto the survivor — two emails announcing one meetup are still two emails. This is the one place dedup carries data off the record it drops.
+
+`known rough edge`: the union faithfully propagates dedup's own false positives. Measured 2026-08-10, a `SkyPilot AI Infra Meetup` event absorbed a `SUPERNOVA 2026` email because both fell on 2026-08-18 and `_sig_match_score` reached 2 — an instance of the non-transitive-matching hazard already recorded in `03 - Architecture/00 - System Overview.md` §5.4. 1 wrong pairing in 19 on that run.
 
 ### 3.3 `mcp_server._public_event` projection (MCP client-facing shape)
 

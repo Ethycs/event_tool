@@ -204,8 +204,14 @@ class TestPrepare:
         }], date.today())
         assert set(prepared[0]) == {
             "i", "title", "date", "time", "location", "link", "details",
-            "source", "platform", "priority", "bucket", "ticktick",
-        }
+            "source", "author", "platform", "region", "priority", "bucket",
+            "ticktick",
+        }, (
+            "`author` was added 2026-08-11 for the card byline. It is derived "
+            "from `source`, which is already embedded, so it widens the "
+            "rendering surface without widening what the forwarded file "
+            "discloses — which is the property this test exists to protect."
+        )
 
     def test_every_event_gets_a_ticktick_deep_link(self):
         prepared = _prepare(_events(), date.today())
@@ -214,6 +220,161 @@ class TestPrepare:
     def test_long_details_are_truncated(self):
         prepared = _prepare([{"title": "X", "details": "y" * 5000}], date.today())
         assert len(prepared[0]["details"]) <= 1200
+
+
+class TestTheFilterBar:
+    """Regressions from a screenshot, 2026-08-11.
+
+    The nav showed **22 chips for 33 events**, three of them completely blank,
+    and the same sender twice under two spellings. All three had the same
+    root: the chip label was the LLM's free-text `source` string.
+    """
+
+    @staticmethod
+    def _html(events, tmp_path):
+        from event_harvester.outputs.html_report import generate_html_report
+        p = tmp_path / "r.html"
+        generate_html_report(events, output_path=str(p))
+        return p.read_text(encoding="utf-8")
+
+    def test_an_angle_bracket_sender_cannot_inject_markup(self, tmp_path):
+        """`<noreply@x.com>` rendered as an unknown element — a blank chip.
+
+        This is the bug, and it is an escaping hole before it is a visual one:
+        model-derived text was reaching the document as markup.
+        """
+        html = self._html([{
+            "title": "T", "date": "2026-09-01",
+            "source": "<noreply@reminder.eventbrite.com> in #INBOX",
+            "_platforms": ["gmail"],
+        }], tmp_path)
+        # Scoped to the markup above <main>. The raw string does still appear
+        # inside the `application/json` data block, which is correct and is
+        # `_safe_json`'s job — the defect was it reaching the *document*.
+        head = html.split("<main")[0]
+        assert "<noreply@reminder.eventbrite.com>" not in head
+        assert "&lt;noreply" not in head, (
+            "the address should not reach the chip at all — the chip is a "
+            "platform now, not a sender"
+        )
+
+    def test_a_quote_in_a_sender_cannot_break_out_of_the_attribute(self, tmp_path):
+        html = self._html([{
+            "title": "T", "platform": 'w" onclick="alert(1)',
+        }], tmp_path)
+        assert 'onclick="alert(1)' not in html
+
+    def test_chips_are_platforms_not_senders(self, tmp_path):
+        """Twelve events from ten senders on one platform is one chip."""
+        events = [
+            {"title": f"E{i}", "date": "2026-09-01",
+             "source": f"person{i}@example.com in #INBOX", "_platforms": ["gmail"]}
+            for i in range(12)
+        ]
+        html = self._html(events, tmp_path)
+        # Scoped to the source axis: the place row has chips of its own.
+        assert html.count("data-source=") == 2, "just All + gmail"
+        assert "person0@example.com" not in html.split("<main")[0]
+
+    def test_each_chip_carries_its_count(self, tmp_path):
+        events = (
+            [{"title": "a", "_platforms": ["gmail"]}] * 3
+            + [{"title": "b", "_platforms": ["web"]}]
+        )
+        head = self._html(events, tmp_path).split("<main")[0]
+        assert '<span class="tally">3</span>' in head
+        assert '<span class="tally">4</span>' in head, "the All chip totals them"
+
+    def test_there_is_an_explicit_all_chip(self, tmp_path):
+        """Clearing a filter previously meant re-clicking the active chip —
+        discoverable only by accident."""
+        head = self._html(_events(), tmp_path).split("<main")[0]
+        assert 'data-source=""' in head
+        assert "All" in head
+
+    def test_chips_are_ordered_by_size(self, tmp_path):
+        head = self._html(
+            [{"title": "a", "_platforms": ["web"]}]
+            + [{"title": "b", "_platforms": ["gmail"]}] * 5, tmp_path,
+        ).split("<main")[0]
+        assert head.index('data-source="gmail"') < head.index('data-source="web"')
+
+
+class TestAuthorDisplay:
+    def test_a_from_header_becomes_a_name(self):
+        from event_harvester.outputs.html_report import _clean_author
+        assert _clean_author("Ben Holfeld <Ben@luma-mail.com> in #INBOX") \
+            == "Ben Holfeld"
+
+    def test_a_bare_address_loses_its_brackets(self):
+        from event_harvester.outputs.html_report import _clean_author
+        assert _clean_author("<noreply@eventbrite.com>") == "noreply@eventbrite.com"
+
+    def test_a_plain_handle_is_untouched(self):
+        from event_harvester.outputs.html_report import _clean_author
+        assert _clean_author("@qbarsf in #stories") == "@qbarsf"
+
+    def test_quotes_are_stripped(self):
+        from event_harvester.outputs.html_report import _clean_author
+        assert _clean_author('"Llama Lounge" <ll@x.com>') == "Llama Lounge"
+
+
+class TestPlatformResolution:
+    def test_an_explicit_platform_wins(self):
+        from event_harvester.outputs.html_report import _platform_of
+        assert _platform_of({"platform": "web", "_platforms": ["gmail"]}, "x") == "web"
+
+    def test_a_platform_outside_the_vocabulary_is_ignored(self):
+        """`data/.site/events.json` is already-prepared output, so a rebuild
+        feeds this the `platform` an older build wrote — the author's email.
+        Trusting any non-empty string made the bad chips survive every rebuild
+        and heal only after a fresh harvest."""
+        from event_harvester.outputs.html_report import _platform_of
+        stale = {"platform": "Ben Holfeld <ben@x.com>"}
+        assert _platform_of(stale, "Ben in Gmail / INBOX") == "gmail"
+
+    def test_a_single_batch_platform_is_used(self):
+        from event_harvester.outputs.html_report import _platform_of
+        assert _platform_of({"_platforms": ["gmail"]}, "a in b") == "gmail"
+
+    def test_an_ambiguous_batch_says_so_rather_than_guessing(self):
+        from event_harvester.outputs.html_report import _platform_of
+        assert _platform_of({"_platforms": ["gmail", "web"]}, "a in b") == "mixed"
+
+    @pytest.mark.parametrize("source,expected", [
+        ("@someone in Gmail / INBOX", "gmail"),
+        ("Ben <b@x.com> in Gmail/INBOX", "gmail"),
+        ("@qbarsf in Web / instagram/@qbarsf", "web"),
+        ("@qbarsf in instagram/@qbarsf", "web"),
+        ("bot in Telegram / Lonely Hackers Club", "telegram"),
+        ("x in Web", "web"),
+    ])
+    def test_the_channel_half_yields_the_platform_without_a_reharvest(
+        self, source, expected,
+    ):
+        """`build_prompt` groups as "Platform / channel" and the model echoes
+        it back, so the platform was in the string all along — on the other
+        side of the `" in "` the old code split on. This is what fixes the
+        already-cached events."""
+        from event_harvester.outputs.html_report import _platform_of
+        assert _platform_of({}, source) == expected
+
+    @pytest.mark.parametrize("source", [
+        "Telegram / Frolic Party SF 21+ SFW [Unofficial]",
+        "Gmail / INBOX",
+        "Web / instagram/@qbarsf",
+    ])
+    def test_a_bare_group_header_with_no_in_separator(self, source):
+        """The prompt asks for "@author in #channel" and the model often
+        obliges — but it also echoes the group header verbatim. Requiring the
+        separator left 148 of 240 events with no source chip."""
+        from event_harvester.outputs.html_report import _platform_of
+        assert _platform_of({}, source) in ("telegram", "gmail", "web")
+
+    def test_an_unreadable_source_yields_no_chip_rather_than_a_sender(self):
+        from event_harvester.outputs.html_report import _platform_of
+        assert _platform_of({}, "@someone in #chan") == ""
+        assert _platform_of({}, "nonsense") == ""
 
 
 class TestOutput:
@@ -292,17 +453,28 @@ class TestDetailIsShownNotHidden:
             "without this rule the More button renders even when hidden"
         )
 
-    def test_the_toggle_is_measured_after_layout(self):
+    def test_the_toggle_is_measured_against_real_layout(self):
+        """Whether the clamp bit is only knowable after layout."""
         html = self._js()
-        assert "syncDetailToggles" in html
         assert "scrollHeight" in html and "clientHeight" in html
-        assert "requestAnimationFrame(syncDetailToggles)" in html
+
+    def test_measurement_is_deferred_not_done_for_every_card_at_once(self):
+        """The old version read scrollHeight for every `.details` in one loop —
+        240 forced reflows, and the main cause of the page freezing. Each card
+        is now measured when it approaches the viewport."""
+        html = self._js()
+        assert "IntersectionObserver" in html
+        assert "watchToggle" in html
+
+    def test_a_browser_without_the_observer_still_gets_toggles(self):
+        html = self._js()
+        assert "'IntersectionObserver' in window" in html
 
     def test_the_toggle_is_resynced_when_card_width_changes(self):
         """Grid and carousel are different widths; so is a window resize."""
         html = self._js()
-        assert html.count("requestAnimationFrame(syncDetailToggles)") >= 2
         assert "addEventListener('resize'" in html
+        assert "syncDetailToggles" in html
 
     def test_duplicate_segments_are_stripped_from_the_inline_text(self):
         html = self._js()
@@ -314,7 +486,11 @@ class TestDetailIsShownNotHidden:
     def test_search_still_matches_the_raw_details(self):
         """Stripping is for display only — a URL must stay findable."""
         html = self._js()
-        assert "ev.details" in html.split("function matching()")[1][:400]
+        # Bounded to the function body rather than a fixed character count —
+        # a comment added inside `matching()` pushed the haystack past 400 and
+        # failed this test without changing any behaviour.
+        body = html.split("function matching()")[1].split("\n}")[0]
+        assert "ev.details" in body
 
     def test_detail_text_is_never_interpolated_as_html(self):
         html = self._js(events=[{

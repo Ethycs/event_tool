@@ -48,10 +48,16 @@ class TestParseCapArg:
         with pytest.raises(argparse.ArgumentTypeError, match="must be an integer"):
             parse_cap_arg("discord=abc")
 
-    def test_negative_raises(self):
-        import argparse
-        with pytest.raises(argparse.ArgumentTypeError, match="must be >= 0"):
-            parse_cap_arg("discord=-5")
+    def test_minus_one_means_unlimited(self):
+        """-1 is how `prioritize_with_caps` has always spelled "no ceiling",
+        and the config default since 2026-08-11. Rejecting it left the flag
+        unable to express the value the config itself defaults to."""
+        assert parse_cap_arg("discord=-1") == {"discord": -1}
+
+    def test_any_negative_normalises_to_unlimited(self):
+        """Matches `config._clamp_cap`, so the two paths cannot disagree —
+        and a typo cannot mean "drop every message from this source"."""
+        assert parse_cap_arg("discord=-5") == {"discord": -1}
 
     def test_missing_equals_raises(self):
         import argparse
@@ -282,9 +288,9 @@ class TestParserCapFlag:
         with pytest.raises(SystemExit):
             self.parser.parse_args(["harvest", "--cap", "discord=abc"])
 
-    def test_negative_cap_exits(self):
-        with pytest.raises(SystemExit):
-            self.parser.parse_args(["harvest", "--cap", "discord=-1"])
+    def test_minus_one_is_accepted_as_unlimited(self):
+        args = self.parser.parse_args(["harvest", "--cap", "discord=-1"])
+        assert args.cap == [{"discord": -1}]
 
 
 # ── Platform filter through argparse ─────────────────────────────────

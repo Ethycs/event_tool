@@ -38,6 +38,11 @@ async def harvest_cmd(args, cfg) -> int:
         if not _apply_profile_by_name(cfg, args.profile):
             return 2
 
+    # Caps default to unlimited so the scheduled/site path collects everything
+    # and the page filters it. An interactive run wants a bounded bill, so the
+    # CLI restores the old ceilings — but only where nothing else set them, so
+    # a profile (applied above), a CAP_* env var or a /admin overlay still win.
+    cfg.caps.apply_cli_defaults()
     apply_caps_to_config(cfg, args.cap)
     if args.group_by_source:
         cfg.caps.group_by_source = True
@@ -183,6 +188,14 @@ async def harvest_cmd(args, cfg) -> int:
         )
         print(f"Obsidian events -> {path}\n")
 
+    # ── Gmail label ─────────────────────────────────────────────────────
+    # Deliberately before the TickTick block: that block returns early when
+    # TickTick is unconfigured, and labelling your own mail should not depend
+    # on a third-party task service being set up.
+    _label_event_mail(
+        cfg, result.events, dry_run=args.dry_run, messages=result.all_messages,
+    )
+
     # ── TickTick sync ───────────────────────────────────────────────────
     if args.no_sync:
         return 0
@@ -213,6 +226,53 @@ async def harvest_cmd(args, cfg) -> int:
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
+
+
+def _label_event_mail(
+    cfg, events: list[dict], *, dry_run: bool, messages: list[dict] | None = None,
+) -> None:
+    """Tag the mail that produced an event with `cfg.gmail.events_label`.
+
+    Additive: it adds a label, never removes one and never moves a message
+    out of the inbox, so re-running is a no-op rather than a second edit.
+
+    `--dry-run` prints the actual event→subject pairings and writes nothing.
+    It prints the pairings rather than a count on purpose: this is the one
+    sink that edits a mailbox, and "would tag 16 messages" is not something a
+    reader can check, whereas a wrong pairing is obvious on sight.
+    """
+    label = (getattr(cfg.gmail, "events_label", "") or "").strip()
+    if not label or not events:
+        return
+
+    ids = {
+        mid
+        for ev in events
+        for mid in (ev.get("_source_ids") or [])
+    }
+    unlinked = sum(1 for ev in events if not ev.get("_source_ids"))
+    if not ids:
+        return
+
+    if dry_run:
+        subjects = {
+            m["id"]: (m.get("content") or "").partition("\n")[0]
+            for m in (messages or [])
+        }
+        print(f"{DIM}Gmail label '{label}': would tag {len(ids)} message(s) "
+              f"[dry run]{RESET}")
+        for ev in events:
+            for mid in ev.get("_source_ids") or []:
+                subj = subjects.get(mid, mid)
+                print(f"{DIM}    {(ev.get('title') or '?')[:44]:<46} <- {subj[:60]}{RESET}")
+        print()
+        return
+
+    from event_harvester.sources import gmail as gmail_src
+
+    n = gmail_src.label_event_messages(cfg.gmail, events, name=label)
+    note = f", {unlinked} event(s) had no resolved source" if unlinked else ""
+    print(f"{GREEN}Gmail label '{label}':{RESET} tagged {n} message(s){note}\n")
 
 
 def _source_key(event: dict) -> str:
