@@ -188,6 +188,40 @@ ValueError: Requested tokens (2519) exceed context window of 2048
 
 `unverified` — no valid quality comparison exists yet. The numbers above measure a 2048-token deployment, not Qwen3-8B.
 
+### Can the prompts be shortened? — measured 2026-08-13
+
+Over the 817 messages a real harvest sends, in its contiguous batches of 10, including the 216-token system prompt:
+
+| | p50 | p95 | max | over 2048 |
+|---|---|---|---|---|
+| before | 1,502 | 2,062 | 2,219 | 7 of 82 |
+| after `chat_label` | 1,502 | 2,056 | 2,141 | 5 of 82 |
+
+**`chat_label` is worth 2.2%, not the 26% one batch suggested.** A web source's `channel` is the event URL with tracking parameters — 39–64 tokens each — and because every URL is distinct, a 10-message web batch became ten one-message groups paying ten headers. On one stratified batch that was 486 of 1,881 tokens. Across all 82 real batches it is **2,459 tokens per harvest, and 78 off the worst case**. Worth having and nearly free; not a solution.
+
+**`batch_size` is the lever that works.** It is the caller's choice, not a property of the prompt:
+
+| batch_size | calls | p50 | max + system | fits 2048 |
+|---|---|---|---|---|
+| 10 | 82 | 1,286 | 2,141 | 77 of 82 |
+| 8 | 103 | 1,022 | 1,771 | **all** |
+| **5** | 164 | 667 | **1,297** | **all** |
+| 4 | 205 | 555 | 1,078 | **all** |
+
+At 5 every call fits with room to generate. The cost is the system prompt paid twice as often — about +18k tokens per harvest, ~15% — and twice the requests.
+
+**Truncating content further is a bad trade.** Content is 58–74% of a prompt, but `build_prompt` derives its date hints from the same 400-char slice it sends, so cutting the slice cuts the hints:
+
+| cap | saved | messages losing their pre-resolved date |
+|---|---|---|
+| 300 | ~9% | 45 of 817 (5.5%) |
+| 250 | ~15% | 54 of 817 (6.6%) |
+| 200 | ~23% | 66 of 817 (8.1%) |
+
+Those hints are why a small model can do this job at all. Do not spend them for 9%.
+
+**Unmeasured opportunity:** web message `content` repeats itself — the observed shape is `title … date: … time: … location: … link: … <title again>`. That duplication is built by the web source, not by `build_prompt`, and content is the largest share of every prompt.
+
 ## `recruiters` CLI (`cli/commands/recruiters.py`, `cli/parser.py:238-271`) — why it exists separately
 
 `recruiter_score.py` is **not** part of the classifier train/eval loop — it has no `.pkl`, no `train()`, and is a pure rule-based scorer plus an optional LLM refinement pass for borderline cases. It exists to solve a different problem than "is this an event": triaging Gmail recruiter spam (staffing-firm mass blasts vs. genuine, personalized outreach) so the operator doesn't have to read every recruiter email by hand.

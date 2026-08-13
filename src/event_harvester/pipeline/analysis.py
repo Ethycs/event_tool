@@ -56,6 +56,41 @@ _parse_llm_ini = parse_llm_ini
 PRIORITY_LABEL = {0: "none", 1: "low", 3: "medium", 5: "high"}
 
 
+_TRACKING_PARAMS = ("aff", "recId", "recSource", "searchQuery", "utm_source",
+                    "utm_medium", "utm_campaign", "DoneURL")
+
+
+def chat_label(platform: str, channel: str) -> str:
+    """A short, stable name for the group header a batch is organised under.
+
+    **A web source's `channel` is the event's full URL**, tracking parameters
+    and all — up to 120 characters, 39-64 tokens each. Measured 2026-08-13,
+    those headers were **26% of the worst-case prompt** (486 of 1,881 tokens),
+    with every URL repeated a second time inside the message body as
+    `link: https://…`. They also fragmented the batch into ten one-message
+    groups, so ten headers were paid for ten messages.
+
+    Compacting to host plus first path segment keeps what the header is *for*
+    — telling the model which listing this came from — and lets several events
+    from the same site share one group. The `source` the model emits is
+    `@author in #channel`, so the author handle survives untouched, which
+    matters: `outputs/regions.py` reads venue names out of it to place events
+    that carry no location.
+    """
+    name = str(channel or "")
+    if name.startswith(("http://", "https://")):
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(name)
+        host = parts.netloc.removeprefix("www.")
+        segment = next((s for s in parts.path.split("/") if s), "")
+        # A slug is the event's own title repeated; the first segment is the
+        # section ('e', 'events', 'calendar') or the group name, which is the
+        # part that identifies the source.
+        name = f"{host}/{segment}" if segment else host
+    return f"{str(platform).capitalize()} / {name}"
+
+
 def build_prompt(messages: list[dict], days_back: int) -> str:
     """Build the event extraction prompt from collected messages.
 
@@ -70,7 +105,7 @@ def build_prompt(messages: list[dict], days_back: int) -> str:
 
     grouped: dict[str, list[dict]] = {}
     for msg in messages:
-        key = f"{msg['platform'].capitalize()} / {msg['channel']}"
+        key = chat_label(msg["platform"], msg["channel"])
         grouped.setdefault(key, []).append(msg)
 
     lines = [
@@ -82,7 +117,9 @@ def build_prompt(messages: list[dict], days_back: int) -> str:
         "--- Messages ---\n",
     ]
     for chat, msgs in sorted(grouped.items()):
-        lines.append(f"### {chat}  ({len(msgs)} messages)")
+        # The count only earns its tokens when it is not one.
+        suffix = f"  ({len(msgs)} messages)" if len(msgs) > 1 else ""
+        lines.append(f"### {chat}{suffix}")
         for m in msgs[-60:]:
             ts = m["timestamp"][:16].replace("T", " ")
             content = m["content"][:400].replace("\n", " ")
