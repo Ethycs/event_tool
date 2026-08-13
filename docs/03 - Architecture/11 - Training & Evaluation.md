@@ -247,6 +247,26 @@ The 8 events it missed are mostly music and nightlife listings with several acts
 
 `unverified` — one run of 150 messages, and `temperature=0` is rejected by the gpt-5 family so the baseline is not reproducible to the event.
 
+### Adopted as the default · 2026-08-13
+
+`LLMConfig.model` is now `qwen3-8b`, served through the mesh proxy, with `codex_sdk/gpt-5.6-luna` behind it as `fallback_model`. `LLMConfig.batch_size` is **5**, which is load-bearing rather than cosmetic: the primary is served with a 2048-token context and batches of 10 overflow it.
+
+| Setting | Default | Why |
+|---|---|---|
+| `LLM_MODEL` | `qwen3-8b` | 90% of the baseline's events, none invented, better fill, half the latency |
+| `LLM_API_BASE` | — | any OpenAI-compatible endpoint; litellm proxy, Ollama, vLLM, LM Studio |
+| `LLM_API_KEY` | falls back to `OPENAI_API_KEY` | a proxy virtual key is not a provider key |
+| `LLM_VERIFY_SSL` | `true` | the mesh proxy is self-signed; only turn it off for an endpoint you control |
+| `LLM_FALLBACK_MODEL` | — | empty disables the fallback entirely |
+| `LLM_FALLBACK_API_KEY` | falls back to `LLM_ZT_KEY` | on the mesh, both sides usually need only the model name |
+| `LLM_BATCH_SIZE` | `5` | the primary's context window sets this |
+
+**The fallback is about availability, not quality.** The primary is one box on one network and can be down, out of context, or restarting; none of that should turn a harvest into zero events, which is exactly what an upstream outage did on 2026-08-12. Every fallback is logged at **ERROR** and counted (`llm.fallback`) — a fallback that silently papers over a dead primary is how you discover months later that nothing local has run and the bill is cloud. It cannot recurse: the secondary is constructed with `fallback_model=""`.
+
+`_routed_model` prefixes `openai/` when an `api_base` is set and no provider was named, because litellm otherwise reads the first path segment as a provider — `codex_sdk/gpt-5.6-luna` becomes "provider codex_sdk", and every call fails with a provider-list error that reads like a network fault.
+
+**One observed weakness, from a single verification call.** Given `Queer Night at The Stud, Friday 2026-08-21`, where `build_prompt` emitted the hint `dates=2026-08-14,2026-08-21` (the bare weekday *and* the explicit date), `qwen3-8b` chose **2026-08-14** and the fallback chose 2026-08-21 correctly. One example, not a measurement — but it is a concrete instance of the missing 10%, and it suggests the failure mode is *choosing among* hints rather than reading them. Worth a targeted eval before trusting dates unattended.
+
 ## `recruiters` CLI (`cli/commands/recruiters.py`, `cli/parser.py:238-271`) — why it exists separately
 
 `recruiter_score.py` is **not** part of the classifier train/eval loop — it has no `.pkl`, no `train()`, and is a pure rule-based scorer plus an optional LLM refinement pass for borderline cases. It exists to solve a different problem than "is this an event": triaging Gmail recruiter spam (staffing-firm mass blasts vs. genuine, personalized outreach) so the operator doesn't have to read every recruiter email by hand.

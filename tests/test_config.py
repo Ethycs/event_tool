@@ -20,7 +20,14 @@ class TestConfigLoading:
             cfg = load_config()
             assert cfg.telegram.api_id == 0
             assert cfg.telegram.session == "harvest_session"
-            assert cfg.llm.model == "gpt-4o-mini"
+            # Changed 2026-08-13. An 8B model on the mesh matched 90% of
+            # gpt-5.6-luna's events over identical batches, invented none, and
+            # filled every field better at half the latency.
+            assert cfg.llm.model == "qwen3-8b"
+            # 5, not 10: the default model is served with a 2048-token context
+            # and batches of 10 overflow it. See LLMConfig.batch_size.
+            assert cfg.llm.batch_size == 5
+            assert cfg.llm.verify_ssl is True
             assert cfg.days_back == 7
             assert cfg.telegram_channels == []
 

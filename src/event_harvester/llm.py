@@ -78,11 +78,70 @@ def chat_completion(
     if cfg.backend == "local":
         out = _complete_local(messages, cfg, max_tokens=max_tokens)
     else:
-        out = _complete_litellm(
-            messages, cfg, max_tokens=max_tokens, response_format=response_format
-        )
+        try:
+            out = _complete_litellm(
+                messages, cfg, max_tokens=max_tokens, response_format=response_format
+            )
+        except Exception as primary_error:
+            out = _complete_fallback(
+                messages, cfg, max_tokens=max_tokens,
+                response_format=response_format, primary_error=primary_error,
+            )
     set_span_attrs(**{"llm.response_chars": len(out), "llm.response_empty": not out})
     return out
+
+
+def _complete_fallback(
+    messages: list[dict[str, str]],
+    cfg: LLMConfig,
+    *,
+    max_tokens: int,
+    response_format: dict[str, str] | None,
+    primary_error: Exception,
+) -> str:
+    """Retry one call against the fallback model, or re-raise.
+
+    **Why a fallback at all.** The default model is an 8B served from one box
+    on one network. It is cheap, fast and private, and it can also be down,
+    out of context, or mid-restart — none of which should turn a harvest into
+    zero events. On 2026-08-12 an upstream outage did exactly that and the
+    empty result overwrote a cache holding 251 events.
+
+    The failure is logged at ERROR either way. A fallback that silently papers
+    over a dead primary is how you discover months later that nothing has been
+    running locally and the bill is from the cloud.
+    """
+    if not cfg.fallback_model:
+        raise primary_error
+
+    logger.error(
+        "LLM primary %r failed (%s: %s) — falling back to %r",
+        cfg.model, type(primary_error).__name__,
+        str(primary_error)[:200], cfg.fallback_model,
+    )
+    count("llm.fallback", model=cfg.model, to=cfg.fallback_model,
+          reason=type(primary_error).__name__,
+          description="Calls that fell back to the secondary model")
+    set_span_attrs(**{
+        "llm.fallback.used": True,
+        "llm.fallback.model": cfg.fallback_model,
+        "llm.fallback.reason": type(primary_error).__name__,
+    })
+
+    from dataclasses import replace
+
+    secondary = replace(
+        cfg,
+        model=cfg.fallback_model,
+        api_key=cfg.fallback_api_key or cfg.api_key,
+        api_base=cfg.fallback_api_base,
+        # The fallback is the escape hatch; it must not be disabled by its own
+        # absence of a fallback.
+        fallback_model="",
+    )
+    return _complete_litellm(
+        messages, secondary, max_tokens=max_tokens, response_format=response_format
+    )
 
 
 def _suppress_litellm_noise():
@@ -93,6 +152,32 @@ def _suppress_litellm_noise():
 
 
 _litellm_init = False
+
+# Providers litellm routes by prefix. Anything else in front of a `/` on an
+# OpenAI-compatible endpoint is part of the *model name*, not a provider.
+_KNOWN_PROVIDERS = (
+    "openai/", "anthropic/", "azure/", "ollama/", "vertex_ai/", "bedrock/",
+    "gemini/", "groq/", "together_ai/", "hosted_vllm/", "mistral/", "cohere/",
+)
+
+
+def _routed_model(cfg: LLMConfig) -> str:
+    """The model string litellm needs to reach `cfg.api_base`.
+
+    Everything behind a litellm proxy is reached through the OpenAI-compatible
+    handler, whatever runs underneath. Without the `openai/` prefix litellm
+    reads the first path segment as a provider — so `codex_sdk/gpt-5.6-luna`
+    becomes "provider codex_sdk", which does not exist, and every call fails
+    with a provider-list error that reads like a network fault. Found the hard
+    way on 2026-08-13; the eval harness carries the same rule.
+
+    With no `api_base` the model string is the provider's own and is left
+    alone.
+    """
+    model = cfg.litellm_model
+    if not cfg.api_base or model.startswith(_KNOWN_PROVIDERS):
+        return model
+    return f"openai/{model}"
 
 
 @traced("llm.litellm.completion", tracer_name=_TRACER)
@@ -108,14 +193,25 @@ def _complete_litellm(
         _suppress_litellm_noise()
         _litellm_init = True
 
+    import litellm
     from litellm import completion
 
-    model = cfg.litellm_model
+    # The mesh proxy serves a self-signed certificate. Process-wide because
+    # that is the only knob litellm exposes; set from config so it is a
+    # deployment decision rather than a default.
+    if cfg.api_base and not cfg.verify_ssl:
+        litellm.ssl_verify = False
+
+    model = _routed_model(cfg)
     kwargs: dict[str, Any] = {
         "model": model,
         "messages": messages,
         "max_tokens": max_tokens,
     }
+    if cfg.api_base:
+        kwargs["api_base"] = cfg.api_base
+    if cfg.api_key:
+        kwargs["api_key"] = cfg.api_key
     if response_format:
         kwargs["response_format"] = response_format
 

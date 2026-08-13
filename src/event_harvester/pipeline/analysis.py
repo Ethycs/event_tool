@@ -445,14 +445,20 @@ def extract_events_llm(
     # Only the backend that actually runs contributes LLM-stage rejects. The
     # orchestrator used to read them off `_extract_events_cloud` regardless of
     # which backend ran, so local runs reported stale or empty buckets.
+    # Batch size comes from config, not the function default: it is a property
+    # of the model being served, not of the extractor. The default model's
+    # context window is what sets it — see `LLMConfig.batch_size`.
+    batch_size = getattr(cfg, "batch_size", 5) or 5
     if cfg.backend == "local":
-        summary, events, llm_rejects = _extract_events_local(filtered, days_back, cfg)
+        summary, events, llm_rejects = _extract_events_local(
+            filtered, days_back, cfg, batch_size=batch_size)
     else:
         logger.info(
-            "Sending %d messages to %s (backend=%s) ...",
-            len(filtered), cfg.display_name, cfg.backend,
+            "Sending %d messages to %s (backend=%s) in batches of %d ...",
+            len(filtered), cfg.display_name, cfg.backend, batch_size,
         )
-        summary, events, llm_rejects = _extract_events_cloud(filtered, days_back, cfg)
+        summary, events, llm_rejects = _extract_events_cloud(
+            filtered, days_back, cfg, batch_size=batch_size)
 
     rejects.update(llm_rejects)
     return ExtractionResult(summary, events, rejects)
@@ -460,7 +466,7 @@ def extract_events_llm(
 
 def _extract_events_cloud(
     messages: list[dict], days_back: int, cfg: LLMConfig,
-    batch_size: int = 10,
+    batch_size: int = 5,
 ) -> tuple[str, list[dict], dict[str, list[dict]]]:
     """Extract events using parallel batched requests (cloud APIs handle concurrency).
 
@@ -627,7 +633,7 @@ _PRIO_MAP = {"HIGH": 5, "MED": 3, "MEDIUM": 3, "LOW": 1}
 
 def _extract_events_local(
     messages: list[dict], days_back: int, cfg: LLMConfig,
-    batch_size: int = 10,
+    batch_size: int = 5,
 ) -> tuple[str, list[dict], dict[str, list[dict]]]:
     """Extract tasks using simple numbered list format (local models).
 

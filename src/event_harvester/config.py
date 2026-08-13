@@ -1,6 +1,7 @@
 """Centralized configuration with validation."""
 
 import json
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,9 +30,36 @@ class TelegramConfig:
 
 @dataclass
 class LLMConfig:
-    model: str = "gpt-4o-mini"
+    # Default since 2026-08-13: an 8B model on the mesh, measured at 90% of
+    # `gpt-5.6-luna`'s events over identical batches, inventing none and
+    # filling every field better, at half the latency. See
+    # `03 - Architecture/11 - Training & Evaluation.md`.
+    model: str = "qwen3-8b"
     api_key: str = ""
     backend: str = "litellm"  # "litellm" or "local"
+
+    # Where the primary model is served. Empty means the provider's own
+    # endpoint, which is what a bare `gpt-4o-mini` wants.
+    api_base: str = ""
+    # The mesh proxy serves a self-signed certificate. Off by default; only a
+    # deployment that knows its endpoint should turn verification off.
+    verify_ssl: bool = True
+
+    # **The fallback exists because the primary is one box on one network.**
+    # A local model is cheap and fast and cannot page anyone at 3am; when it is
+    # unreachable, out of context, or refusing, the harvest should degrade to a
+    # cloud model rather than produce zero events. Empty disables it.
+    fallback_model: str = ""
+    fallback_api_key: str = ""
+    fallback_api_base: str = ""
+
+    # Messages per extraction call. **5, not 10, and that is load-bearing for
+    # the default model**: qwen3-8b is served with a 2048-token context, and at
+    # 10 the largest batches overflow it — 6 of 15 were refused outright, and
+    # those held 51 of 78 events. At 5 every call fits (1,297 tokens worst
+    # case) and the baseline's own yield is unchanged (78 -> 80 events on
+    # identical input), so this costs nothing but request count.
+    batch_size: int = 5
 
     # Local backend settings (used when backend="local")
     model_path: str = ""  # path to .onnx model
@@ -304,6 +332,39 @@ def _parse_csv_env(key: str) -> list[str]:
     return [s.strip() for s in raw.split(",") if s.strip()]
 
 
+logger = logging.getLogger("event_harvester.config")
+
+
+def _env_flag(key: str, *, default: bool = False) -> bool:
+    """A boolean from the environment, with an explicit default.
+
+    Unset means the default — which matters for `LLM_VERIFY_SSL`, where the
+    safe value is on and the existing `in ("1","true","yes")` idiom would
+    silently make it off.
+    """
+    raw = os.getenv(key)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(key: str, default: int, *, minimum: int, maximum: int) -> int:
+    """A bounded integer. A junk or out-of-range value is the default, logged."""
+    raw = os.getenv(key, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("%s=%r is not a number; using %d", key, raw, default)
+        return default
+    if not minimum <= value <= maximum:
+        logger.warning("%s=%d is outside %d-%d; using %d",
+                       key, value, minimum, maximum, default)
+        return default
+    return value
+
+
 def load_config() -> AppConfig:
     """Load configuration from environment variables."""
     api_id_raw = os.getenv("TELEGRAM_API_ID", "0")
@@ -368,9 +429,20 @@ def load_config() -> AppConfig:
             db_path=os.getenv("SIGNAL_DB_PATH"),
         ),
         llm=LLMConfig(
-            model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
-            api_key=llm_api_key,
+            model=os.getenv("LLM_MODEL", "qwen3-8b"),
+            # The primary is served by the proxy, which has its own virtual
+            # key — not the provider key `llm_api_key` holds. Falls back to it
+            # so a plain `LLM_MODEL=gpt-4o-mini` setup still works unchanged.
+            api_key=os.getenv("LLM_API_KEY") or llm_api_key,
             backend=os.getenv("LLM_BACKEND", "litellm"),
+            api_base=os.getenv("LLM_API_BASE", ""),
+            verify_ssl=_env_flag("LLM_VERIFY_SSL", default=True),
+            fallback_model=os.getenv("LLM_FALLBACK_MODEL", ""),
+            fallback_api_key=os.getenv("LLM_FALLBACK_API_KEY") or os.getenv(
+                "LLM_ZT_KEY", ""),
+            fallback_api_base=os.getenv("LLM_FALLBACK_API_BASE", "")
+            or os.getenv("LLM_API_BASE", ""),
+            batch_size=_env_int("LLM_BATCH_SIZE", 5, minimum=1, maximum=50),
             model_path=os.getenv("LLM_MODEL_PATH", ""),
             tokenizer_path=os.getenv("LLM_TOKENIZER_PATH", ""),
             device=os.getenv("LLM_DEVICE", "npu"),

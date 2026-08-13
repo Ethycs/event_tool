@@ -14,6 +14,11 @@ ENV/
 
 # Environment / secrets
 .env
+# `.env` alone does not cover a backup, and a backup of .env is still .env.
+# Added 2026-08-13 after `.env.bak-20260813` showed up as untracked-but-not-
+# ignored, one `git add -A` away from being published.
+.env.*
+!.env.example
 *.session
 credentials.json
 token.json
