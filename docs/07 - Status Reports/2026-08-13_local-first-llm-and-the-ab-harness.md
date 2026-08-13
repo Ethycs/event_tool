@@ -1,6 +1,6 @@
 # Session Report — a local model by default, and the harness that proved it
 
-**Date**: 2026-08-13 · **Status**: ✅ LANDED · ⚠️ **the event cache is empty and the OpenAI account has no credit**
+**Date**: 2026-08-13 · **Status**: ✅ LANDED · **the cache is refilled — 244 events, all local** · ⚠️ the OpenAI account has no credit
 **Scope**: `/calendar` + nav + profile editor · sub-path proxy · mobile pass · the outage that erased 251 events · the extraction A/B harness · **qwen3-8b as the default model**
 **Tests**: 1495 passed, 0 failed (1314 at session start) · **Lint**: 43, unchanged all session
 **Follows**: [2026-08-12_the-calendar-and-the-page-nobody-could-find.md](2026-08-12_the-calendar-and-the-page-nobody-could-find.md)
@@ -21,6 +21,26 @@ Measured over 150 identical messages, batched identically:
 | latency p50 | 14.2s | **7.0s** |
 
 It finds nine events in ten, invents none, fills every field *better*, and runs at half the latency on hardware you own.
+
+### 1a. And then it did it for real
+
+Job `…dcf5` finished at 19:30:43 UTC, **24m 19s**, on the full mailbox:
+
+| | |
+|---|---|
+| events | **244**, against the 251 the cloud model produced on 2026-08-12 — **97%** |
+| `llm_errors` / `llm_past` | **0** / 30 |
+| fallbacks to `codex_sdk/gpt-5.6-luna` | **0** — every one of the 161 calls was `model= qwen3-8b` |
+| date / time / location / link filled | **100 / 93 / 89 / 73%**; no event dated in the past |
+| throughput | 161 serialised calls at ~9.0 s each ≈ 24 min |
+
+So the 90% recall figure understated it, and the A/B harness was measuring the
+right thing. **This is the number that matters**: not a 150-message sample
+against a baseline, but the production cache, refilled by a 5 GB model on the
+mesh, with the cloud fallback never once touched.
+
+The 24-minute wall clock is also the evidence for §5b — it fits inside 30
+minutes only because the message cache was warm. It would not have on a cold one.
 
 ---
 
@@ -153,8 +173,8 @@ And two secret-handling slips, both fixed:
 | Lint | 43, unchanged all session |
 | Git | `origin/main` is at `343797e`; **`108ba59` (the timeout fix) is unpushed**. Tree clean |
 | Services | both restarted onto current code, 2026-08-13 ~19:06 UTC |
-| **Harvest** | **job `…dcf5` was RUNNING at handoff** — extract stage, **0 fallbacks**. Check this first |
-| Event cache | **0 events** until that job lands (§5, §5b) |
+| **Harvest** | job `…dcf5` **done** at 19:30:43 UTC — 244 events, 0 fallbacks, 24m 19s (§1a) |
+| Event cache | **244 events**, `data/.mcp_events.json`, all extracted by `qwen3-8b` |
 | Message cache | warm — the failed run repopulated it, so the re-run skips the scrape |
 | Not mine | the 8 `.dvc` paths, still untracked and uncommitted |
 | Secrets | `.env` has a new appended block; backup at `.env.bak-20260813`, now gitignored |
@@ -163,14 +183,26 @@ And two secret-handling slips, both fixed:
 
 ## 8. Open, in priority order
 
-0. **Check `pixi run event-harvester jobs list` before anything else.** Job `…dcf5` was mid-extract at handoff. If it is `done`, compare its event count against **251** — that is the real-world test of the 90% recall figure, and with zero fallbacks it is genuinely `qwen3-8b`'s work rather than a cloud harvest wearing its name. If it failed, **read `result.error` before blaming the model**: the last failure was a wall clock, not an extraction fault, and the count alone would not have told you.
-1. **Parallel slots on the llama.cpp server** — the single biggest win available. ~27 minutes of extraction becomes ~7, and `batch_size=5` stops being a constraint. Mind the `-c` / `--parallel` interaction in §5b.
-2. **A date-selection weakness in `qwen3-8b`, unquantified.** Given `Friday 2026-08-21` where `build_prompt` emitted `dates=2026-08-14,2026-08-21`, it chose **the 14th**; the fallback chose correctly. One example, not a measurement — but a wrong date still fingerprint-matches, so **the 90% recall figure would not show this**. Worth a targeted date-accuracy eval before trusting it unattended.
-3. **`n_ctx=8192` on the qwen3-8b deployment** — would allow `batch_size=10` again and covers the generation budget. Pairs with the slot change above.
-4. ~~`phi-4-14b` / `phi-3.5-mini` untested~~ — **resolved as not-a-bug**: the backend runs one model. Nothing to chase.
-5. **The OpenAI account has no credit** — `gpt-4o*` on the proxy fail with an upstream auth error. `claude_code/*` and `codex_sdk/*` work.
-6. **`sources/venue_location.py` is still unwired** — unchanged for two sessions.
-7. **`pixi run check-head` has side effects** — it printed source banners, attempted a web harvest and collided with the running service's Chromium profile. A checker that answers "does a bare checkout import?" should not open a browser.
+0. ~~Check job `…dcf5`~~ — **done: 244 events, 0 fallbacks, 24m 19s. See §1a.** The
+   count is 97% of the cloud model's 251 and the cache is refilled.
+1. **`llm_no_events` came back 0, and that cannot be right.** 775 messages
+   reached the model in 161 batches and produced 244 events, so ~530 messages
+   were read and yielded nothing — yet none were filed. The cause is
+   `analysis.py:513`: a batch is filed under `llm_no_events` only when it
+   produces **zero** events, so at `batch_size=5` a batch yielding one event
+   leaves its other four unattributed. That was invisible at `batch_size=10`
+   for the same reason it is visible now — smaller batches are less often
+   wholly empty. **This is an axiom-3 hole, not an outage**: the messages are
+   dropped correctly, they are just not counted anywhere, and the rejects no
+   longer sum to the total. Fix by attributing per message (the events carry
+   `_source_ids`), not per batch.
+2. **Parallel slots on the llama.cpp server** — the single biggest win available. ~27 minutes of extraction becomes ~7, and `batch_size=5` stops being a constraint. Mind the `-c` / `--parallel` interaction in §5b.
+3. **A date-selection weakness in `qwen3-8b`, unquantified.** Given `Friday 2026-08-21` where `build_prompt` emitted `dates=2026-08-14,2026-08-21`, it chose **the 14th**; the fallback chose correctly. One example, not a measurement — but a wrong date still fingerprint-matches, so **neither the 90% recall figure nor the 244 would show this**. The live cache is at least not obviously wrong: 244 of 244 carry a date, none in the past, and the tail decays plausibly to 2027-05. Still worth a targeted date-accuracy eval before trusting it unattended.
+4. **`n_ctx=8192` on the qwen3-8b deployment** — would allow `batch_size=10` again and covers the generation budget. Pairs with the slot change above.
+5. ~~`phi-4-14b` / `phi-3.5-mini` untested~~ — **resolved as not-a-bug**: the backend runs one model. Nothing to chase.
+6. **The OpenAI account has no credit** — `gpt-4o*` on the proxy fail with an upstream auth error. `claude_code/*` and `codex_sdk/*` work.
+7. **`sources/venue_location.py` is still unwired** — unchanged for two sessions.
+8. **`pixi run check-head` has side effects** — it printed source banners, attempted a web harvest and collided with the running service's Chromium profile. A checker that answers "does a bare checkout import?" should not open a browser.
 
 ## Verification
 
