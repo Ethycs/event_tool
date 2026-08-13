@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
@@ -35,11 +36,26 @@ tracer = get_tracer("event_harvester.job_runner")
 #: minutes, so a couple of seconds of latency on pickup is free.
 POLL_SECONDS = 2.0
 
-#: Wall-clock ceiling per job. A full harvest measured 320 s on 2026-07-31;
-#: 30 minutes is generous without being infinite. The precedent is
+#: Wall-clock ceiling per job. The precedent is
 #: `interlock.DEFAULT_IO_TIMEOUT_S`, chosen to turn "hangs forever" into
 #: "fails after a bounded wait".
-JOB_TIMEOUT_SECONDS = 30 * 60
+#:
+#: **Raised from 30 minutes to 90 on 2026-08-13, after it killed a healthy
+#: run 13 batches from the finish.** The old value was set against a harvest
+#: measured at 320 s on 2026-07-31, and every term in that measurement has
+#: since changed:
+#:
+#: * the message cache can be cold, so the run re-scrapes 33 web sources
+#:   with browsers before extraction starts;
+#: * `batch_size` went 10 → 5 for the local model's context window, which
+#:   doubled the call count to 161;
+#: * extraction moved to a **local** model that answers in ~10 s and, on a
+#:   single-slot server, serialises — so 161 calls is ~27 minutes on its own.
+#:
+#: Harvest plus extract came to ~32 minutes and was cut off at 30. The lesson
+#: is that this constant is a function of the deployment, not of the code, so
+#: it is now overridable without an edit.
+JOB_TIMEOUT_SECONDS = float(os.getenv("EH_JOB_TIMEOUT_SECONDS", 90 * 60))
 
 #: A dead credential would otherwise produce a failed job every night for
 #: ever. After this many consecutive failures the runner stops taking
