@@ -24,6 +24,25 @@ from event_harvester.training.eval_extraction import (
 )
 
 
+@pytest.fixture(autouse=True)
+def no_ambient_keys(monkeypatch):
+    """Clear **every** key `resolve_key` consults, for two reasons.
+
+    A test that finds a real key stops testing the no-key path — and worse,
+    `test_absent_is_none` then failed with the live proxy key embedded in the
+    assertion message, printing a working credential into the test log. The
+    same fallback also let `test_an_endpoint_without_a_key_is_refused` sail
+    past the guard and make **real API calls** from a unit test.
+
+    Autouse and unconditional: a credential must never be reachable from here
+    by accident.
+    """
+    from event_harvester.training.eval_extraction import KEY_VARS
+
+    for name in KEY_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
 def _cache(tmp_path, n=40):
     """A message cache in the shape `pipeline/harvest.py` writes."""
     messages = [{
@@ -53,19 +72,23 @@ class TestTheSampleIsIdentical:
         assert len(sample) == 3
         assert all(len(b) == 10 for b in sample)
 
-    def test_it_takes_the_head_of_the_scored_queue(self, tmp_path):
-        """`prioritize_with_caps` sends the highest-scoring messages, so an
-        eval over a random draw would measure a different distribution than
-        the one production actually sends."""
-        from event_harvester.pipeline.analysis import score_message
+    def test_it_spans_the_pool_rather_than_taking_its_head(self, tmp_path):
+        """The head of the queue is the easy end — structured listings that
+        already carry a date, a time and a link. A 3-batch run over it scored
+        100% on every field for both models, which answers a question nobody
+        asked. The sample is spaced across the whole pool instead."""
+        path = _cache(tmp_path, n=100)
+        sample = load_sample(2, 10, path, pool=100)
+        taken = [int(m["id"]) for b in sample for m in b]
+        assert len(taken) == 20
+        assert len(set(taken)) == 20, "the stride must not repeat a message"
+        # Spread, not clustered at the front: with a pool of 100 and 20 wanted,
+        # the last pick comes from deep in the pool.
+        assert max(taken) - min(taken) > 50
 
-        path = _cache(tmp_path, n=60)
-        sample = load_sample(2, 10, path)
-        taken = [m for b in sample for m in b]
-        all_msgs = json.loads(path.read_text(encoding="utf-8"))["messages"]
-        cutoff = min(score_message(m) for m in taken)
-        assert all(score_message(m) <= cutoff
-                   for m in all_msgs if m["id"] not in {t["id"] for t in taken})
+    def test_a_small_pool_falls_back_to_taking_everything(self, tmp_path):
+        sample = load_sample(2, 10, _cache(tmp_path, n=20), pool=20)
+        assert sum(len(b) for b in sample) == 20
 
     def test_an_empty_cache_says_so_rather_than_scraping(self, tmp_path):
         path = tmp_path / "empty.json"
@@ -169,6 +192,12 @@ class TestAgreement:
 
 
 class TestKeys:
+    """Assertions here compare booleans, never the value.
+
+    A failing `assert resolve_key(None) is None` puts whatever it found into
+    the failure message — which is how a live proxy key ended up in a test log.
+    """
+
     def test_the_flag_wins(self, monkeypatch):
         monkeypatch.setenv("EH_EVAL_API_KEY", "from-env")
         assert resolve_key("from-flag") == "from-flag"
@@ -177,9 +206,19 @@ class TestKeys:
         monkeypatch.setenv("EH_EVAL_API_KEY", "from-env")
         assert resolve_key(None) == "from-env"
 
-    def test_absent_is_none_not_empty_string(self, monkeypatch):
-        monkeypatch.delenv("EH_EVAL_API_KEY", raising=False)
-        assert resolve_key(None) is None
+    def test_the_proxy_key_is_a_recognised_fallback(self, monkeypatch):
+        """`LLM_ZT_KEY` lives in .env for the mesh proxy, so the CLI finds it
+        without the operator re-exporting it."""
+        monkeypatch.setenv("LLM_ZT_KEY", "from-dotenv")
+        assert resolve_key(None) == "from-dotenv"
+
+    def test_the_earlier_variable_wins(self, monkeypatch):
+        monkeypatch.setenv("EH_EVAL_API_KEY", "explicit")
+        monkeypatch.setenv("LLM_ZT_KEY", "fallback")
+        assert resolve_key(None) == "explicit"
+
+    def test_absent_is_none_not_empty_string(self):
+        assert (resolve_key(None) is None) is True
 
 
 class TestCommandWiring:
@@ -199,13 +238,22 @@ class TestCommandWiring:
         assert args.baseline == "a/b" and args.batches == 5
 
     def test_an_endpoint_without_a_key_is_refused_before_spending(self, monkeypatch):
-        """A 401 mid-run reads like a broken eval rather than a missing flag."""
+        """A 401 mid-run reads like a broken eval rather than a missing flag.
+
+        The `no_ambient_keys` fixture is load-bearing here: before it existed
+        this test found the real proxy key, skipped the guard, and made live
+        API calls.
+        """
         import asyncio
 
         from event_harvester.cli.commands.eval_extraction import eval_extraction_cmd
         from event_harvester.cli.parser import build_parser
 
-        monkeypatch.delenv("EH_EVAL_API_KEY", raising=False)
+        # Belt and braces — a network call from a unit test is never acceptable.
+        monkeypatch.setattr(
+            "event_harvester.training.eval_extraction._call",
+            lambda *a, **k: pytest.fail("the guard let a real call through"),
+        )
         args = build_parser().parse_args([
             "eval-extraction", "--baseline", "a/b", "--candidate", "c/d",
             "--api-base", "https://h:4000/v1",

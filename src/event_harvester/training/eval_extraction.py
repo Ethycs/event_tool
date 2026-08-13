@@ -110,14 +110,31 @@ class ModelResult:
         }
 
 
+# How many messages a real harvest sends to the LLM: 817 of 20,716 on
+# 2026-08-12, after the classifier and reranker. The eval samples across this
+# whole pool, not its head.
+DEFAULT_POOL = 817
+
+
 def load_sample(batches: int, batch_size: int = 10,
-                cache_path: str | Path | None = None) -> list[list[dict]]:
+                cache_path: str | Path | None = None,
+                pool: int = DEFAULT_POOL) -> list[list[dict]]:
     """The same messages the pipeline would have sent, in the same batches.
 
-    Taken from the shared message cache and ordered by `score_message`, which
-    is the ordering `prioritize_with_caps` uses — so this is the head of the
-    real queue rather than a random draw. Deterministic by construction: no
-    sampling, no shuffle.
+    Ordered by `score_message` — the ordering `prioritize_with_caps` uses — to
+    get the ~817 that actually reach the LLM, then **evenly spaced across that
+    pool** rather than taken from the front.
+
+    That stride matters more than it looks. A 3-batch run over the *head* of
+    the queue scored 100% on every field for both models, because the
+    highest-scoring messages are structured event listings that carry a date, a
+    time and a link already — the easy end. Measuring there answers "can a weak
+    model copy a well-formed listing", which was never the question. Spacing
+    the sample makes a 20-batch run span the same difficulty range as the full
+    82-batch harvest.
+
+    Deterministic by construction: no randomness, so every model sees exactly
+    the same messages in the same order.
     """
     from event_harvester.utils import data_path
 
@@ -137,8 +154,50 @@ def load_sample(batches: int, batch_size: int = 10,
             f"no usable messages in {path}. Run a harvest first — the cache has "
             "a 4h TTL and this eval deliberately does not scrape.",
         )
-    ranked = sorted(usable, key=score_message, reverse=True)[:batches * batch_size]
+    ranked = sorted(usable, key=score_message, reverse=True)[:pool]
+    wanted = batches * batch_size
+    if wanted < len(ranked):
+        stride = len(ranked) / wanted
+        ranked = [ranked[int(i * stride)] for i in range(wanted)]
+    else:
+        ranked = ranked[:wanted]
     return [ranked[i:i + batch_size] for i in range(0, len(ranked), batch_size)]
+
+
+def _is_gpt5(model: str) -> bool:
+    """gpt-5 and gpt-5-codex reject `temperature=0`; only 1 is accepted."""
+    return "gpt-5" in model
+
+
+def _routed(model: str, api_base: str | None) -> str:
+    """Prefix `openai/` when talking to an OpenAI-compatible endpoint.
+
+    Everything served by a litellm proxy is reached through the OpenAI-
+    compatible handler, whatever it is underneath. Without the prefix, litellm
+    reads the first path segment of a proxy model name as a *provider* — so
+    `codex_sdk/gpt-5.6-luna` becomes "provider codex_sdk", which does not
+    exist, and every call fails with a provider-list error that looks like a
+    network problem. An explicit prefix is left alone.
+    """
+    if not api_base or "/" in model.split("/")[0]:
+        return model
+    known = ("openai/", "anthropic/", "azure/", "ollama/", "vertex_ai/",
+             "bedrock/", "gemini/", "groq/", "together_ai/", "hosted_vllm/")
+    return model if model.startswith(known) else f"openai/{model}"
+
+
+def allow_self_signed() -> None:
+    """Stop verifying TLS for this process.
+
+    Needed for the litellm proxy on the ZeroTier/LAN host, which serves a
+    self-signed certificate. Opt-in through `--insecure` and never the default:
+    the mesh authenticates its peers, but "we trust the network" should be a
+    sentence someone typed, not an assumption compiled in.
+    """
+    import litellm
+
+    litellm.ssl_verify = False
+    logger.warning("TLS verification disabled for this run (--insecure)")
 
 
 def _call(model: str, prompt: str, *, api_base: str | None, api_key: str | None,
@@ -147,18 +206,23 @@ def _call(model: str, prompt: str, *, api_base: str | None, api_key: str | None,
     from litellm import completion
 
     kwargs: dict[str, Any] = {
-        "model": model,
+        "model": _routed(model, api_base),
         "messages": [
             {"role": "system", "content": _EVENT_EXTRACTION_PROMPT},
             {"role": "user", "content": prompt},
         ],
         "max_tokens": max_tokens,
-        # Determinism where the provider honours it: this is a measurement, and
-        # a sampled difference between runs would be indistinguishable from a
-        # difference between models.
-        "temperature": 0,
         "timeout": timeout,
     }
+    # Determinism where the provider allows it: this is a measurement, and a
+    # sampled difference between runs would be indistinguishable from a
+    # difference between models. **The gpt-5 family rejects it outright** —
+    # "don't support temperature=0, only temperature=1" — so those models are
+    # compared at their default sampling, and a rerun of one may differ
+    # slightly. Sending it anyway fails the whole run with
+    # `UnsupportedParamsError`, which is how this was found.
+    if not _is_gpt5(model):
+        kwargs["temperature"] = 0
     if api_base:
         kwargs["api_base"] = api_base
     if api_key:
@@ -244,81 +308,109 @@ def _pct(x: float | None) -> str:
     return "  —  " if x is None else f"{100 * x:5.1f}%"
 
 
-def _report(a: ModelResult, b: ModelResult, agree: dict[str, Any]) -> None:
-    print(f"\n{BOLD}Extraction A/B{RESET}   {a.batches} identical batches\n")
-    rows = [
-        ("events extracted", str(len(a.events)), str(len(b.events))),
-        ("events per batch", f"{len(a.events)/max(1,a.batches):.1f}",
-         f"{len(b.events)/max(1,b.batches):.1f}"),
-        ("batches that parsed", f"{a.batches - a.parse_failures}/{a.batches}",
-         f"{b.batches - b.parse_failures}/{b.batches}"),
-        ("call errors", str(a.call_errors), str(b.call_errors)),
-    ]
-    for field_name in FIELDS:
-        rows.append((f"{field_name} filled",
-                     _pct(a.fill_rates[field_name]), _pct(b.fill_rates[field_name])))
-    la, lb = sorted(a.latencies), sorted(b.latencies)
-    rows.append(("latency p50",
-                 f"{la[len(la)//2]:.1f}s" if la else "—",
-                 f"{lb[len(lb)//2]:.1f}s" if lb else "—"))
-    rows.append(("wall clock", f"{sum(a.latencies):.0f}s", f"{sum(b.latencies):.0f}s"))
+def _cell(result: ModelResult, key: str) -> str:
+    lat = sorted(result.latencies)
+    n = max(1, result.batches)
+    # Parsed is out of the calls that *answered*. Reporting it against every
+    # attempted batch printed "3/3 parsed" for a run where all three calls
+    # errored — the one number you would read to decide the run was sound.
+    answered = result.batches - result.call_errors
+    return {
+        "events extracted": str(len(result.events)),
+        "events per batch": f"{len(result.events)/n:.1f}",
+        "batches that parsed": f"{answered - result.parse_failures}/{answered}",
+        "call errors": str(result.call_errors),
+        "latency p50": f"{lat[len(lat)//2]:.1f}s" if lat else "—",
+        "wall clock": f"{sum(result.latencies):.0f}s",
+    }.get(key) or _pct(result.fill_rates.get(key.split()[0], 0.0))
 
-    width = max(len(r[0]) for r in rows)
-    print(f"  {'':<{width}}   {BOLD}{a.model[:26]:>26}{RESET}   "
-          f"{BOLD}{b.model[:26]:>26}{RESET}")
-    for label, left, right in rows:
-        print(f"  {label:<{width}}   {left:>26}   {right:>26}")
 
-    colour = GREEN if (agree.get("recall") or 0) >= 0.8 else YELLOW
-    print(f"\n  {BOLD}Agreement{RESET} — of the baseline's {agree['baseline_events']} "
-          f"event(s), the candidate found "
-          f"{colour}{agree['matched']} ({_pct(agree['recall']).strip()}){RESET}")
-    print(f"  {DIM}candidate also produced {agree['candidate_only']} event(s) the "
-          f"baseline did not — check these by hand, they are either finds or "
-          f"inventions{RESET}")
-    if agree["missed_titles"]:
-        print(f"\n  {DIM}missed by the candidate:{RESET}")
-        for title in agree["missed_titles"]:
-            print(f"    {DIM}- {title[:70]}{RESET}")
+def _report(baseline: ModelResult, candidates: list[ModelResult],
+            agreements: list[dict[str, Any]]) -> None:
+    everyone = [baseline, *candidates]
+    print(f"\n{BOLD}Extraction A/B{RESET}   {baseline.batches} identical batches\n")
 
-    for result in (a, b):
+    keys = ["events extracted", "events per batch", "batches that parsed",
+            "call errors", *[f"{f} filled" for f in FIELDS],
+            "latency p50", "wall clock"]
+    width = max(len(k) for k in keys)
+    col = 24
+    header = "".join(f"{m.model[-col:]:>{col + 2}}" for m in everyone)
+    print(f"  {'':<{width}}{BOLD}{header}{RESET}")
+    print(f"  {'':<{width}}{DIM}{'      (baseline)':>{col + 2}}{RESET}")
+    for key in keys:
+        row = "".join(f"{_cell(m, key):>{col + 2}}" for m in everyone)
+        print(f"  {key:<{width}}{row}")
+
+    print(f"\n  {BOLD}Agreement with the baseline{RESET} "
+          f"({agreements[0]['baseline_events'] if agreements else 0} event(s) to match)")
+    for result, agree in zip(candidates, agreements):
+        recall = agree.get("recall") or 0
+        colour = GREEN if recall >= 0.8 else YELLOW
+        print(f"    {result.model[-col:]:>{col}}   "
+              f"{colour}{agree['matched']:>3} matched  {_pct(agree['recall'])}{RESET}"
+              f"   {DIM}+{agree['candidate_only']} not in the baseline{RESET}")
+
+    for result, agree in zip(candidates, agreements):
+        if agree["missed_titles"]:
+            print(f"\n  {DIM}{result.model} missed:{RESET}")
+            for title in agree["missed_titles"][:6]:
+                print(f"    {DIM}- {title[:70]}{RESET}")
+
+    for result in everyone:
         if result.raw_samples:
-            print(f"\n  {YELLOW}{result.model} produced {result.parse_failures} "
+            print(f"\n  {YELLOW}{result.model}: {result.parse_failures} "
                   f"unparseable batch(es). First:{RESET}")
             print(f"  {DIM}{result.raw_samples[0][:300]}{RESET}")
 
 
 @traced("training.eval_extraction", tracer_name=_TRACER)
-def run_ab(baseline: str, candidate: str, *, batches: int = 20,
+def run_ab(baseline: str, candidates: str | list[str], *, batches: int = 20,
            batch_size: int = 10, days_back: int = 7,
            api_base: str | None = None, api_key: str | None = None,
            candidate_api_base: str | None = None,
-           candidate_api_key: str | None = None,
+           candidate_api_key: str | None = None, insecure: bool = False,
            save: str | None = None, cache_path: str | None = None) -> dict[str, Any]:
-    """Run both models over one sample and print the comparison."""
+    """Run every model over one sample and print the comparison.
+
+    One baseline, any number of candidates — the baseline is the expensive
+    half and there is no reason to pay for it once per candidate.
+    """
+    if isinstance(candidates, str):
+        candidates = [candidates]
+    if insecure:
+        allow_self_signed()
+
     sample = load_sample(batches, batch_size, cache_path)
     messages = sum(len(b) for b in sample)
+    calls = (1 + len(candidates)) * len(sample)
     print(f"\n{BOLD}[ Extraction A/B ]{RESET}")
     print(f"  {len(sample)} batch(es), {messages} message(s), from the shared cache")
-    print(f"  A  {baseline}")
-    print(f"  B  {candidate}")
-    print(f"  {DIM}two calls per batch — {2 * len(sample)} completions total{RESET}\n")
+    print(f"  A  {baseline}  {DIM}(baseline){RESET}")
+    for c in candidates:
+        print(f"  B  {c}")
+    print(f"  {DIM}{calls} completions total{RESET}\n")
 
     a = run_model(baseline, sample, days_back=days_back,
                   api_base=api_base, api_key=api_key)
-    b = run_model(candidate, sample, days_back=days_back,
-                  api_base=candidate_api_base if candidate_api_base is not None else api_base,
-                  api_key=candidate_api_key if candidate_api_key is not None else api_key)
+    results = [
+        run_model(
+            c, sample, days_back=days_back,
+            api_base=candidate_api_base if candidate_api_base is not None else api_base,
+            api_key=candidate_api_key if candidate_api_key is not None else api_key,
+        )
+        for c in candidates
+    ]
 
-    agree = agreement(a.events, b.events)
-    _report(a, b, agree)
+    agreements = [agreement(a.events, r.events) for r in results]
+    _report(a, results, agreements)
 
     payload = {
         "sample": {"batches": len(sample), "messages": messages,
                    "batch_size": batch_size, "days_back": days_back},
         "baseline": a.to_dict(),
-        "candidate": b.to_dict(),
-        "agreement": agree,
+        "candidates": [r.to_dict() for r in results],
+        "agreement": agreements,
     }
     if save:
         out = Path(save)
@@ -326,7 +418,8 @@ def run_ab(baseline: str, candidate: str, *, batches: int = 20,
         # The events themselves, so a disagreement can be read rather than
         # re-run — the eval is the expensive part.
         payload["baseline"]["events_detail"] = a.events
-        payload["candidate"]["events_detail"] = b.events
+        for entry, result in zip(payload["candidates"], results):
+            entry["events_detail"] = result.events
         out.write_text(json.dumps(payload, indent=2, ensure_ascii=False),
                        encoding="utf-8")
         print(f"\n  {DIM}written to {out}{RESET}")
@@ -334,6 +427,23 @@ def run_ab(baseline: str, candidate: str, *, batches: int = 20,
     return payload
 
 
-def resolve_key(explicit: str | None, env_var: str = "EH_EVAL_API_KEY") -> str | None:
-    """A key from the flag, else the environment. Never logged."""
-    return explicit or os.environ.get(env_var) or None
+# Checked in order. `LLM_ZT_KEY` is the virtual key for the litellm proxy on
+# the mesh (`central-dev.lan:4000`); it lives in `.env`, which `config.py`
+# loads on import, so it is in the environment by the time this runs but not in
+# the shell that launched it — passing it through a shell variable does not
+# work, which is how this list came to exist.
+KEY_VARS = ("EH_EVAL_API_KEY", "LLM_ZT_KEY")
+
+
+def resolve_key(explicit: str | None, *env_vars: str) -> str | None:
+    """A key from the flag, else the first environment variable that has one.
+
+    Never logged, never echoed — only its presence is ever reported.
+    """
+    if explicit:
+        return explicit
+    for name in (env_vars or KEY_VARS):
+        value = os.environ.get(name)
+        if value:
+            return value
+    return None

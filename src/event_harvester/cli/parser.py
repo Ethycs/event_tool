@@ -537,8 +537,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_ab.add_argument("--baseline", metavar="MODEL", required=True,
                       help="Model A, in litellm format (e.g. openai/gpt-5.4-mini)")
-    p_ab.add_argument("--candidate", metavar="MODEL", required=True,
-                      help="Model B — the one you suspect is good enough")
+    p_ab.add_argument("--candidate", metavar="MODEL", required=True, action="append",
+                      help="Model B — the one you suspect is good enough. Repeat "
+                           "to compare several against one baseline run")
+    p_ab.add_argument("--insecure", action="store_true",
+                      help="Skip TLS verification — for a proxy on the mesh with "
+                           "a self-signed certificate")
     p_ab.add_argument("--batches", type=int, default=20, metavar="N",
                       help="Batches of messages to run through both (default: 20). "
                            "A full harvest is ~82")

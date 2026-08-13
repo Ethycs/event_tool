@@ -43,6 +43,7 @@ async def eval_extraction_cmd(args, cfg) -> int:
                 api_key=key,
                 candidate_api_base=args.candidate_api_base,
                 candidate_api_key=candidate_key,
+                insecure=args.insecure,
                 save=args.save,
                 cache_path=args.cache,
             )
