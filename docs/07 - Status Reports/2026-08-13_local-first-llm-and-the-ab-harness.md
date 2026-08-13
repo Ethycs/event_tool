@@ -103,6 +103,32 @@ Now checked, each naming the variable to set:
 
 On the live `.env` the only warning is the TLS one, which is accurate and expected.
 
+## 5b. The first run on the new default was killed by a clock
+
+Restarting both services (the site was 5 commits stale, and the MCP backend owns the runner) queued a harvest that **failed after 30 minutes with 148 of 161 batches done and zero fallbacks**:
+
+```json
+"state": "failed",
+"progress": {"stage": "extract"},
+"result": {"error": "exceeded 1800s wall clock"}
+```
+
+It was working. It ran out of clock ~13 batches from the finish. The constant's own comment explained why it was wrong — *"A full harvest measured 320 s on 2026-07-31"* — and **every term in that measurement had since changed**:
+
+* the message cache was cold, so the run re-scraped 33 web sources with browsers before extraction began;
+* `batch_size` went 10 → 5 for the local model's context window, doubling the call count to **161**;
+* extraction moved to a local model answering in ~10 s which, on a single-slot server, **serialises** — 161 calls is ~27 minutes on its own.
+
+Harvest + extract ≈ 32 minutes. Cut off at 30.
+
+`JOB_TIMEOUT_SECONDS` is now 90 minutes and overridable via `EH_JOB_TIMEOUT_SECONDS`, because it is a function of the deployment's speed rather than of the code.
+
+**Throughput is the real finding.** `_extract_events_cloud` runs 5 concurrent workers and gets no benefit from them: ~6 completions/minute is one request at a time. The backend serves **one model with one slot**.
+
+> **A trap if you add slots.** In llama.cpp `-c` is the **total** KV cache, divided across `--parallel` slots — so `--parallel 4 -c 8192` gives each request 2048, which may be exactly where our 2048 came from. Four usable slots at our ~2,500-token prompts plus generation wants roughly `-c 32768 --parallel 4`. Size the total, not the per-slot figure.
+
+Parallel slots turn ~27 minutes of extraction into ~7, and turn `batch_size=5` from a constraint into a free choice.
+
 ## 6. Method notes worth keeping
 
 Four faults in my own measurement tools, three of which would have produced a confident wrong answer:
@@ -123,12 +149,13 @@ And two secret-handling slips, both fixed:
 
 | Fact | Value |
 |---|---|
-| Tests | **1468 passed**, 0 failed |
+| Tests | **1495 passed**, 0 failed |
 | Lint | 43, unchanged all session |
-| Git | `main` is **6 commits ahead of `origin/main`**, working tree clean |
-| Services | `EventHarvesterMCP` + `EventHarvesterSite` running; site on `0dac2fd`, **stale by 5 commits** |
-| Event cache | `data/.mcp_events.json` — **0 events** (§5) |
-| Message cache | 5.2 MB, 20,716 messages — **TTL expired**, a harvest will re-scrape |
+| Git | `origin/main` is at `343797e`; **`108ba59` (the timeout fix) is unpushed**. Tree clean |
+| Services | both restarted onto current code, 2026-08-13 ~19:06 UTC |
+| **Harvest** | **job `…dcf5` was RUNNING at handoff** — extract stage, **0 fallbacks**. Check this first |
+| Event cache | **0 events** until that job lands (§5, §5b) |
+| Message cache | warm — the failed run repopulated it, so the re-run skips the scrape |
 | Not mine | the 8 `.dvc` paths, still untracked and uncommitted |
 | Secrets | `.env` has a new appended block; backup at `.env.bak-20260813`, now gitignored |
 
@@ -136,10 +163,11 @@ And two secret-handling slips, both fixed:
 
 ## 8. Open, in priority order
 
-1. **The site serves 0 events.** One harvest on the local model restores it. Do this first and compare the count against yesterday's 251 — it is also the first real test of the new default.
+0. **Check `pixi run event-harvester jobs list` before anything else.** Job `…dcf5` was mid-extract at handoff. If it is `done`, compare its event count against **251** — that is the real-world test of the 90% recall figure, and with zero fallbacks it is genuinely `qwen3-8b`'s work rather than a cloud harvest wearing its name. If it failed, **read `result.error` before blaming the model**: the last failure was a wall clock, not an extraction fault, and the count alone would not have told you.
+1. **Parallel slots on the llama.cpp server** — the single biggest win available. ~27 minutes of extraction becomes ~7, and `batch_size=5` stops being a constraint. Mind the `-c` / `--parallel` interaction in §5b.
 2. **A date-selection weakness in `qwen3-8b`, unquantified.** Given `Friday 2026-08-21` where `build_prompt` emitted `dates=2026-08-14,2026-08-21`, it chose **the 14th**; the fallback chose correctly. One example, not a measurement — but a wrong date still fingerprint-matches, so **the 90% recall figure would not show this**. Worth a targeted date-accuracy eval before trusting it unattended.
-3. **`n_ctx=8192` on the qwen3-8b deployment** — would allow `batch_size=10` again and covers the generation budget.
-4. **`phi-4-14b` and `phi-3.5-mini` are not loaded in Triton** (`'phi-4-14b-gguf' is not found`), so the 14B class that also fits 12 GB is untested.
+3. **`n_ctx=8192` on the qwen3-8b deployment** — would allow `batch_size=10` again and covers the generation budget. Pairs with the slot change above.
+4. ~~`phi-4-14b` / `phi-3.5-mini` untested~~ — **resolved as not-a-bug**: the backend runs one model. Nothing to chase.
 5. **The OpenAI account has no credit** — `gpt-4o*` on the proxy fail with an upstream auth error. `claude_code/*` and `codex_sdk/*` work.
 6. **`sources/venue_location.py` is still unwired** — unchanged for two sessions.
 7. **`pixi run check-head` has side effects** — it printed source banners, attempted a web harvest and collided with the running service's Chromium profile. A checker that answers "does a bare checkout import?" should not open a browser.
