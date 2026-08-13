@@ -160,6 +160,34 @@ Relative-date arithmetic, the thing small models are worst at, has already been 
 
 > **A measurement tool that is wrong is worse than none.** The first version of `agreement` called `if events_match(a, b)` — which returns `(is_match, score)`, and a tuple is always truthy, so it scored **100% recall against any candidate whatsoever**. Caught by `tests/test_eval_extraction.py::TestAgreement`, which is why that test exists.
 
+### First run — `codex_sdk/gpt-5.6-luna` vs `qwen3-8b`, 2026-08-13
+
+15 stratified batches, 150 messages, through the mesh proxy at `central-dev.lan:4000`.
+
+| | baseline | qwen3-8b |
+|---|---|---|
+| events | 78 | 18 |
+| **call errors** | 0 | **6 of 15** |
+| unparseable batches | 2 | 2 |
+| date / time / location / link filled | 99 / 92 / 99 / 96% | 100 / 72 / 94 / 83% |
+| latency p50 | 21.9s | **6.1s** |
+| recall vs baseline | — | 29.5% |
+
+**The 29.5% is not a quality measurement.** All six errors were the same thing:
+
+```
+ValueError: Requested tokens (2519) exceed context window of 2048
+  llama_cpp/llama.py(1300): _create_completion
+```
+
+`qwen3-8b` is deployed behind llama.cpp with **`n_ctx=2048`**, and our prompts run to ~2,500 tokens on the larger batches. The model was never shown 6 of the 15 batches — and those six held **51 of the baseline's 78 events**, because the biggest batches are the event-dense ones. This is a deployment setting, not a model limit; Qwen3-8B natively handles far more.
+
+**Like-for-like on the 9 batches both models answered: 27 events vs 18 — 67%.** That is the honest headline, and it is a real gap rather than a config artefact. Format compliance was identical (2 unparseable each), `date` fill was perfect, and it ran **3.6× faster**.
+
+**Before re-running, raise the context window.** `n_ctx` must exceed prompt + generation: prompts reach ~2,500 tokens and `extract_events_llm` asks for `max_tokens=4096`, so **`n_ctx=8192`** is the setting to use. At 5 GB of weights on a 12 GB card there is ample room, including for the 5 concurrent batches `_extract_events_cloud` runs.
+
+`unverified` — no valid quality comparison exists yet. The numbers above measure a 2048-token deployment, not Qwen3-8B.
+
 ## `recruiters` CLI (`cli/commands/recruiters.py`, `cli/parser.py:238-271`) — why it exists separately
 
 `recruiter_score.py` is **not** part of the classifier train/eval loop — it has no `.pkl`, no `train()`, and is a pure rule-based scorer plus an optional LLM refinement pass for borderline cases. It exists to solve a different problem than "is this an event": triaging Gmail recruiter spam (staffing-firm mass blasts vs. genuine, personalized outreach) so the operator doesn't have to read every recruiter email by hand.
