@@ -98,17 +98,39 @@ class TestTheSampleIsIdentical:
 
 
 class TestItJudgesWithTheRealParser:
-    def test_an_unparseable_reply_counts_as_a_failure(self, tmp_path, monkeypatch):
+    def test_a_reply_shaped_like_ini_but_unreadable_is_a_failure(
+            self, tmp_path, monkeypatch):
         """A malformed reply costs all 10 messages in the batch silently, so it
         is the failure mode that matters most for a weak model."""
         from event_harvester.training import eval_extraction as mod
 
-        monkeypatch.setattr(mod, "_call",
-                            lambda *a, **k: ("I found some events for you!", None))
+        monkeypatch.setattr(mod, "_call", lambda *a, **k: (
+            "[Event 1] — Queer Night, Friday\n[Event 2] — AI Meetup", None))
         result = run_model("weak/model", load_sample(2, 10, _cache(tmp_path)))
         assert result.parse_failures == 2
         assert result.events == []
         assert result.raw_samples, "the raw reply must be kept for diagnosis"
+
+    def test_an_empty_reply_is_not_a_parse_failure(self, tmp_path, monkeypatch):
+        """A batch of five messages with no events in it should say so, and
+        that is a correct answer. Counting it as malformed made both models
+        look three times worse at batch_size 5 than they were."""
+        from event_harvester.training import eval_extraction as mod
+
+        monkeypatch.setattr(mod, "_call", lambda *a, **k: ("", None))
+        result = run_model("m", load_sample(2, 10, _cache(tmp_path)))
+        assert result.parse_failures == 0
+        assert result.empty_batches == 2
+
+    def test_prose_is_still_a_parse_failure(self, tmp_path, monkeypatch):
+        from event_harvester.training import eval_extraction as mod
+
+        monkeypatch.setattr(mod, "_call", lambda *a, **k: (
+            "I looked through the messages and found several interesting "
+            "events you might enjoy attending this weekend!", None))
+        result = run_model("m", load_sample(1, 10, _cache(tmp_path)))
+        assert result.parse_failures == 1
+        assert result.empty_batches == 0
 
     def test_a_good_reply_is_parsed(self, tmp_path, monkeypatch):
         from event_harvester.training import eval_extraction as mod

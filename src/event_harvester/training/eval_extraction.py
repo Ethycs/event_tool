@@ -73,6 +73,7 @@ class ModelResult:
     model: str
     events: list[dict] = field(default_factory=list)
     parse_failures: int = 0
+    empty_batches: int = 0     # answered, correctly, that there was nothing
     call_errors: int = 0
     batches: int = 0
     latencies: list[float] = field(default_factory=list)
@@ -98,6 +99,7 @@ class ModelResult:
             "events": len(self.events),
             "events_per_batch": round(len(self.events) / max(1, self.batches), 2),
             "parse_failures": self.parse_failures,
+            "empty_batches": self.empty_batches,
             "call_errors": self.call_errors,
             "fill_rates": {k: round(v, 3) for k, v in self.fill_rates.items()},
             "latency_s": {
@@ -265,9 +267,18 @@ def run_model(model: str, sample: list[list[dict]], *, days_back: int = 7,
         # cannot read is a reply the pipeline would have thrown away.
         _summary, events, _dropped = _parse_event_ini(text)
         if not events:
-            result.parse_failures += 1
-            if len(result.raw_samples) < keep_raw:
-                result.raw_samples.append(text[:600])
+            # "Found nothing" and "wrote something I cannot read" are different
+            # facts, and conflating them inflates the failure count exactly
+            # where batches are small and legitimately empty — at batch_size 5
+            # both models looked three times worse than they were. A reply with
+            # no section header and little content is the model correctly
+            # declining, not a malformed answer.
+            if "[Event" in text or len(text.strip()) > 40:
+                result.parse_failures += 1
+                if len(result.raw_samples) < keep_raw:
+                    result.raw_samples.append(text[:600])
+            else:
+                result.empty_batches += 1
         result.events.extend(events)
         print(f"  {DIM}{model}  batch {index}/{len(sample)}  "
               f"{len(events)} event(s){RESET}")
@@ -319,6 +330,7 @@ def _cell(result: ModelResult, key: str) -> str:
         "events extracted": str(len(result.events)),
         "events per batch": f"{len(result.events)/n:.1f}",
         "batches that parsed": f"{answered - result.parse_failures}/{answered}",
+        "empty (no events)": str(result.empty_batches),
         "call errors": str(result.call_errors),
         "latency p50": f"{lat[len(lat)//2]:.1f}s" if lat else "—",
         "wall clock": f"{sum(result.latencies):.0f}s",
@@ -331,7 +343,7 @@ def _report(baseline: ModelResult, candidates: list[ModelResult],
     print(f"\n{BOLD}Extraction A/B{RESET}   {baseline.batches} identical batches\n")
 
     keys = ["events extracted", "events per batch", "batches that parsed",
-            "call errors", *[f"{f} filled" for f in FIELDS],
+            "empty (no events)", "call errors", *[f"{f} filled" for f in FIELDS],
             "latency p50", "wall clock"]
     width = max(len(k) for k in keys)
     col = 24

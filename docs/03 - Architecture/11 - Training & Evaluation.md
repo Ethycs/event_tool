@@ -222,6 +222,31 @@ Those hints are why a small model can do this job at all. Do not spend them for 
 
 **Unmeasured opportunity:** web message `content` repeats itself — the observed shape is `title … date: … time: … location: … link: … <title again>`. That duplication is built by the web source, not by `build_prompt`, and content is the largest share of every prompt.
 
+### Second run — the same 150 messages at `batch_size=5` · 2026-08-13
+
+`load_sample` picks `batches × batch_size` messages by a fixed stride, so `30 × 5` and `15 × 10` select **the identical 150 messages** and differ only in grouping. A controlled comparison, not two unrelated runs.
+
+| | bs=10 | bs=5 |
+|---|---|---|
+| **`gpt-5.6-luna` events** | 78 | **80** |
+| date / time / location / link | 99 / 92 / 99 / 96% | 96 / 90 / 96 / 95% |
+| latency p50 | 21.9s | 14.2s |
+| **`qwen3-8b` events** | 18 | **68** |
+| `qwen3-8b` call errors | **6 of 15** | **0 of 30** |
+| `qwen3-8b` fill rates | 100 / 72 / 94 / 83% | **98 / 93 / 100 / 97%** |
+| **`qwen3-8b` recall** | 29.5% | **90.0%** |
+| events invented (not in baseline) | 3 | **0** |
+
+**Smaller batches cost the baseline nothing** — 78 → 80 events on identical input, fill rates within noise. So `batch_size=5` is not a workaround that trades quality for fit; it is free.
+
+**And it makes `qwen3-8b` viable.** With every prompt inside its 2048-token window it recovers **90% of the baseline's events, invents none, and fills every field better than the baseline does** — while running at 7.0s per call against 14.2s. The earlier 29.5% measured a context window, exactly as suspected.
+
+The 8 events it missed are mostly music and nightlife listings with several acts in one title (`Cult Strange ~ Vague Lanes ~ The Ink Bats`).
+
+> **A metric flaw this run exposed.** `parse_failures` counted any reply yielding no events, so a batch of five messages that genuinely contained none was scored as malformed. At `batch_size=5` that made *both* models look roughly three times worse than they were. Empty replies are now counted separately as `empty_batches`; only a reply with content the parser cannot read is a failure.
+
+`unverified` — one run of 150 messages, and `temperature=0` is rejected by the gpt-5 family so the baseline is not reproducible to the event.
+
 ## `recruiters` CLI (`cli/commands/recruiters.py`, `cli/parser.py:238-271`) — why it exists separately
 
 `recruiter_score.py` is **not** part of the classifier train/eval loop — it has no `.pkl`, no `train()`, and is a pure rule-based scorer plus an optional LLM refinement pass for borderline cases. It exists to solve a different problem than "is this an event": triaging Gmail recruiter spam (staffing-firm mass blasts vs. genuine, personalized outreach) so the operator doesn't have to read every recruiter email by hand.
