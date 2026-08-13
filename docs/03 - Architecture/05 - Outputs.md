@@ -71,6 +71,8 @@ The list page had said "mobile-first" since 2026-07-30 and had never been opened
 | `/calendar` grid begins at | y=611 | y=369 |
 | Undersized tap targets | 6–8 per page | 0 on `/`, 2 explained below |
 
+**Re-measured 2026-08-13**, after the desktop pass below rewrote the same stylesheet: sticky block 59–60px, first card at y=249–250, one column at 292/332/362px, no sideways scroll. Every computed font size at 320 and 375px is identical to the values in this table's "after" column, because the fluid scale's floors *are* those values.
+
 **`/admin` was the serious one.** Its cap rows are `110px 1fr 84px 44px`, and a range input's intrinsic width meant the row could not compress — so the number field and the ∞ toggle, *the two controls that actually set a cap*, sat off the right edge with nothing indicating they existed. The page was not cramped, it was unusable.
 
 The cause was not the table's `overflow-x`, which was already set and did nothing. **A grid item's automatic minimum size is its min-content width**, so `section` refused to shrink below the 33-row Searches table regardless of what the table itself was told; the section was never the thing scrolling. `section { min-width: 0 }` is the fix, found by hiding elements one at a time and watching `document.scrollWidth` rather than by reasoning about the cascade.
@@ -254,7 +256,48 @@ Reported by a screenshot, not a test: **22 chips for 33 events, three of them co
 
 Also in this pass: search, sort and the layout toggle moved onto one row (they were stacked across three); chips wrap instead of scrolling horizontally, since horizontal scroll hid every filter past the viewport edge with no affordance saying so; each chip carries its own count, so a filter says how much it will show before it is clicked; and an explicit **All** chip replaced "re-click the active chip to clear", which was discoverable only by accident.
 
-`n × m` layout: the grid is `repeat(auto-fill, minmax(270px, 1fr))`, so *n* comes from the viewport and *m* from how many events are in that date bucket — one column on a phone, four on a desktop, from the same file with no media-query ladder. The Grid/Carousel toggle switches a single body class, so the cards are identical in both modes and switching costs a repaint rather than a re-render. Measured: 1 column at 390px, 4 at 1440px, zero horizontal overflow at both.
+`n × m` layout: the grid is `repeat(auto-fill, minmax(var(--card-min), 1fr))`, so *n* comes from the viewport and *m* from how many events are in that date bucket — one column on a phone, nine on an ultrawide, from the same file with no media-query ladder. The Grid/Carousel toggle switches a single body class, so the cards are identical in both modes and switching costs a repaint rather than a re-render.
+
+### The desktop half of that claim was false until 2026-08-13
+
+The layout above was measured on a phone and at 1440px, and it was true at both. It was not true past 1400px, because **`main { max-width: 1400px }` capped the thing the grid was measured against**. One declaration produced two defects:
+
+| viewport | columns | `main` | empty gutter | h1 at x | first card at x |
+|---|---|---|---|---|---|
+| 1280 | 4 | 1280 | 0 | 16 | 16 |
+| 1920 | 4 | 1400 | 520 | 16 | 276 |
+| 2560 | 4 | 1400 | 1160 | 16 | 596 |
+| 3440 | **4** | 1400 | **2040** | 16 | **1036** |
+
+The grid stopped resizing — four columns however wide the window got, which is what "not responsive" looks like from the chair. And because only `main` was centred while `header` and `.controls` stayed full-bleed, the **search field ran to x=3270 while the cards it filters began at x=1036**: a 1020px skew between the furniture and its content, on the same page, at the same moment.
+
+The cap is gone; every band now shares the same 16px inset, so they align by construction rather than by a second number that has to be kept equal to the first. And the track itself is fluid — `--card-min: clamp(260px, 20vw, 340px)` — so a wide screen gains columns *and* keeps each card legible, instead of tiling ever more 270px slivers.
+
+Measured after: **3 / 4 / 5 / 6 / 7 / 9 columns** at 1024 / 1280 / 1920 / 2240 / 2560 / 3440, tracks between 305 and 385px throughout, gutter 0 and skew 0 at every width, no horizontal overflow anywhere. The phone is untouched: 320/360/390 still show one column at 292/332/362px with the sticky block at 59–60px.
+
+### The type scale is fluid, and it stops · **2026-08-13**
+
+Five steps, each a `clamp()` interpolating between its phone value at 375px and its desktop value at 1600px:
+
+| token | 320–375px | 1600px+ | used by |
+|---|---|---|---|
+| `--fs-xs` | 11 | 13 | chip tallies, footer |
+| `--fs-sm` | 13 | 15 | meta, chips, location, source, bucket headings, controls |
+| `--fs-md` | 14 | 16 | detail text, the date line, buttons, nav tabs |
+| `--fs-base` | 16 | 18 | body, card titles, the search field |
+| `--fs-lg` | 18 | 26 | `h1` |
+
+**Every clamp's upper bound is a fixed px, never a vw.** A 3440px monitor is further from your eyes than a phone, not larger in your field of view, so text that keeps growing with the viewport is the failure mode — the scale saturates at 1600px and holds.
+
+Three things this had to get right:
+
+- **The floors are the sizes the 2026-08-12 phone pass measured.** At 320 and 375px every computed size is identical to what it was before this change, so a desktop improvement cannot cost the phone anything.
+- **`--fs-base` floors at 16px deliberately.** Safari zooms the page when a focused input computes below 16px, and the search field is on that token.
+- **Each size is now declared once.** `h1 { font-size: 18px }` in the phone media query was restating `--fs-lg`'s floor in a second place that could drift from it; it is gone, and `_STYLE` contains no numeric `font-size` at all. This is the same lesson as the source-order bugs in §0b from the other end — a value that appears twice can disagree with itself, and a value that appears once cannot.
+
+`NAV_STYLE` uses `var(--fs-md, 14px)`: only the event list carries the scale so far, and without the fallback the declaration would be invalid on `/calendar` and `/admin` and the tabs would silently inherit the body size. **Those two pages still use fixed type** — bringing them across is a separate measured pass, since the calendar's seven-column month grid is the constraint that decides how far its text can grow.
+
+Pinned by `tests/test_desktop_responsive.py` (27).
 
 Search is AND across terms — "queer friday" narrows rather than matching either word — over title, location, details, source and date. Sort by date, priority or title.
 

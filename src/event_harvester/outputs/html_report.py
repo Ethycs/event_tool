@@ -207,6 +207,34 @@ _STYLE = """
 :root {
   --bg: #ffffff; --fg: #16181d; --muted: #5b6472; --line: #e4e7ec;
   --card: #ffffff; --accent: #7c3aed; --chip: #f2f4f7; --shadow: 0 1px 2px rgba(16,24,40,.06);
+
+  /* ── Type scale: fluid, and saturating ─────────────────────────────
+     Each step interpolates between its phone value at 375px and its
+     desktop value at 1600px, then **stops**. It stops because a 3440px
+     monitor is further from your eyes than a phone, not larger in your
+     field of view — text that keeps growing with the viewport is the
+     thing that reads as overwhelming.
+
+     The floors are the sizes the 2026-08-12 mobile pass measured, so
+     nothing here shrinks below what was already checked on a 320px
+     screen. `--fs-base` floors at 16px deliberately: iOS zooms the page
+     when a focused input computes below 16px, and the search field uses
+     this token.
+
+     One source of truth per step — no per-breakpoint override. The two
+     bugs this stylesheet has already had were both a media query losing
+     on source order, and a rule that exists once cannot lose to itself. */
+  --fs-xs:   clamp(11px, 10.4px + 0.16vw, 13px);
+  --fs-sm:   clamp(13px, 12.4px + 0.16vw, 15px);
+  --fs-md:   clamp(14px, 13.4px + 0.16vw, 16px);
+  --fs-base: clamp(16px, 15.4px + 0.16vw, 18px);
+  --fs-lg:   clamp(18px, 15.6px + 0.65vw, 26px);
+
+  /* The narrowest a card may be before the grid drops a column. Grows
+     with the viewport so a wide screen gains columns *and* keeps each
+     card legible, rather than tiling ever more 270px slivers. Shared
+     with the carousel so both layouts agree on what a card is. */
+  --card-min: clamp(260px, 20vw, 340px);
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -217,19 +245,19 @@ _STYLE = """
 * { box-sizing: border-box; }
 body {
   margin: 0; background: var(--bg); color: var(--fg);
-  font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+  font: var(--fs-base)/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
         Helvetica, Arial, sans-serif;
   -webkit-text-size-adjust: 100%;
 }
 header { padding: 20px 16px 12px; border-bottom: 1px solid var(--line); }
-h1 { margin: 0 0 4px; font-size: 20px; letter-spacing: -0.01em; }
-.meta { color: var(--muted); font-size: 13px; }
+h1 { margin: 0 0 4px; font-size: var(--fs-lg); letter-spacing: -0.01em; }
+.meta { color: var(--muted); font-size: var(--fs-sm); }
 .controls {
   position: sticky; top: 0; z-index: 5; background: var(--bg);
   border-bottom: 1px solid var(--line); padding: 10px 16px;
 }
 input[type=search] {
-  width: 100%; padding: 11px 12px; font-size: 16px; color: var(--fg);
+  width: 100%; padding: 11px 12px; font-size: var(--fs-base); color: var(--fg);
   background: var(--chip); border: 1px solid var(--line); border-radius: 10px;
 }
 /* One row, search + sort + layout, because they are all "how do I look at
@@ -244,7 +272,7 @@ input[type=search] {
 .chip {
   flex: 0 0 auto; display: inline-flex; align-items: center; gap: 7px;
   padding: 7px 13px; border-radius: 999px; border: 1px solid var(--line);
-  background: var(--chip); color: var(--muted); font-size: 13px; cursor: pointer;
+  background: var(--chip); color: var(--muted); font-size: var(--fs-sm); cursor: pointer;
   min-height: 34px;
 }
 .chip:hover { border-color: var(--accent); color: var(--fg); }
@@ -252,22 +280,29 @@ input[type=search] {
 /* The count rides inside the chip so the filter says what it will show
    before you click it. */
 .tally {
-  font-size: 11px; font-weight: 700; padding: 1px 6px; border-radius: 999px;
+  font-size: var(--fs-xs); font-weight: 700; padding: 1px 6px; border-radius: 999px;
   background: rgba(127,127,127,.22); color: inherit; font-variant-numeric: tabular-nums;
 }
 .chip[aria-pressed="true"] .tally { background: rgba(255,255,255,.25); }
-main { padding: 0 16px 48px; max-width: 1400px; margin: 0 auto; }
+/* No max-width, and that is the point. It used to cap at 1400px while `header`
+   and `.controls` stayed full-bleed, which cost twice over: measured on
+   2026-08-13, the grid **stopped resizing at 1400px** — still 4 columns on a
+   3440px monitor, with 2040px of empty gutter — and because only `main` was
+   centred, the search bar ran to x=3270 while the first card began at x=1036.
+   A 1020px skew between the furniture and the content it controls.
+   Every band now shares the same 16px inset, so they line up at any width. */
+main { padding: 0 16px 48px; }
 h2.bucket {
-  font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
+  font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: .06em;
   color: var(--muted); margin: 24px 0 10px;
 }
 
 /* n x m: n comes from the viewport, m from how many events are in the bucket.
    auto-fill rather than a fixed column count so the same file is one column on
-   a phone and five on a desktop without a media-query ladder. */
+   a phone and nine on an ultrawide without a media-query ladder. */
 .shelf {
   display: grid; gap: 10px;
-  grid-template-columns: repeat(auto-fill, minmax(270px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(var(--card-min), 1fr));
 }
 /* Carousel: one horizontally-snapping row per bucket. Same cards, same DOM —
    only the container changes, so nothing re-renders when you toggle. */
@@ -276,7 +311,7 @@ body.carousel .shelf {
   padding-bottom: 6px; scrollbar-width: thin;
 }
 body.carousel .shelf .card {
-  flex: 0 0 min(86%, 300px); scroll-snap-align: start; margin-bottom: 0;
+  flex: 0 0 min(86%, var(--card-min)); scroll-snap-align: start; margin-bottom: 0;
 }
 .card {
   background: var(--card); border: 1px solid var(--line); border-radius: 12px;
@@ -293,12 +328,12 @@ body.carousel .shelf .card {
 }
 .card .actions { margin-top: auto; }
 .bar select, .bar button {
-  flex: 0 0 auto; padding: 9px 12px; min-height: 40px; font-size: 13px;
+  flex: 0 0 auto; padding: 9px 12px; min-height: 40px; font-size: var(--fs-sm);
   color: var(--fg); background: var(--chip); border: 1px solid var(--line);
   border-radius: 10px; cursor: pointer;
 }
 .count {
-  flex: 0 0 auto; color: var(--muted); font-size: 13px; white-space: nowrap;
+  flex: 0 0 auto; color: var(--muted); font-size: var(--fs-sm); white-space: nowrap;
   font-variant-numeric: tabular-nums;
 }
 /* The chips collapse behind this on a phone; it names what is active, so
@@ -314,7 +349,9 @@ body.carousel .shelf .card {
    takes the sticky block to ~62px and puts events above the fold. */
 @media (max-width: 700px) {
   header { padding: 12px 14px 8px; }
-  h1 { font-size: 18px; }
+  /* `h1 { font-size: 18px }` used to live here. `--fs-lg` already floors at
+     18px, which is what this measured to at 320-375px, so the override was
+     restating the scale in a second place that could drift from it. */
   /* The source tallies are a debugging line, not a reason to push the events
      off the screen. Kept in the DOM for a forwarded copy read on a desktop. */
   header .meta + .meta { display: none; }
@@ -334,16 +371,16 @@ body.carousel .shelf .card {
   display: block; width: calc(100% + 2px); margin: -1px -1px 10px; aspect-ratio: 300 / 168;
   object-fit: cover; border-radius: 11px 11px 0 0; background: var(--chip);
 }
-.card h3 { margin: 0 0 6px; font-size: 16px; line-height: 1.35; }
-.when { color: var(--accent); font-weight: 600; font-size: 14px; }
-.where, .src { color: var(--muted); font-size: 13px; }
+.card h3 { margin: 0 0 6px; font-size: var(--fs-base); line-height: 1.35; }
+.when { color: var(--accent); font-weight: 600; font-size: var(--fs-md); }
+.where, .src { color: var(--muted); font-size: var(--fs-sm); }
 .src { margin-top: 6px; }
 /* Detail is shown, not hidden behind a button. Clamped to three lines so a
    long one cannot stretch its card taller than its neighbours in the grid;
    `.open` releases the clamp. Most details in practice are ~90 characters
    and fit in one line, so most cards never show a toggle at all. */
 .details {
-  margin: 10px 0 0; color: var(--fg); font-size: 14px; line-height: 1.45;
+  margin: 10px 0 0; color: var(--fg); font-size: var(--fs-md); line-height: 1.45;
   white-space: pre-wrap; overflow-wrap: anywhere;
   display: -webkit-box; -webkit-box-orient: vertical;
   -webkit-line-clamp: 3; line-clamp: 3; overflow: hidden;
@@ -355,7 +392,7 @@ body.carousel .shelf .card {
 a.btn, button.btn {
   flex: 1 1 auto; min-width: 120px; min-height: 40px; padding: 9px 12px;
   border-radius: 9px; border: 1px solid var(--line); background: var(--chip);
-  color: var(--fg); font-size: 14px; text-align: center; text-decoration: none;
+  color: var(--fg); font-size: var(--fs-md); text-align: center; text-decoration: none;
   cursor: pointer; display: inline-flex; align-items: center; justify-content: center;
 }
 /* `display: inline-flex` above beats the user-agent `[hidden]` rule, so a
@@ -366,12 +403,13 @@ a.btn.primary { background: var(--accent); border-color: var(--accent); color: #
 #toast {
   position: fixed; left: 50%; bottom: 20px; transform: translate(-50%, 80px);
   background: var(--accent); color: #fff; padding: 10px 16px; border-radius: 999px;
-  font-size: 14px; opacity: 0; pointer-events: none; transition: transform .25s, opacity .25s;
+  font-size: var(--fs-md); opacity: 0; pointer-events: none;
+  transition: transform .25s, opacity .25s;
   max-width: 90vw; text-align: center;
 }
 #toast.show { transform: translate(-50%, 0); opacity: 1; }
 @media (prefers-reduced-motion: reduce) { #toast { transition: none; } }
-footer { color: var(--muted); font-size: 12px; padding: 24px 16px; text-align: center; }
+footer { color: var(--muted); font-size: var(--fs-xs); padding: 24px 16px; text-align: center; }
 
 /* Touch targets, 44px per WCAG 2.5.5 — these were 32-41px, and every one of
    them is something you tap on the page you read on a phone. Scoped to coarse

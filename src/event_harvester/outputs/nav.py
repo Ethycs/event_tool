@@ -112,10 +112,17 @@ def base_script(active: str = "") -> str:
 # Kept with the markup it styles so a page cannot pick up one without the
 # other. Colours come from the host page's custom properties; both pages define
 # `--fg`, `--muted`, `--line` and `--accent`.
+#
+# `--fs-md` has a fallback because only the event list carries the fluid type
+# scale so far. On a page that defines it the tabs scale with everything else;
+# on one that does not they stay at the 14px they have always been. Written
+# without the fallback this would resolve to an invalid value on two of the
+# three pages and silently inherit the body size instead.
 NAV_STYLE = """
 .sitenav { display: flex; gap: 2px; margin: 0 0 10px; flex-wrap: wrap; }
 .sitenav a {
-  color: var(--muted); text-decoration: none; font-weight: 600; font-size: 14px;
+  color: var(--muted); text-decoration: none; font-weight: 600;
+  font-size: var(--fs-md, 14px);
   padding: 6px 12px; border-radius: 8px; border: 1px solid transparent;
 }
 .sitenav a:hover { color: var(--fg); background: var(--chip); }
