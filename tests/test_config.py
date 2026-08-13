@@ -62,7 +62,7 @@ class TestConfigValidation:
     def test_no_warnings_when_all_configured(self):
         cfg = AppConfig(
             telegram=TelegramConfig(api_id=123, api_hash="abc"),
-            llm=LLMConfig(model="openrouter/test"),
+            llm=LLMConfig(model="openrouter/test", api_key="test-key"),
             ticktick=TickTickConfig(
                 client_id="cid", client_secret="cs",
                 username="u", password="p",
@@ -94,7 +94,7 @@ class TestConfigValidation:
         assert not TelegramConfig().is_configured
         assert TelegramConfig(api_id=1, api_hash="x").is_configured
         assert not LLMConfig(model="").is_configured
-        assert LLMConfig(model="openrouter/test").is_configured
+        assert LLMConfig(model="openrouter/test", api_key="k").is_configured
         assert not TickTickConfig().is_configured
         tt = TickTickConfig(
             client_id="a", client_secret="b",

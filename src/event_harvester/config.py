@@ -79,9 +79,58 @@ class LLMConfig:
 
     @property
     def is_configured(self) -> bool:
+        """Whether this config could actually reach a model.
+
+        **A model name alone is not configuration.** This used to return
+        `bool(self.model)`, which — since `model` has always had a non-empty
+        default — was `True` for every config ever constructed. `validate_config`
+        therefore never warned about a missing LLM setup, and the pipeline went
+        on to make calls that could not succeed.
+
+        That was survivable while the default was `gpt-4o-mini`, which at least
+        names a real model at a well-known provider. It stopped being
+        survivable on 2026-08-13: **the default is now `qwen3-8b`, which exists
+        only behind a particular endpoint.** With no `api_base` it is sent to
+        OpenAI, which has never heard of it, and the operator gets a 404 in a
+        log rather than a warning at startup.
+
+        So: a model, and something to reach it with — a key, or an endpoint
+        that needs none (a LAN Ollama or vLLM typically does).
+        """
         if self.backend == "local":
             return bool(self.model_path)
-        return bool(self.model)
+        return bool(self.model) and bool(self.api_key or self.api_base)
+
+    @property
+    def needs_endpoint(self) -> bool:
+        """True when the model name cannot be resolved by a public provider.
+
+        A bare name with no provider prefix and no `api_base` is going to
+        OpenAI by default. `gpt-*` belongs there; `qwen3-8b` does not, and the
+        failure arrives as an unhelpful 404 mid-harvest.
+        """
+        if self.backend == "local" or self.api_base:
+            return False
+        model = (self.model or "").lower()
+        if "/" in model:            # an explicit provider — anthropic/, ollama/
+            return False
+        return not model.startswith(("gpt-", "o1-", "o3-", "chatgpt-",
+                                     "text-", "davinci"))
+
+    @property
+    def fallback_is_configured(self) -> bool:
+        """Whether the fallback could actually answer.
+
+        It inherits the primary's key when it has none of its own, and on this
+        deployment those are *different* keys for *different* model groups —
+        the local-models key cannot reach `codex_sdk/*`. A fallback that 401s
+        is worse than no fallback, because it is only exercised when something
+        has already gone wrong.
+        """
+        if not self.fallback_model:
+            return False
+        return bool(self.fallback_api_key or self.fallback_api_base
+                    or self.api_key)
 
     @property
     def display_name(self) -> str:
@@ -578,6 +627,61 @@ def apply_caps_overlay(cfg, path: Path | None = None) -> None:
         setattr(cfg.caps, k, v)
 
 
+def _llm_warnings(llm: LLMConfig) -> list[str]:
+    """What is wrong with the LLM setup, in the order it will bite.
+
+    Separated from `validate_config` because the LLM stage now has four ways to
+    be misconfigured and only one of them used to be checked. Each warning
+    names the variable to set — a warning that says "configure the LLM" makes
+    the reader go and read this file.
+    """
+    out: list[str] = []
+    if llm.backend == "local":
+        if not llm.model_path:
+            out.append(
+                "LLM: LLM_BACKEND=local but LLM_MODEL_PATH is unset - analysis "
+                "will be skipped. Point it at an .onnx model, or set "
+                "LLM_BACKEND=litellm."
+            )
+        return out
+
+    if not llm.model:
+        out.append("LLM: LLM_MODEL is unset - analysis will be skipped.")
+        return out
+
+    if not (llm.api_key or llm.api_base):
+        out.append(
+            f"LLM: {llm.model!r} has neither a key nor an endpoint - analysis "
+            "will be skipped. Set LLM_API_KEY (or OPENAI_API_KEY), or "
+            "LLM_API_BASE for a local server."
+        )
+    elif llm.needs_endpoint:
+        # The failure this prevents is a 404 from OpenAI for a model only a
+        # local server has ever heard of, arriving mid-harvest.
+        out.append(
+            f"LLM: {llm.model!r} is not a name any public provider serves and "
+            "LLM_API_BASE is unset, so it will be sent to OpenAI and rejected. "
+            "Set LLM_API_BASE to the server hosting it."
+        )
+
+    if llm.fallback_model and not llm.fallback_is_configured:
+        out.append(
+            f"LLM: fallback {llm.fallback_model!r} has no credentials of its "
+            "own and none to inherit. It will fail exactly when it is needed. "
+            "Set LLM_FALLBACK_API_KEY."
+        )
+    # Deliberately no warning for an *absent* fallback. One model is a valid
+    # configuration, and a warning that fires on every run is one the reader
+    # learns to skip past — which costs more than it saves the first time
+    # something is actually wrong.
+    if llm.api_base and not llm.verify_ssl:
+        out.append(
+            f"LLM: TLS verification is off for {llm.api_base} (LLM_VERIFY_SSL). "
+            "Intended for a self-signed endpoint you control."
+        )
+    return out
+
+
 def validate_config(
     cfg: AppConfig,
     *,
@@ -602,11 +706,8 @@ def validate_config(
             "Download it from Google Cloud Console (APIs & Services > Credentials)."
         )
 
-    if need_analysis and not cfg.llm.is_configured:
-        warnings.append(
-            "LLM: No model configured - analysis will be skipped. "
-            "Set LLM_MODEL and the appropriate API key env var."
-        )
+    if need_analysis:
+        warnings.extend(_llm_warnings(cfg.llm))
 
     if need_ticktick and not cfg.ticktick.is_configured:
         warnings.append(

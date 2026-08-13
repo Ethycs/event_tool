@@ -90,7 +90,7 @@ class TestAnalyseAndExtractTasks:
             "details = Daily standup meeting"
         )
 
-        cfg = LLMConfig(model="openrouter/test-model")
+        cfg = LLMConfig(model="openrouter/test-model", api_key="test-key")
 
         with patch("event_harvester.pipeline.classifier.has_trained_models", return_value=False):
             with patch(
@@ -106,7 +106,7 @@ class TestAnalyseAndExtractTasks:
         assert set(result.rejects) == set(REJECT_BUCKETS)
 
     def test_handles_no_events(self, sample_messages):
-        cfg = LLMConfig(model="openrouter/test-model")
+        cfg = LLMConfig(model="openrouter/test-model", api_key="test-key")
 
         with patch("event_harvester.pipeline.classifier.has_trained_models", return_value=False):
             with patch(
@@ -144,7 +144,7 @@ class TestCapEffect:
     """
 
     def _count_messages_sent(self, messages, caps):
-        cfg = LLMConfig(model="openrouter/test-model")
+        cfg = LLMConfig(model="openrouter/test-model", api_key="test-key")
         seen: list[int] = []
 
         def _fake_cloud(msgs, days_back, cfg_, batch_size=10):
@@ -195,7 +195,7 @@ class TestRejectsComeFromTheBackendThatRan:
         if backend == "local":
             cfg = LLMConfig(backend="local", model_path="/fake/model.onnx")
         else:
-            cfg = LLMConfig(model="openrouter/test-model", backend=backend)
+            cfg = LLMConfig(model="openrouter/test-model", api_key="test-key", backend=backend)
         with patch("event_harvester.pipeline.classifier.has_trained_models", return_value=False):
             with patch(
                 "event_harvester.pipeline.analysis._extract_events_cloud",
