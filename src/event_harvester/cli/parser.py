@@ -527,6 +527,44 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_root_flags(clf_eval)
 
+    # ── extraction A/B ──
+    # Its own top-level command rather than a `classifier` subcommand: this
+    # measures the LLM stage, which is a different question from whether the
+    # classifier is right about what to send it.
+    p_ab = sub.add_parser(
+        "eval-extraction",
+        help="A/B two LLMs on the extraction stage over identical real batches",
+    )
+    p_ab.add_argument("--baseline", metavar="MODEL", required=True,
+                      help="Model A, in litellm format (e.g. openai/gpt-5.4-mini)")
+    p_ab.add_argument("--candidate", metavar="MODEL", required=True,
+                      help="Model B — the one you suspect is good enough")
+    p_ab.add_argument("--batches", type=int, default=20, metavar="N",
+                      help="Batches of messages to run through both (default: 20). "
+                           "A full harvest is ~82")
+    p_ab.add_argument("--batch-size", type=int, default=10, metavar="N",
+                      help="Messages per batch — match the pipeline (default: 10)")
+    p_ab.add_argument("--api-base", metavar="URL", default=None,
+                      help="OpenAI-compatible endpoint for both models, e.g. a "
+                           "litellm proxy at https://host:4000/v1")
+    p_ab.add_argument("--candidate-api-base", metavar="URL", default=None,
+                      help="Different endpoint for the candidate (e.g. a local "
+                           "Ollama) when the two are not served together")
+    p_ab.add_argument("--api-key", metavar="KEY", default=None,
+                      help="Key for --api-base. Prefer the EH_EVAL_API_KEY "
+                           "environment variable — an argument lands in your "
+                           "shell history")
+    p_ab.add_argument("--candidate-api-key", metavar="KEY", default=None,
+                      help="Key for --candidate-api-base, if it differs")
+    p_ab.add_argument("--cache", metavar="FILE", default=None,
+                      help="Message cache to sample from "
+                           "(default: data/.message_cache.json)")
+    p_ab.add_argument("--save", metavar="FILE", default=None,
+                      help="Write the full comparison, including every extracted "
+                           "event, as JSON")
+    _add_days_back(p_ab)
+    _add_root_flags(p_ab)
+
     # ── serve ──
     p_serve = sub.add_parser(
         "serve",

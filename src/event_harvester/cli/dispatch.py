@@ -15,6 +15,7 @@ import logging
 import sys
 
 from event_harvester.cli.commands.classifier import classifier_cmd
+from event_harvester.cli.commands.eval_extraction import eval_extraction_cmd
 from event_harvester.cli.commands.harvest import harvest_cmd
 from event_harvester.cli.commands.jobs import jobs_cmd
 from event_harvester.cli.commands.mcp import mcp_cmd
@@ -31,7 +32,7 @@ logger = logging.getLogger("event_harvester")
 
 KNOWN_COMMANDS = frozenset({
     "harvest", "watch", "web", "recruiters", "classifier", "serve", "site", "service",
-    "mcp", "jobs",
+    "mcp", "jobs", "eval-extraction",
 })
 
 _HANDLERS = {
@@ -45,6 +46,7 @@ _HANDLERS = {
     "service": service_cmd,
     "mcp": mcp_cmd,
     "jobs": jobs_cmd,
+    "eval-extraction": eval_extraction_cmd,
 }
 
 

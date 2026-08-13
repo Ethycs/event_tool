@@ -123,6 +123,43 @@ pixi run event-harvester classifier eval --labels FILE [--out-samples DIR]
 - `train` with neither `--in-labels` nor `--out-labels`: harvests, labels via LLM, trains, and **discards the labels** (no `--out-labels` means nothing is written to disk) — every run re-harvests and re-labels from scratch with real LLM calls. Cheap to lose track of cost here if run repeatedly.
 - `eval --labels` is `required=True` in argparse; there is no default labels path.
 
+## `eval-extraction` — A/B the extraction model · **added 2026-08-12**
+
+`training/eval_extraction.py`, `cli/commands/eval_extraction.py`. Answers "could a much weaker model do the extraction?" with a measurement rather than an opinion. Distinct from `classifier eval`, which asks whether the *classifier* is right about what to send — a different question about a different stage.
+
+```
+pixi run event-harvester eval-extraction \
+  --baseline openai/gpt-5.4-mini-2026-03-17 \
+  --candidate ollama/qwen3:8b \
+  --api-base https://central-dev.lan:4000/v1 \
+  --batches 20 --save data/ab.json
+```
+
+Both models get **identical batches** — taken from `data/.message_cache.json`, ordered by `score_message` so they are the head of the real queue rather than a random draw, and deterministic by construction. `temperature=0`. A difference is then the model, not the sample.
+
+Replies are parsed with the pipeline's own `_parse_event_ini`. A harness that read output more leniently than production does would flatter a weak model exactly where it is weakest.
+
+| Reported | Why it is there |
+|---|---|
+| events extracted | the headline, and on its own it rewards hallucination |
+| **batches that failed to parse** | a malformed reply costs all 10 messages silently — the failure mode that matters most |
+| date / time / location / link fill rates | `TBD` does not count. An event with no date never reaches the calendar page |
+| **agreement** — recall of the baseline's events | matched with `events_match`, so "the same event" means what it means to the deduper |
+| candidate-only events | counted and surfaced, never credited: they are either finds or inventions and the harness cannot tell |
+| latency, tokens | throughput at 82 calls/harvest |
+
+**Why the workload makes this worth asking** (measured 2026-08-12 against the real cache):
+
+| | |
+|---|---|
+| Messages reaching the LLM | **817 of 20,716 — 3.9%**, ~82 calls per harvest |
+| Prompt size | p50 1,286 · **p95 1,863** · max 2,043 tokens. No long-context requirement anywhere |
+| Arriving with a **pre-resolved ISO date** | **32%** — `build_prompt` runs `_resolve_date` before the model sees anything |
+
+Relative-date arithmetic, the thing small models are worst at, has already been lifted into Python. What remains is selection and transcription into INI.
+
+> **A measurement tool that is wrong is worse than none.** The first version of `agreement` called `if events_match(a, b)` — which returns `(is_match, score)`, and a tuple is always truthy, so it scored **100% recall against any candidate whatsoever**. Caught by `tests/test_eval_extraction.py::TestAgreement`, which is why that test exists.
+
 ## `recruiters` CLI (`cli/commands/recruiters.py`, `cli/parser.py:238-271`) — why it exists separately
 
 `recruiter_score.py` is **not** part of the classifier train/eval loop — it has no `.pkl`, no `train()`, and is a pure rule-based scorer plus an optional LLM refinement pass for borderline cases. It exists to solve a different problem than "is this an event": triaging Gmail recruiter spam (staffing-firm mass blasts vs. genuine, personalized outreach) so the operator doesn't have to read every recruiter email by hand.
