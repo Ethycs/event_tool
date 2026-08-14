@@ -196,6 +196,12 @@ And two secret-handling slips, both fixed:
    dropped correctly, they are just not counted anywhere, and the rejects no
    longer sum to the total. Fix by attributing per message (the events carry
    `_source_ids`), not per batch.
+   **Designed 2026-08-14** in [`01 - Design/04 - Decomposing the Pipeline.md`](../01%20-%20Design/04%20-%20Decomposing%20the%20Pipeline.md),
+   after an exchange with 206-1002 over the mesh exchange. The short version:
+   derive drop counts at the stage boundary from `in` and `out` rather than
+   letting a stage self-report, and make the accounting unit the message —
+   the same unit as the pipeline element — because a bucket written per batch
+   cannot represent a partial batch. Roadmap 2.16.
 2. **Parallel slots on the llama.cpp server** — the single biggest win available. ~27 minutes of extraction becomes ~7, and `batch_size=5` stops being a constraint. Mind the `-c` / `--parallel` interaction in §5b.
 3. **A date-selection weakness in `qwen3-8b`, unquantified.** Given `Friday 2026-08-21` where `build_prompt` emitted `dates=2026-08-14,2026-08-21`, it chose **the 14th**; the fallback chose correctly. One example, not a measurement — but a wrong date still fingerprint-matches, so **neither the 90% recall figure nor the 244 would show this**. The live cache is at least not obviously wrong: 244 of 244 carry a date, none in the past, and the tail decays plausibly to 2027-05. Still worth a targeted date-accuracy eval before trusting it unattended.
 4. **`n_ctx=8192` on the qwen3-8b deployment** — would allow `batch_size=10` again and covers the generation budget. Pairs with the slot change above.
