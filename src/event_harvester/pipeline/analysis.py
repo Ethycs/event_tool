@@ -10,14 +10,28 @@ from event_harvester.observability.tracing import get_tracer
 logger = logging.getLogger("event_harvester.pipeline.analysis")
 tracer = get_tracer("event_harvester.pipeline.analysis")
 
-# The five reject buckets every caller expects, in pipeline order.
-REJECT_BUCKETS = ("classifier", "caps", "reranker", "llm_past", "llm_no_events",
-                  "llm_errors")
+# The reject vocabulary and the free stages moved to `filtering` on 2026-08-14,
+# so that "does this look like an event?" can be asked without paying for the
+# stage that answers "which event is it?". Re-exported here because four
+# modules and a training script import them from this one, and the split is not
+# a reason to move every caller.
+from event_harvester.pipeline.filtering import (  # noqa: E402
+    DROP_KINDS,
+    FILTER_BUCKETS,
+    REJECT_BUCKETS,
+    FilterResult,
+    FunnelImbalance,
+    StageCount,
+    empty_rejects,
+    filter_for_extraction,
+)
 
-
-def empty_rejects() -> dict[str, list[dict]]:
-    """A full reject dict with every bucket present and empty."""
-    return {bucket: [] for bucket in REJECT_BUCKETS}
+__all__ = [
+    "DROP_KINDS", "FILTER_BUCKETS", "REJECT_BUCKETS", "ExtractionResult",
+    "FilterResult", "FunnelImbalance", "StageCount", "empty_rejects",
+    "extract_events_llm", "filter_for_extraction", "prioritize",
+    "prioritize_grouped", "prioritize_with_caps", "score_message",
+]
 
 
 @dataclass
@@ -380,67 +394,12 @@ def extract_events_llm(
         logger.warning("LLM not configured - skipping analysis.")
         return ExtractionResult("", [])
 
-    from event_harvester.pipeline.classifier import filter_actionable as classifier_filter
-    from event_harvester.pipeline.classifier import has_trained_models
-
-    total = len(messages)
-    if caps is None or getattr(caps, "no_cap", False) or caps.total < 0:
-        # Three ways a caller says "don't cap this run", all equivalent here:
-        #   caps=None      -- the orchestrator's unlimited_caps path, which is
-        #                     what CLI `--only` takes. This used to fall through
-        #                     to a literal 150, so `--only` silently trimmed to
-        #                     the default total after advertising no caps.
-        #   caps.no_cap    -- the UI checkbox / MCP no_cap param / profile flag.
-        #   caps.total < 0 -- the -1 "unlimited" sentinel (e.g. CAP_TOTAL=-1).
-        # Use the message count itself as the rerank top_k so nothing is dropped.
-        cap_total = max(total, 1)
-    else:
-        cap_total = caps.total
-
-    rejects: dict[str, list[dict]] = empty_rejects()
-
-    if has_trained_models():
-        after_clf = classifier_filter(messages)
-        n_after_clf = len(after_clf)
-        clf_ids = {id(m) for m in after_clf}
-        rejects["classifier"] = [m for m in messages if id(m) not in clf_ids]
-
-        if caps:
-            after_caps = prioritize_with_caps(after_clf, caps)
-        else:
-            after_caps = sorted(after_clf, key=score_message, reverse=True)[:cap_total]
-
-        caps_ids = {id(m) for m in after_caps}
-        rejects["caps"] = [m for m in after_clf if id(m) not in caps_ids]
-
-        try:
-            from event_harvester.pipeline.reranker import rerank_messages
-            filtered = rerank_messages(after_caps, top_k=cap_total)
-        except ImportError:
-            logger.warning("sentence-transformers not installed, falling back to regex priority.")
-            filtered = sorted(after_caps, key=score_message, reverse=True)
-
-        filtered_ids = {id(m) for m in filtered}
-        rejects["reranker"] = [m for m in after_caps if id(m) not in filtered_ids]
-
-        logger.info(
-            "Event extraction: %d -> %d (classifier) -> %d (caps) -> %d (rerank/score) -> LLM (%s)",
-            total, n_after_clf, len(after_caps), len(filtered), cfg.display_name,
-        )
-    else:
-        # No classifier — score, then per-source cap (or global cap)
-        if caps:
-            filtered = prioritize_with_caps(messages, caps)
-        else:
-            filtered = prioritize(messages, max_messages=cap_total)
-
-        filtered_ids = {id(m) for m in filtered}
-        rejects["caps"] = [m for m in messages if id(m) not in filtered_ids]
-
-        logger.info(
-            "Event extraction: %d -> %d messages (priority) -> LLM (%s)",
-            total, len(filtered), cfg.display_name,
-        )
+    # The free stages, and their arithmetic. Everything above the LLM lives in
+    # `filtering` now so it can be run without one — see that module's
+    # docstring and `01 - Design/04 - Decomposing the Pipeline.md`.
+    filtered_result = filter_for_extraction(messages, caps, label=cfg.display_name)
+    filtered = filtered_result.messages
+    rejects: dict[str, list[dict]] = filtered_result.rejects
 
     # Only the backend that actually runs contributes LLM-stage rejects. The
     # orchestrator used to read them off `_extract_events_cloud` regardless of

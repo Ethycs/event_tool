@@ -1,7 +1,7 @@
 # Decomposing the Pipeline — declared drops, and a funnel that adds up
 
-**Status:** DRAFT — **nothing here is built**. The measurements are real; the design is proposed.
-**Date:** 2026-08-14
+**Status:** 🟡 IN FLIGHT — **sequencing steps 1–2 are built and tested** (`pipeline/filtering.py`, 31 tests); 3 is partly measured; 4–6 are proposed only. Every measurement below is real.
+**Date:** 2026-08-14 · **Revised** the same day, after executing step 1 turned up an error in §8 — see §4.5
 **Applies to:** `pipeline/orchestrator.py`, `pipeline/analysis.py`, and the four `Pipeline` callers
 **Depends on:** `03 - Architecture/00 - System Overview.md` (axiom 1, axiom 3) · `05 - Standards/EH-STD-MSG-v0 — Message Record.md`
 **Origin:** a design exchange with **206-1002** (`blackbox / structure_net research`) over the mesh exchange on 2026-08-14, about the stage pipeline in `gpt2_attack_notions`, `src/cat_scanner/pipeline/`. Their pattern, our risk profile — §2.
@@ -137,7 +137,30 @@ These are different facts and one masquerading as the other cost 251 events. We 
 
 An `unreached` drop anywhere in a run is grounds for refusing to overwrite a cache, which is currently a special case in `mcp_server._save_latest_events` rather than a property of the funnel.
 
-### 4.5 Terminal events carry a reason
+### 4.5 The extract stage does not balance in messages, and cannot be made to
+
+**Correction, 2026-08-14, found while executing step 1.** An earlier draft of §8 said the extract stage's attribution should be "rewritten to use `_source_ids`". That is wrong twice over, and the reason is worth recording because it changes what the fix is.
+
+- **`_source_ids` is deliberately partial.** `analysis.attach_source_ids` matches only on a verbatim link or an author match, and *"ambiguity resolves to no id rather than a guess"* — it was built for Gmail labelling, where a mislabelled message writes to a real mailbox. Measured on the live cache: **95 of 244 events (39%) carry no `_source_ids` at all**, 88 of them web. That is the design working, not failing.
+- **It points the wrong way.** It links an event back to a message — the *surviving* direction. Drop accounting needs the messages that produced nothing.
+
+And the deeper problem: **messages in and events out are different types.** A batch of 5 producing 2 events does not tell you which 3 messages produced nothing — one message can yield two events. Per-message attribution of `llm_no_events` is *not derivable from the model's output*. The original per-batch implementation was not carelessness; the unit genuinely does not decompose.
+
+So the extract stage is `cardinality: "expanding"` and its invariant is stated in the unit that *does* survive — messages consumed:
+
+```
+n_in == attributed + consumed_unattributable + unreached
+```
+
+| Term | Meaning |
+|---|---|
+| `attributed` | a link or author match pinned it to an event (`_source_ids`, the 61%) |
+| `consumed_unattributable` | in a batch the model answered; which message yielded what is unknowable |
+| `unreached` | `llm_errors` — never sent, or the call failed |
+
+Events produced is a **separate number that does not participate in the message balance**. This is a smaller change than the doc originally proposed: no attribution rewrite, one new bucket, and the ~530 messages currently invisible become a named category instead of being pinned to a reason that cannot be computed. Naming the unknowable as unknowable is the honest version, and it still makes the sum checkable.
+
+### 4.6 Terminal events carry a reason
 
 206-1002's parting observation, and our failure family for the third time in one exchange: their `complete` event fires from a `finally`, so a cancelled run and a finished run emit **the same event shape** with different numbers, and nothing marks which is which. If our Stop lands 25 minutes into a harvest, the terminal record must say `cancelled` explicitly — otherwise a Stop is indistinguishable from a quiet night, which is exactly incident #1 wearing a third costume.
 
@@ -180,14 +203,14 @@ The `has_trained_models()` false branch at `analysis.py:430` has the identical p
 
 ## 8. Sequencing, in priority order
 
-1. **Split the filter stages out of `extract_events_llm`.** Free, no behaviour change, and it is the prerequisite for everything else. Unblocks the onboarding funnel on its own.
-2. **Add the boundary check to the filter stages only**, with reasons hard-coded. Proves the arithmetic on the three stages whose numbers we already trust, before formalising anything.
-3. **Backtest the free funnel** over the 33 configured sources: survived-to-LLM against events actually produced. Cached data, no network, no tokens. **This is a measurement we do not have** and it decides whether the onboarding gate is worth building.
+1. ~~**Split the filter stages out of `extract_events_llm`.**~~ ✅ **Done 2026-08-14** — `pipeline/filtering.py`. `filter_for_extraction` takes no `LLMConfig`; `analysis` re-exports the vocabulary so no caller moved. `validated`: replayed against job `…dcf5`'s own cache, the classifier reproduces **13,126 exactly** and caps **0 exactly**; the reranker differs by 64, of which **60 are provably the calendar** (it keeps only future dates and a day had passed — 60 lost, 0 gained, measured by resolving the same messages against both dates).
+2. ~~**Add the boundary check to the filter stages.**~~ ✅ **Done 2026-08-14.** `StageCount`/`FilterResult.check` assert `n_in == n_out + sum(drops)` per stage and across the section. Raises under pytest, logs at ERROR and records in production (Open Question 2, resolved: an accounting bug must not cost a 24-minute harvest). `EH_STRICT_FUNNEL` forces either. 31 tests, of which the load-bearing ones prove the check *can fail*.
+3. **Backtest the free funnel** — survived-to-LLM against events actually produced. `known rough edge`: **the correlation half is not cleanly answerable from the current cache.** 39% of events carry no `_source_ids` (§4.5), and the cache holds 734 web messages across 92 channel labels rather than 33 named sources. The funnel half *is* measured — per-channel keep rates, and **22 of 92 channels where the free stages keep nothing** — which is the signal the onboarding gate actually needs. Crediting events per source needs either a harvest that records source→event links, or matching on the free-text `source` string, which is fuzzy enough to be worth doing deliberately rather than by accident.
 4. **Formalise `StageContract`** with `cardinality` and `drops`, and reject contract-less stages.
-5. **Move the extract stage onto it** — this is the one that changes behaviour, because the batch→message attribution has to be rewritten to use `_source_ids`.
+5. **Move the extract stage onto it.** Now smaller than originally written — see §4.5. One new bucket for the consumed-but-unattributable messages, not an attribution rewrite.
 6. **Terminal reason on cancellation.** Small, independent, and can land any time.
 
-Steps 1–3 are worth doing even if 4–6 never happen: they deliver the onboarding gate and a number, at no architectural cost.
+Steps 1–2 landed at no architectural cost and are worth having even if 4–6 never happen. Step 3 delivered the funnel numbers but not the correlation.
 
 ---
 
