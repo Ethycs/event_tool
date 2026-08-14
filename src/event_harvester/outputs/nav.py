@@ -49,6 +49,7 @@ from html import escape
 PAGES: tuple[tuple[str, str, str, str], ...] = (
     ("index", ".", "Events", "Everything found, newest harvest"),
     ("calendar", "calendar", "Calendar", "The same events on a month grid"),
+    ("sources", "sources", "Sources", "What is configured, and adding another"),
     ("admin", "admin", "Admin", "Caps, keyword lists and profiles"),
 )
 
@@ -58,6 +59,7 @@ PAGES: tuple[tuple[str, str, str, str], ...] = (
 _SUFFIX = {
     "index": r"(?:index\.html)?",
     "calendar": r"(?:calendar(?:\.html)?)?",
+    "sources": r"(?:sources)?",
     "admin": r"(?:admin)?",
 }
 

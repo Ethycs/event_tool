@@ -233,6 +233,8 @@ class OnboardReport:
     candidates: tuple[PageEvidence, ...] = ()
     best: PageEvidence | None = None
     mode: str | None = None
+    #: One of :data:`SOURCE_KINDS` — direct / search / special.
+    kind: str | None = None
     ics_feed: str | None = None
 
     #: No candidate showed an event signal, so the browser-free pass cannot
@@ -254,7 +256,7 @@ class OnboardReport:
             "redirect_chain": list(self.redirect_chain),
             "already_configured": self.already_configured,
             "changed_url": self.changed_url, "needs_browser": self.needs_browser,
-            "mode": self.mode, "ics_feed": self.ics_feed,
+            "mode": self.mode, "kind": self.kind, "ics_feed": self.ics_feed,
             "best": self.best.to_dict() if self.best else None,
             "candidates": [c.to_dict() for c in self.candidates],
             "warnings": list(self.warnings), "notes": list(self.notes),
@@ -569,6 +571,126 @@ def recommend_mode(ev: PageEvidence, ics_feed: str | None) -> tuple[str, list[st
     return "raw", warnings
 
 
+#: The three shapes a source comes in. This is the taxonomy the control UI
+#: groups by, and it is about **how you get the events**, not about the venue.
+SOURCE_KINDS = {
+    "direct": (
+        "Publishes its calendar. A feed, or a page whose HTML already lists "
+        "dated events. Cheapest to run and cheapest to trust — nothing has to "
+        "be driven, and a feed gives one item per event instead of one blob "
+        "per page."
+    ),
+    "search": (
+        "Has the events but will not show them until asked. Needs a query, a "
+        "form fill, or a city/date route chosen before anything appears."
+    ),
+    "special": (
+        "Needs machinery of its own. A bot challenge that only a real browser "
+        "clears (erobay), a platform with a dedicated mode (Luma, Partiful, "
+        "Instagram), or a listing that arrives from an XHR rather than the "
+        "HTML (Meetup). These are the ones a generic scraper gets wrong "
+        "quietly rather than loudly."
+    ),
+}
+
+_SPECIAL_MODES = {"luma", "partiful", "instagram", "feed", "chat", "steps"}
+_SEARCH_MODES = {"search"}
+_DIRECT_MODES = {"ics", "rss", "calendar", "raw"}
+
+
+def classify_kind(
+    *,
+    mode: str | None = None,
+    evidence: PageEvidence | None = None,
+    ics_feed: str | None = None,
+    native_chrome: bool = False,
+    has_query: bool = False,
+) -> str:
+    """Which of :data:`SOURCE_KINDS` this source is.
+
+    Ordered most-specific first: a Cloudflare-fronted site that also publishes
+    a feed is still `special`, because the thing that decides how it must be
+    *run* outranks the thing that decides how it is parsed. Erobay is the case
+    — it answers 403 to a plain request and 43 of the last harvest's 244 events
+    came from it, so misfiling it as `direct` would be an expensive tidy.
+    """
+    if native_chrome or (evidence is not None and evidence.blocked):
+        return "special"
+    if mode in _SPECIAL_MODES:
+        return "special"
+    if mode in _SEARCH_MODES or has_query:
+        return "search"
+    if ics_feed or mode in _DIRECT_MODES:
+        return "direct"
+    return "special"
+
+
+# ── feeds handed to us directly ────────────────────────────────────────────
+
+_FEED_URL_RE = re.compile(
+    r"\.(?:ics|rss|atom|xml)(?:$|\?)|/feed/?$|[?&]ical=1|^webcal://", re.I,
+)
+
+
+def looks_like_feed_url(url: str) -> str | None:
+    """Is the URL *itself* a feed? Returns the kind, or ``None``.
+
+    Configured sources are frequently already pointed at a feed —
+    `bottom-of-the-hill` at an RSS URL, `dnalounge` at `webcal://…/dnalounge.ics`.
+    Fetching those as HTML finds no links and no dates, so the reasoning below
+    would confidently recommend `raw` for the one source the blueprint holds up
+    as the RSS success story (65 events against `raw`'s 1). Detect and stop.
+    """
+    if not _FEED_URL_RE.search(url or ""):
+        return None
+    low = url.lower()
+    if low.startswith("webcal://") or ".ics" in low or "ical=1" in low:
+        return "ics"
+    return "rss"
+
+
+def validate_rss(url: str, timeout_s: int = 12) -> tuple[int, int]:
+    """Fetch an RSS/Atom feed and return ``(items, items_with_dates)``.
+
+    **A site-wide `/feed/` is usually the blog, not the calendar.** Six sources
+    in the 2026-08-14 sweep were about to be "upgraded" from a working scrape
+    to a WordPress blog feed on nothing more than the feed's existence — one of
+    them literally `sfoasis.com/blog?format=rss`. Existence is not evidence;
+    dated items are. This is the RSS analogue of what `feed_probe._validate`
+    already does for iCalendar, and it exists for the same reason.
+    """
+    import requests
+
+    try:
+        r = requests.get(
+            url, timeout=timeout_s,
+            headers={"User-Agent": USER_AGENT, "Accept": "application/rss+xml,*/*"},
+        )
+        if r.status_code >= 400:
+            return 0, 0
+        body = r.text[:MAX_HTML_BYTES]
+    except Exception as e:  # noqa: BLE001
+        logger.debug("onboard: rss validate failed for %s: %s", url, e)
+        return 0, 0
+
+    entries = re.split(r"<(?:item|entry)\b", body, flags=re.I)[1:]
+    dated = 0
+    for entry in entries:
+        # An events feed dates its *contents*; a blog feed dates its posts, so
+        # pubDate alone proves nothing. Look for a date in the title or the
+        # body text, which is where an event feed puts when the thing happens.
+        head = entry[:1500]
+        text = _extract_text(head)
+        if _DECIMATE_DATE_RE.search(text):
+            dated += 1
+    return len(entries), dated
+
+
+#: Below this many dated items, a feed is treated as a blog rather than a
+#: calendar. Two is deliberate: one dated post is a coincidence in any blog.
+RSS_DATED_MIN = 2
+
+
 def _configured_match(url: str) -> str | None:
     """Is this host already configured? Step 1, and free."""
     try:
@@ -595,6 +717,7 @@ def explore(
     max_candidates: int = 6,
     probe_ics: bool = True,
     check_configured: bool = True,
+    validate_feeds: bool = True,
 ) -> OnboardReport:
     """Run the whole browser-free workflow and return what it found.
 
@@ -617,6 +740,20 @@ def explore(
                 )
                 span.set_attribute("onboard.already_configured", True)
                 return report
+
+        # A URL that is already a feed is the answer, not a page to reason
+        # about. Fetching it as HTML finds nothing and recommends `raw`.
+        if (feed_kind := looks_like_feed_url(url)):
+            report.mode = feed_kind
+            report.kind = "direct"
+            if feed_kind == "ics":
+                report.ics_feed = url
+            report.notes.append(
+                f"The URL supplied is already {feed_kind.upper()}. Nothing to "
+                f"choose — a feed gives one item per event, which is the "
+                f"outcome the rest of this reasoning is trying to reach."
+            )
+            return report
 
         html, chain, ev = fetch(url, timeout_s=timeout_s)
         report.final_url = ev.url
@@ -703,9 +840,31 @@ def explore(
                 f"anything; the recommendation here is withheld, not zero."
             )
 
+        # A feed has to earn the recommendation. Existence is not evidence —
+        # `/feed/` on a WordPress venue site is the blog, and swapping a
+        # working scrape for it would be a downgrade wearing an upgrade's name.
+        if validate_feeds and report.best and report.best.rss_feeds:
+            kept: list[str] = []
+            for feed_url in report.best.rss_feeds:
+                items, dated = validate_rss(feed_url, timeout_s=timeout_s)
+                if dated >= RSS_DATED_MIN:
+                    kept.append(feed_url)
+                    report.notes.append(
+                        f"RSS with {dated} dated item(s) of {items}: {feed_url}"
+                    )
+                else:
+                    report.notes.append(
+                        f"Ignored {feed_url} — {items} item(s), only {dated} "
+                        f"dated. Reads as a blog feed, not a calendar."
+                    )
+            report.best.rss_feeds = tuple(kept)
+
         if report.best:
             report.mode, mode_warnings = recommend_mode(report.best, report.ics_feed)
             report.warnings.extend(mode_warnings)
+            report.kind = classify_kind(
+                mode=report.mode, evidence=report.best, ics_feed=report.ics_feed,
+            )
             if report.changed_url:
                 report.notes.append(
                     f"Configure {report.best.url} — not the URL supplied. "

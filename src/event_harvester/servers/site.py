@@ -343,7 +343,10 @@ def build_app(cfg, *, interval_hours: float = DEFAULT_INTERVAL_HOURS,
     # Control UI.md` §2, "one origin, split routes". It writes config, so its
     # handlers validate against closed vocabularies and write atomically; see
     # that module's docstring for what this origin still lacks.
+    # `/sources` is read-mostly and its one mutation is an append to an attempt
+    # log — it proposes a configuration, it never writes the source config.
     from event_harvester.servers.admin import build_routes as admin_routes
+    from event_harvester.servers.sources_page import routes as sources_routes
 
     routes = [
         Route("/", index),
@@ -351,6 +354,7 @@ def build_app(cfg, *, interval_hours: float = DEFAULT_INTERVAL_HOURS,
         Route("/events.json", events_json),
         Route("/healthz", healthz),
         Route("/refresh", refresh_now, methods=["POST"]),
+        *sources_routes(),
         *admin_routes(),
     ]
     prefix = normalise_prefix(root_path)
