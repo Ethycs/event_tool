@@ -93,9 +93,14 @@ class TestFingerprintStore:
         monkeypatch.setattr("event_harvester.pipeline.event_match.FINGERPRINT_FILE", tmp_file)
 
     def test_save_and_find(self):
+        # Relative, not literal. This read `"2026-08-14"` and passed for a
+        # year, then failed on 2026-08-15 — `_load` prunes any fingerprint
+        # dated before today (`event_match.py:196`), so the literal made the
+        # test assert "a future event round-trips" only while that date
+        # happened to be in the future.
         event = {
             "title": "HOPE 26",
-            "date": "2026-08-14",
+            "date": (date.today() + timedelta(days=30)).isoformat(),
             "time": "09:00",
             "location": "New York",
             "link": "https://hope.net",

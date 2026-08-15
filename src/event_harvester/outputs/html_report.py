@@ -207,6 +207,7 @@ _STYLE = """
 :root {
   --bg: #ffffff; --fg: #16181d; --muted: #5b6472; --line: #e4e7ec;
   --card: #ffffff; --accent: #7c3aed; --chip: #f2f4f7; --shadow: 0 1px 2px rgba(16,24,40,.06);
+  --bad: #d92d20;
 
   /* ── Type scale: fluid, and saturating ─────────────────────────────
      Each step interpolates between its phone value at 375px and its
@@ -240,6 +241,7 @@ _STYLE = """
   :root {
     --bg: #0f1115; --fg: #e8eaed; --muted: #98a2b3; --line: #242832;
     --card: #171a21; --accent: #a78bfa; --chip: #212530; --shadow: none;
+    --bad: #f87171;
   }
 }
 * { box-sizing: border-box; }
@@ -327,6 +329,34 @@ body.carousel .shelf .card {
   contain-intrinsic-size: auto 260px;
 }
 .card .actions { margin-top: auto; }
+
+/* Dismiss, top-right, over everything on the card.
+   `position: relative` here is load-bearing: `.thumb` bleeds past the card's
+   padding on a negative margin to meet the rounded corners, so without a
+   positioning context and a z-index above it the button would sit *under* the
+   picture on exactly the cards that have one. */
+.card { position: relative; }
+.dismiss {
+  position: absolute; top: 6px; right: 6px; z-index: 3;
+  width: 28px; height: 28px; padding: 0; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--bg); color: var(--bad);
+  font-weight: 700; font-size: var(--fs-base); line-height: 1;
+  display: inline-flex; align-items: center; justify-content: center;
+  cursor: pointer; opacity: .8; box-shadow: var(--shadow);
+}
+.dismiss:hover, .dismiss:focus-visible {
+  opacity: 1; background: var(--bad); border-color: var(--bad); color: #fff;
+}
+/* The count doubles as the way back when anything is hidden. */
+.count.restorable { cursor: pointer; text-decoration: underline dotted; }
+#toast .toast-action {
+  margin-left: 12px; padding: 2px 10px; min-height: 0; border-radius: 999px;
+  border: 1px solid rgba(255,255,255,.55); background: transparent;
+  color: #fff; font: inherit; font-weight: 700; cursor: pointer;
+}
+/* The base rule turns pointer events off so a toast never eats a click. One
+   carrying an Undo has to take them back, or the button is decorative. */
+#toast.actionable { pointer-events: auto; }
 .bar select, .bar button {
   flex: 0 0 auto; padding: 9px 12px; min-height: 40px; font-size: var(--fs-sm);
   color: var(--fg); background: var(--chip); border: 1px solid var(--line);
@@ -424,6 +454,12 @@ footer { color: var(--muted); font-size: var(--fs-xs); padding: 24px 16px; text-
   .chip { min-height: 40px; padding: 9px 14px; }
   a.btn, button.btn, .bar select, .bar button { min-height: 44px; }
   input[type=search] { min-height: 44px; }
+  /* 28px is a mouse target. On a thumb it is both hard to hit and easy to hit
+     by accident while scrolling, and this one removes a card. Only the box
+     grows — the glyph stays on `--fs-base`, because a literal size here would
+     be the second place a font size is declared, which is the thing the type
+     scale exists to prevent. */
+  .dismiss { width: 44px; height: 44px; top: 4px; right: 4px; }
 }
 """
 
@@ -452,9 +488,67 @@ function detailText(ev) {
     .join(' — ');
 }
 
+// ── Dismissal ────────────────────────────────────────────────────────────
+//
+// Kept in localStorage, not on the server, and that is forced rather than
+// chosen: this file is meant to be forwarded, and a forwarded copy has no
+// origin to POST to. A dismissal is therefore per-browser — which is the
+// honest scope for "I don't want to see this", as distinct from `decline`,
+// which is a judgement about the event and belongs in the fingerprint store.
+//
+// Keyed by content rather than by index, because the poll below swaps `DATA`
+// wholesale on the next harvest and an index would then dismiss a stranger.
+const DISMISS_KEY = 'eh-dismissed';
+
+function keyOf(ev) {
+  return [ev.title, ev.date, ev.link || ev.location || ''].join('|');
+}
+
+let dismissed = new Set();
+try {
+  dismissed = new Set(JSON.parse(localStorage.getItem(DISMISS_KEY) || '[]'));
+} catch (e) { /* file://, private mode, or corrupt — start empty */ }
+
+function saveDismissed() {
+  try {
+    localStorage.setItem(DISMISS_KEY, JSON.stringify([...dismissed]));
+  } catch (e) { /* dismissal still works for this page view */ }
+}
+
+function dismiss(ev) {
+  const k = keyOf(ev);
+  dismissed.add(k);
+  saveDismissed();
+  render();
+  toast('Dismissed “' + ev.title + '”', {
+    label: 'Undo',
+    onclick: () => { dismissed.delete(k); saveDismissed(); render(); },
+  });
+}
+
+function restoreAll() {
+  if (!dismissed.size) return;
+  const n = dismissed.size;
+  dismissed.clear();
+  saveDismissed();
+  render();
+  toast('Restored ' + n + ' event' + (n === 1 ? '' : 's') + '.');
+}
+
 function card(ev) {
   const el = document.createElement('article');
   el.className = 'card';
+
+  // First in DOM order so it is the card's first tab stop — the control that
+  // removes something should not be reachable only after reading it all.
+  const x = document.createElement('button');
+  x.className = 'dismiss';
+  x.type = 'button';
+  x.textContent = '×';                       // multiplication sign, not "x"
+  x.title = 'Dismiss this event';
+  x.setAttribute('aria-label', 'Dismiss ' + ev.title);
+  x.addEventListener('click', e => { e.stopPropagation(); dismiss(ev); });
+  el.appendChild(x);
 
   // Thumbnail first, and only when there is one — an empty box where a
   // picture should be reads as broken, whereas no box just reads as text.
@@ -561,6 +655,7 @@ function matching() {
   // matching either word.
   const terms = q ? q.split(/\s+/) : [];
   return DATA.filter(ev => {
+    if (dismissed.has(keyOf(ev))) return false;
     // The two chip rows are independent axes and AND together: "SF" plus
     // "web" means SF events from web sources, not one or the other.
     if (activeSource && ev.platform !== activeSource) return false;
@@ -585,7 +680,16 @@ function render() {
   const token = ++renderToken;
   main.textContent = '';
   const matches = matching().sort(SORTS[sortBy.value] || SORTS.date);
-  countEl.textContent = matches.length + ' of ' + DATA.length;
+
+  // Say how many are hidden, and make that the way back. An event that
+  // vanishes with no trace and no undo is indistinguishable from a bug, and
+  // the toast's Undo is gone four seconds later.
+  const hidden = DATA.reduce((n, ev) => n + (dismissed.has(keyOf(ev)) ? 1 : 0), 0);
+  countEl.textContent = matches.length + ' of ' + (DATA.length - hidden) +
+    (hidden ? ' · ' + hidden + ' dismissed' : '');
+  countEl.classList.toggle('restorable', hidden > 0);
+  countEl.title = hidden ? 'Click to restore ' + hidden + ' dismissed event(s)' : '';
+  countEl.onclick = hidden ? restoreAll : null;
 
   if (!matches.length) {
     const p = document.createElement('p');
@@ -759,16 +863,40 @@ const LIVE = location.protocol === 'http:' || location.protocol === 'https:';
 const POLL_MS = 60000;
 let lastStamp = null;
 
-function toast(message) {
+let toastTimer = null;
+
+function toast(message, action) {
   let el = document.getElementById('toast');
   if (!el) {
     el = document.createElement('div');
     el.id = 'toast';
     document.body.appendChild(el);
   }
-  el.textContent = message;
+  el.textContent = '';                          // textContent, never innerHTML
+  const span = document.createElement('span');
+  span.textContent = message;
+  el.appendChild(span);
+
+  if (action) {
+    const b = document.createElement('button');
+    b.className = 'toast-action';
+    b.type = 'button';
+    b.textContent = action.label;
+    b.addEventListener('click', () => {
+      el.classList.remove('show', 'actionable');
+      action.onclick();
+    });
+    el.appendChild(b);
+  }
+  el.classList.toggle('actionable', !!action);
   el.classList.add('show');
-  setTimeout(() => el.classList.remove('show'), 4000);
+
+  // One timer, cleared on each call: dismissing three cards in a row used to
+  // leave three timers racing, and the first one to fire hid a toast whose
+  // Undo still had seconds left.
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(
+    () => el.classList.remove('show', 'actionable'), action ? 7000 : 4000);
 }
 
 async function poll() {
