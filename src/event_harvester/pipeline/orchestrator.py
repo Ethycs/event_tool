@@ -24,7 +24,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from event_harvester.config import AppConfig, validate_config
@@ -37,6 +38,7 @@ from event_harvester.pipeline.harvest import harvest_messages, save_messages
 from event_harvester.pipeline.weights import extract_links
 from event_harvester.sources import filter_read_sent
 
+logger = logging.getLogger("event_harvester.pipeline.orchestrator")
 tracer = get_tracer("event_harvester.pipeline.orchestrator")
 
 
@@ -68,9 +70,52 @@ class PipelineResult:
     links: list[dict]
     skipped_analysis: bool = False
     no_messages: bool = False
+    #: One line per enabled source that harvested nothing this run. A dead
+    #: source and a quiet one look identical in the totals, which is how
+    #: Discord returned 0 for weeks while the harvest reported ``ok``.
+    source_warnings: list[str] = field(default_factory=list)
 
 
 _ALL_PLATFORMS: tuple[str, ...] = ("discord", "telegram", "gmail", "signal", "web")
+
+
+#: Sources whose 0 is nearly always a fault, not a quiet week. Telegram,
+#: Discord and Gmail are high-volume by nature — a real account produces
+#: chatter every few days — so zero *raw messages* (before any filtering)
+#: means the source is not wired up, not that nothing happened. Signal and web
+#: can be legitimately empty, so their zero is stated but not flagged as wrong.
+_EXPECTED_NONEMPTY = ("telegram", "discord", "gmail")
+
+
+def _source_warnings(
+    source_counts: dict[str, int], no_kwargs: dict[str, bool],
+) -> list[str]:
+    """One line per enabled source that harvested nothing.
+
+    The trigger is 0 *messages*, not 0 events — a source that returns raw
+    messages the model then finds no events in is working. This fires a level
+    earlier, at "the source handed us nothing at all", which is the signal a
+    dead cache path or a revoked credential produces and an empty totals line
+    hides. Discord ran this way for weeks: its desktop cache stopped holding
+    message JSON, the reader returned ``[]``, and the harvest said ``ok``.
+    """
+    warnings: list[str] = []
+    for plat in _ALL_PLATFORMS:
+        if no_kwargs.get(f"no_{plat}"):
+            continue                      # not enabled this run; its 0 is expected
+        if source_counts.get(plat, 0) > 0:
+            continue
+        if plat in _EXPECTED_NONEMPTY:
+            warnings.append(
+                f"{plat}: harvested 0 messages. This source is enabled but "
+                f"returned nothing — usually a missing credential or an "
+                f"unreachable cache path rather than a quiet period."
+            )
+        else:
+            warnings.append(
+                f"{plat}: harvested 0 messages (may simply be quiet)."
+            )
+    return warnings
 
 
 def _empty_rejects() -> dict[str, list]:
@@ -175,6 +220,15 @@ class Pipeline:
                 for plat, n in source_counts.items():
                     span.set_attribute(f"message.count.{plat}", n)
 
+                # A dead source and a quiet one are identical in the totals.
+                # Say which enabled sources handed us nothing, before anything
+                # downstream can mistake it for a slow night.
+                source_warnings = _source_warnings(source_counts, no_kwargs)
+                for w in source_warnings:
+                    self._log(f"⚠ {w}")
+                    logger.warning("source: %s", w)
+                span.set_attribute("harvest.silent_sources", len(source_warnings))
+
             if not all_messages:
                 run_span.set_attribute("pipeline.outcome", "no_messages")
                 return PipelineResult(
@@ -186,6 +240,7 @@ class Pipeline:
                     source_counts=source_counts,
                     links=[],
                     no_messages=True,
+                    source_warnings=source_warnings,
                 )
 
             # ── Filter read/sent (Gmail) ────────────────────────────────
@@ -220,6 +275,7 @@ class Pipeline:
                     source_counts=source_counts,
                     links=links,
                     skipped_analysis=True,
+                    source_warnings=source_warnings,
                 )
 
             # ── Extract events via LLM ──────────────────────────────────
@@ -278,6 +334,7 @@ class Pipeline:
                 rejects=rejects,
                 source_counts=source_counts,
                 links=links,
+                source_warnings=source_warnings,
             )
 
     # ── Reporter helpers (no-op when reporter is None) ──────────────────

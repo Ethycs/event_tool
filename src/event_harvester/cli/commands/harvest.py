@@ -18,6 +18,7 @@ from event_harvester.ui.display import (
     DIM,
     GREEN,
     RESET,
+    YELLOW,
     print_links,
     print_message,
 )
@@ -90,6 +91,8 @@ async def harvest_cmd(args, cfg) -> int:
 
     if result.no_messages:
         print("No messages found. Check credentials / cache and try again.")
+        for w in result.source_warnings:
+            print(f"  {YELLOW}⚠ {w}{RESET}")
         return 0
 
     # ── Print harvested messages + per-platform counts ──────────────────
@@ -103,7 +106,10 @@ async def harvest_cmd(args, cfg) -> int:
     )
     if sc["web"]:
         counts += f", Web: {sc['web']}"
-    print(f"{DIM}Total: {len(result.all_messages)}  ({counts}){RESET}\n")
+    print(f"{DIM}Total: {len(result.all_messages)}  ({counts}){RESET}")
+    for w in result.source_warnings:
+        print(f"  {YELLOW}⚠ {w}{RESET}")
+    print()
 
     n_filtered = len(result.all_messages) - len(result.actionable)
     if n_filtered:

@@ -383,6 +383,12 @@ async def run_event_pipeline(
     # safe pass-through with a sort for deterministic order.
     source_counts = {p: result.source_counts.get(p, 0) for p in sorted(VALID_PLATFORMS)}
 
+    # Config warnings (missing credential, TLS) come from `validate` before the
+    # run; source warnings (an enabled source that harvested nothing) come from
+    # the run itself. Both are things the operator needs to see, so they share
+    # one channel rather than the run-time one being buried in the log.
+    warnings = list(warnings) + list(result.source_warnings)
+
     if result.skipped_analysis or result.no_messages:
         stats = {
             "total_messages": len(result.all_messages),
