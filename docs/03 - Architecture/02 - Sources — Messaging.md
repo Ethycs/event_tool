@@ -1,6 +1,6 @@
 # Sources — Messaging (non-web)
 
-**Status:** CURRENT · **Date:** 2026-07-29 · **Applies to:** `src/event_harvester/sources/__init__.py`, `src/event_harvester/sources/discord.py`, `src/event_harvester/sources/telegram.py`, `src/event_harvester/sources/gmail.py`, `src/event_harvester/sources/signal.py`, `src/event_harvester/sources/chromium_cache.py`, `scripts/auth_telegram.py`, `tests/test_discord.py` · **Depends on:** `src/event_harvester/config.py`, `src/event_harvester/pipeline/harvest.py`
+**Status:** CURRENT · **Date:** 2026-08-17 (Discord cache found dead; scheduled-events path added) · **Applies to:** `src/event_harvester/sources/__init__.py`, `src/event_harvester/sources/discord.py`, `src/event_harvester/sources/discord_events.py`, `integrations/discord-betterdiscord-plugin/`, `src/event_harvester/sources/telegram.py`, `src/event_harvester/sources/gmail.py`, `src/event_harvester/sources/signal.py`, `src/event_harvester/sources/chromium_cache.py`, `scripts/auth_telegram.py`, `tests/test_discord.py` · **Depends on:** `src/event_harvester/config.py`, `src/event_harvester/pipeline/harvest.py`
 
 Four independent message sources — Discord, Telegram, Gmail, Signal — each emit a list of message dicts in a loosely shared schema that `pipeline/harvest.py` gathers concurrently and concatenates. A fifth module, `chromium_cache.py`, is a generic Chromium-cache reader that is exported from the package but, as far as this repo's own code goes, has no caller — Discord has its own duplicate cache-reading logic instead. The five modules disagree on what `channel`, `author`, and `is_sent`/`pinned`-style flags mean, which matters because everything downstream (`filter_read_sent`, the LLM extractor) reads the merged list as if it were one schema.
 
@@ -24,6 +24,15 @@ Four independent message sources — Discord, Telegram, Gmail, Signal — each e
 
 ## `discord.py`
 
+> **The cache is dead — measured 2026-08-16.** A live scan found **0 of 4,257**
+> cache entries matching `/channels/{id}/messages`: Discord no longer writes
+> message responses to the desktop HTTP cache (they arrive over the gateway
+> websocket and stay in memory). So the scraping described below now yields
+> nothing on a current client, and the source's real output comes from
+> **`discord_events.py`** (guild *scheduled events*, via a client-mod export).
+> `read_discord_messages` was refactored to a thin merge of both halves so a
+> dead cache no longer early-returns before the scheduled events are read.
+
 **Domain:** Local Chromium BlockFile HTTP-cache scraping for Discord's own web client (Discord's desktop app is Electron/Chromium under the hood, so its message-fetch responses land in the same on-disk cache format Chrome uses).
 **Runs at:** Sync function, invoked from `pipeline/harvest.py:_run_discord` via `asyncio.to_thread(read_discord_messages, ...)` — off the event loop, in a worker thread.
 **Inputs:** No credentials. `cache_path` (optional direct `Path`), `override_path` (str, from `DISCORD_CACHE_PATH` env via `cfg.discord.cache_path`), `cutoff: datetime`.
@@ -42,6 +51,58 @@ Four independent message sources — Discord, Telegram, Gmail, Signal — each e
 - **known rough edge:** the module duplicates `_decompress`/cache-copy/BlockFileCache-iteration logic that already exists, more generically, in `chromium_cache.py` (`decompress`, `read_cache_entries`). The two implementations have already drifted (different URL-pattern handling, different platform coverage) — a bug fixed in one will not propagate to the other.
 - Malformed cache entries (bad JSON, decode errors) are swallowed per-message inside a broad `except Exception: continue` — failures here are invisible unless you add logging.
 - `tests/test_discord.py` only exercises the pure function `_parse_message_blobs` (8 cases: array, single dict, mixed-type array, empty/None body, invalid JSON, missing-`id`, leading whitespace, UTF-8 content). **known rough edge:** `find_discord_cache`, `_find_cache_wsl`, `_decompress`, and the `ChromiumBlockFileCache` integration in `read_discord_messages` are entirely untested.
+
+
+## `discord_events.py` — guild scheduled events · **added 2026-08-17**
+
+**Domain:** Guild *scheduled events* read from the running client's in-memory
+`GuildScheduledEventStore`, which was never in the HTTP cache. Since the cache
+scraping now returns nothing (banner above), this is the only Discord path that
+produces anything.
+
+**Runs at:** Pure Python, called from `read_discord_messages` on every Discord
+harvest. No browser, no network, no credentials.
+
+**Inputs:** A local JSON file a client-mod plugin writes —
+`%APPDATA%\discord-harvester\scheduled-events.json` (Windows) or
+`~/.config/discord-harvester/scheduled-events.json`, overridable with
+`DISCORD_EVENTS_EXPORT`. The plugin lives in
+`integrations/discord-betterdiscord-plugin/` and only reads the Flux store and
+writes that one file — it sends no message and makes no network request.
+
+**Outputs:** `discord` message records. A scheduled event is already structured
+(exact start, title, external-event location), but it flows through the normal
+pipeline as a message whose `content` **states the date in plain text**, so the
+local model resolves it from the same slice it reads (the pre-dated-message
+pattern). Keeping one pipeline beats saving one cheap LLM call.
+
+### Rules that earn their place
+
+- **UTC → local machine zone.** Discord stores `scheduled_start_time` in UTC;
+  the reader converts to the machine's local zone before writing it into
+  content, because the harvester runs on the viewer's machine. A 7pm event
+  stored as next-day 02:00Z must not read as 2am.
+- **`timestamp` is ingestion time, not the event start.** A future timestamp
+  would confuse recency scoring and the days-back cutoff. The event's date is
+  in `content`; the record is stamped *now*.
+- **Dropped:** past events, and status ∉ {SCHEDULED(1), ACTIVE(2)} — a
+  completed or cancelled event is not an invitation.
+- **A missing/corrupt/absent file is a quiet empty**, and the 0-message source
+  warning (`orchestrator._source_warnings`) covers the "Discord returned
+  nothing" case. A stale export (>24h) is logged but still used — a scheduled
+  event for next week is valid even if dumped two days ago.
+
+### Why not a bot
+
+The supported read is a bot with the `GUILD_SCHEDULED_EVENTS` intent, but it
+needs *Manage Server* to invite. The client-mod path works on any guild you are
+a member of. Client mods are technically against Discord's ToS (client
+modification), unenforced for passive read-only use — see the plugin README for
+the honest framing. Where you have admin, prefer the bot.
+
+Covered by `tests/test_discord_events.py` (18 cases, all offline). The plugin
+itself is **untested in a live client** at time of writing — authored against
+Discord's documented Flux store and event names, defensively.
 
 ## `telegram.py`
 

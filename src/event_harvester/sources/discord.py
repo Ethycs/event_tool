@@ -112,7 +112,47 @@ def read_discord_messages(
     cache_path: Optional[Path] = None,
     override_path: Optional[str] = None,
 ) -> list[dict]:
-    """Read cached Discord messages newer than cutoff."""
+    """Read Discord messages newer than ``cutoff``.
+
+    Two sources, merged: the desktop HTTP cache (historically the whole of it)
+    and the client-mod scheduled-events export (``discord_events``). The cache
+    read is best-effort and never aborts the function -- as of 2026-08-16 it
+    yields nothing, because Discord stopped writing message JSON there, and the
+    export is the only path that produces anything. An early ``return`` on a
+    missing cache would therefore have discarded the scheduled events too.
+    """
+    messages = _read_cache_messages(cutoff, cache_path, override_path)
+    seen_ids = {m["id"] for m in messages}
+
+    # Guild scheduled events from the client-mod export. Always attempted,
+    # regardless of the cache read above.
+    from event_harvester.sources.discord_events import read_scheduled_events
+    for rec in read_scheduled_events():
+        if rec["id"] in seen_ids:
+            continue
+        seen_ids.add(rec["id"])
+        messages.append(rec)
+
+    messages.sort(key=lambda m: m["timestamp"])
+    logger.info(
+        "Discord: %d message(s) since %s UTC",
+        len(messages), cutoff.strftime("%Y-%m-%d %H:%M"),
+    )
+    set_span_attrs(**{"message.count": len(messages)})
+    return messages
+
+
+def _read_cache_messages(
+    cutoff: datetime,
+    cache_path: Optional[Path] = None,
+    override_path: Optional[str] = None,
+) -> list[dict]:
+    """Parse Discord's Chromium block-file cache. Empty on any failure.
+
+    Kept as its own function so a missing or unreadable cache is a *quiet
+    empty*, not an early return from the caller -- the scheduled-events merge
+    must run either way.
+    """
     if cache_path is None:
         cache_path = find_discord_cache(override_path)
     if cache_path is None:
@@ -191,10 +231,4 @@ def read_discord_messages(
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
-    messages.sort(key=lambda m: m["timestamp"])
-    logger.info(
-        "Discord: %d message(s) since %s UTC",
-        len(messages), cutoff.strftime("%Y-%m-%d %H:%M"),
-    )
-    set_span_attrs(**{"message.count": len(messages)})
     return messages
