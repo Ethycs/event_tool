@@ -70,3 +70,51 @@ for guilds where you are only a member.
 documented Flux store and event names, defensively (it tries several store
 method shapes). The harvester-side reader *is* covered by offline tests. If the
 store shape differs on your build, the console line and the toast will say so.
+
+---
+
+# HarvesterMessageCapture — passive message capture
+
+A second plugin in this folder. It records the messages **you load by browsing**
+— as you open channels and scroll, it writes what your client already fetched to
+local JSONL, one file per channel, under
+`%APPDATA%\discord-harvester\messages\`.
+
+## Why this is safe where bulk export is not
+
+Bulk history export drives your account to make thousands of automated requests
+— that is self-botting, and the pattern Discord bans for. This makes **zero**
+requests of its own. It subscribes to the Flux events Discord fires when the
+client loads messages *because you opened a channel or scrolled*, and records
+what arrived. Discord sees a person reading Discord, because that is what is
+happening. There is deliberately **no auto-scroll and no fetch** — adding either
+would turn it back into the thing it avoids.
+
+The trade: it captures only what you actually load. To archive ~3 months of a
+channel, open it and scroll up until you reach that date. That scrolling is you,
+not automation.
+
+## Install & use
+
+1. Copy `HarvesterMessageCapture.plugin.js` into your BetterDiscord plugins
+   folder (same place as the scheduled-events plugin) and enable it.
+2. Browse the servers/channels you care about. Scroll up in each to load the
+   history you want captured. A toast confirms it started; the console logs the
+   output path.
+3. Bundle what you captured into a zip in your Downloads folder:
+   ```powershell
+   pixi run python scripts/zip_discord_capture.py
+   ```
+   It dedups by message id (the plugin appends without deduping, on purpose —
+   simple and crash-safe), sorts by time, and writes
+   `discord_capture_<timestamp>.zip` with a `manifest.json` index.
+
+Move the capture directory with `DISCORD_CAPTURE_DIR` if needed (set it for both
+the plugin's environment and the zip script).
+
+## Status
+
+**Untested in a live client** at time of writing — written against Discord's
+documented Flux events (`LOAD_MESSAGES_SUCCESS`, `MESSAGE_CREATE`,
+`MESSAGE_UPDATE`), defensively. The zip/dedup half is covered by an offline
+test. Check the console line and the growing `.jsonl` files after browsing.
