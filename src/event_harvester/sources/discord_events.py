@@ -140,6 +140,11 @@ def scheduled_events_to_messages(
             "channel": guild or "Scheduled Events",
             "content": _content(ev, start, end),
         }
+        # A cover flyer often carries the date/venue as pixels; hand its URL to
+        # the OCR enrichment pass (pipeline/ocr_enrich) via the `images` field.
+        image = str(ev.get("image") or "").strip()
+        if image:
+            rec["images"] = [image]
         out.append(rec)
 
     out.sort(key=lambda m: m["id"])

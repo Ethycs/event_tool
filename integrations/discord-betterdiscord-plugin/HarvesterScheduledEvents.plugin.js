@@ -140,6 +140,11 @@ module.exports = class HarvesterScheduledEvents {
             entity_type: ev.entityType != null ? ev.entityType : ev.entity_type,
             status: ev.status,
             creator: (ev.creator && ev.creator.username) || "",
+            // Cover flyer, if any. GSE `image` is a hash; the harvester
+            // OCRs this URL for date/venue text that lives only in the art.
+            image: ev.image
+                ? `https://cdn.discordapp.com/guild-events/${ev.id}/${ev.image}.png?size=1024`
+                : "",
         }));
         return { exported_at: new Date().toISOString(), source: "betterdiscord", events };
     }

@@ -243,6 +243,21 @@ class Pipeline:
                     source_warnings=source_warnings,
                 )
 
+            # ── OCR enrichment (flyer images -> text) ───────────────────
+            # Event invites are often flyers; the date/venue live in the image.
+            # A source's job is to populate `images`; this one place OCRs them
+            # and folds the text into `content` before any filtering sees it.
+            # Additive and non-fatal -- disabled or unreachable is a clean no-op.
+            if self.cfg.ocr.enabled:
+                await self._checkpoint()
+                with self._stage("ocr") as span:
+                    from event_harvester.pipeline.ocr_enrich import enrich_messages
+                    n_ocr = await asyncio.to_thread(
+                        enrich_messages, all_messages, self.cfg.ocr)
+                    span.set_attribute("ocr.enriched", n_ocr)
+                    if n_ocr:
+                        self._log(f"OCR: enriched {n_ocr} message(s) from flyer images.")
+
             # ── Filter read/sent (Gmail) ────────────────────────────────
             await self._checkpoint()
             with self._stage("filter") as span:

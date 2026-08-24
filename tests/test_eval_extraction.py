@@ -10,6 +10,8 @@ produce a confident number that means nothing.
 
 from __future__ import annotations
 
+from datetime import date, timedelta
+
 import json
 
 import pytest
@@ -56,6 +58,11 @@ def _cache(tmp_path, n=40):
     path.write_text(json.dumps({"messages": messages}), encoding="utf-8")
     return path
 
+
+# Relative, not literal: the real parser drops past-dated events (llm_past),
+# so a hardcoded date turns this into a time-bomb that fails once it rolls
+# into the past (it did, on 2026-08-23).
+_FUTURE_DATE = (date.today() + timedelta(days=30)).isoformat()
 
 class TestTheSampleIsIdentical:
     """A difference between models must be the model, not the draw."""
@@ -135,7 +142,7 @@ class TestItJudgesWithTheRealParser:
     def test_a_good_reply_is_parsed(self, tmp_path, monkeypatch):
         from event_harvester.training import eval_extraction as mod
 
-        ini = ("[Event.1]\ntitle = Queer Night\ndate = 2026-08-20\n"
+        ini = ("[Event.1]\ntitle = Queer Night\ndate = " + _FUTURE_DATE + "\n"
                "time = 21:00\nlocation = The Stud\nlink = https://lu.ma/x\n")
         monkeypatch.setattr(mod, "_call", lambda *a, **k: (ini, None))
         result = run_model("good/model", load_sample(2, 10, _cache(tmp_path)))
@@ -147,7 +154,7 @@ class TestItJudgesWithTheRealParser:
         judged by a lenient parser would score better here than in production."""
         from event_harvester.training import eval_extraction as mod
 
-        ini = ("[Event.1]\ntitle = 50% off drinks\ndate = 2026-08-20\n"
+        ini = ("[Event.1]\ntitle = 50% off drinks\ndate = " + _FUTURE_DATE + "\n"
                "link = https://x.test/a%20b\n")
         monkeypatch.setattr(mod, "_call", lambda *a, **k: (ini, None))
         result = run_model("m", load_sample(1, 10, _cache(tmp_path)))

@@ -349,6 +349,20 @@ class CapConfig:
 
 
 @dataclass
+class OCRConfig:
+    """Flyer OCR via the infra's GLM-OCR Triton service.
+
+    Off by default: it depends on an endpoint that is not always reachable
+    (blackbox, ZeroTier/LAN-gated -- see memory `glm-ocr-endpoint`), and OCR is
+    additive, so absence must cost nothing. Enable with OCR_ENABLED=1.
+    """
+    enabled: bool = False
+    url: str = ""              # empty -> glm_ocr.DEFAULT_OCR_URL
+    timeout: float = 120.0
+    max_images: int = 4       # per message; a gallery post must not blow the budget
+
+
+@dataclass
 class AppConfig:
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     discord: DiscordConfig = field(default_factory=DiscordConfig)
@@ -359,6 +373,7 @@ class AppConfig:
     web: WebConfig = field(default_factory=WebConfig)
     caps: CapConfig = field(default_factory=CapConfig)
     sources: SourceConfig = field(default_factory=SourceConfig)
+    ocr: OCRConfig = field(default_factory=OCRConfig)
     days_back: int = 7
 
     # Pipeline behavior toggles (UI-controllable)
@@ -538,6 +553,12 @@ def load_config() -> AppConfig:
         dry_run=os.getenv("DRY_RUN", "").lower() in ("1", "true", "yes"),
         obsidian_events_dir=os.getenv("OBSIDIAN_EVENTS_DIR", ""),
         obsidian_recruiters_dir=os.getenv("OBSIDIAN_RECRUITERS_DIR", ""),
+        ocr=OCRConfig(
+            enabled=_env_flag("OCR_ENABLED"),
+            url=os.getenv("GLM_OCR_URL", "").strip(),
+            timeout=float(os.getenv("OCR_TIMEOUT", "120")),
+            max_images=_env_int("OCR_MAX_IMAGES", 4, minimum=1, maximum=20),
+        ),
         days_back=days_back,
         telegram_channels=_parse_csv_env("TELEGRAM_CHANNELS"),
         telegram_exclude=_parse_csv_env("TELEGRAM_EXCLUDE"),
