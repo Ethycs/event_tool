@@ -145,8 +145,24 @@ async def harvest_messages(
                 with tracer.start_as_current_span("harvest.telegram") as span:
                     span.set_attribute("source.name", "telegram")
                     try:
+                        # Roll the window forward from the last run + overlap,
+                        # capped at the days_back ceiling. `cutoff` (now -
+                        # days_back) is that ceiling.
+                        tg_cutoff = cutoff
+                        now = datetime.now(timezone.utc)
+                        if cfg.telegram.rolling_window:
+                            from event_harvester.sources.telegram import (
+                                load_last_harvest,
+                                rolling_cutoff,
+                            )
+                            tg_cutoff = rolling_cutoff(
+                                now, cfg.days_back,
+                                cfg.telegram.overlap_hours, load_last_harvest())
+                            span.set_attribute(
+                                "telegram.window_hours",
+                                round((now - tg_cutoff).total_seconds() / 3600, 1))
                         msgs = await read_telegram_messages(
-                            cutoff,
+                            tg_cutoff,
                             cfg.telegram,
                             channels_allowlist=cfg.telegram_channels,
                             channels_blocklist=cfg.telegram_exclude,
@@ -154,6 +170,11 @@ async def harvest_messages(
                             download_images=cfg.ocr.enabled,
                         )
                         span.set_attribute("message.count", len(msgs or []))
+                        # Advance the window only after a clean read, so a
+                        # failed harvest re-covers the same span next time.
+                        if cfg.telegram.rolling_window:
+                            from event_harvester.sources.telegram import save_last_harvest
+                            save_last_harvest(now)
                         return msgs
                     except Exception as e:
                         span.set_attribute("error.message", str(e))

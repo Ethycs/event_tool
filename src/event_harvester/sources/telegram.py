@@ -2,7 +2,7 @@
 
 import logging
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -12,9 +12,58 @@ from telethon.tl.types import Message, MessageMediaPhoto
 
 from event_harvester.config import TelegramConfig
 from event_harvester.observability.tracing import set_span_attrs, traced
+from event_harvester.utils import data_path, load_json, save_json
 
 logger = logging.getLogger("event_harvester.telegram")
 _TRACER = "event_harvester.sources.telegram"
+
+# ── Rolling harvest window ────────────────────────────────────────────────
+#
+# Re-scanning the full `days_back` every day is wasted work: a daily run only
+# needs the messages posted since the last one. The window rolls forward with
+# each run, anchored to the *previous* harvest minus an overlap buffer so a
+# late run, a small clock skew, or an edited message can't slip through a gap.
+# `days_back` remains the ceiling — this only ever narrows the window, and a
+# first run or one after a long outage still gets the full lookback.
+WINDOW_STATE_FILE = data_path(".telegram_window.json")
+
+
+def rolling_cutoff(
+    now: datetime, days_back: int, overlap_hours: float,
+    last_harvest: Optional[datetime],
+) -> datetime:
+    """The cutoff a rolling run should use. Pure — no IO.
+
+    `= max(now - days_back, last_harvest - overlap)`: look back to just before
+    the previous run, but never further than the `days_back` ceiling. A missing
+    or future `last_harvest` (first run, corrupt state, clock skew) falls back
+    to the full ceiling, so the window can only ever be *too wide*, never too
+    narrow — the safe direction, since a wide window costs time, not events.
+    """
+    ceiling = now - timedelta(days=days_back)
+    if last_harvest is None or last_harvest > now:
+        return ceiling
+    anchor = last_harvest - timedelta(hours=overlap_hours)
+    return max(ceiling, anchor)
+
+
+def load_last_harvest(path: Optional[Path] = None) -> Optional[datetime]:
+    """The timestamp of the last successful rolling harvest, or None."""
+    data = load_json(path or WINDOW_STATE_FILE, default={}) or {}
+    raw = data.get("last_harvest_at")
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def save_last_harvest(now: datetime, path: Optional[Path] = None) -> None:
+    """Record `now` as the last successful harvest for the next run's window."""
+    save_json(path or WINDOW_STATE_FILE,
+              {"last_harvest_at": now.astimezone(timezone.utc).isoformat()})
 
 
 def _should_include_dialog(

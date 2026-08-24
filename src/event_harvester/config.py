@@ -23,6 +23,13 @@ class TelegramConfig:
     phone: str = ""
     session: str = "harvest_session"
 
+    # Rolling window: instead of re-scanning the full `days_back` every run,
+    # fetch only from just before the previous harvest, plus an overlap buffer.
+    # `days_back` stays the *ceiling* (first run, or after a long gap), so this
+    # only ever narrows the window, never widens it.
+    rolling_window: bool = True
+    overlap_hours: float = 6.0
+
     @property
     def is_configured(self) -> bool:
         return bool(self.api_id and self.api_hash)
@@ -469,6 +476,8 @@ def load_config() -> AppConfig:
             api_hash=os.getenv("TELEGRAM_API_HASH", ""),
             phone=os.getenv("TELEGRAM_PHONE", ""),
             session=os.getenv("TELEGRAM_SESSION", "harvest_session"),
+            rolling_window=_env_flag("TELEGRAM_ROLLING_WINDOW", default=True),
+            overlap_hours=float(os.getenv("TELEGRAM_OVERLAP_HOURS", "6") or 6),
         ),
         discord=DiscordConfig(
             cache_path=os.getenv("DISCORD_CACHE_PATH"),
