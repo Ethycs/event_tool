@@ -24,6 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 import httpx
 
 from event_harvester.config import OCRConfig
+from event_harvester.outputs.thumbnails import data_uri, encode_thumbnail
 from event_harvester.sources import glm_ocr
 from event_harvester.utils import data_path, load_json, save_json
 
@@ -77,11 +78,17 @@ def enrich_messages(messages: list[dict], cfg: OCRConfig) -> int:
     cache: dict = load_json(CACHE_FILE, default={}) or {}
     dirty = False
     enriched = 0
+    blobs: dict[str, bytes] = {}                 # fetch each image once, reuse
+
+    def _bytes(ref: str) -> bytes:
+        if ref not in blobs:
+            blobs[ref] = _fetch_image(ref, cfg.timeout)
+        return blobs[ref]
 
     # One image at a time per message, but images across messages can overlap
     # in flight -- the service is remote and the bottleneck is its latency.
     def _ocr_ref(ref: str) -> str:
-        data = _fetch_image(ref, cfg.timeout)
+        data = _bytes(ref)
         if not data:
             return ""
         key = hashlib.sha256(data).hexdigest()
@@ -95,6 +102,19 @@ def enrich_messages(messages: list[dict], cfg: OCRConfig) -> int:
         for msg in targets:
             refs = [str(r) for r in (msg.get("images") or [])][: cfg.max_images]
             texts = [t for t in pool.map(_ocr_ref, refs) if t.strip()]
+
+            # The dyad: the flyer and its text are one unit, combined here. The
+            # OCR pass already holds the bytes, so it also embeds a card-sized
+            # thumbnail (`_thumb`) that `attach_source_ids` carries onto the
+            # event, so presentation shows *this* flyer beside *this* text --
+            # not a generic link thumbnail decoupled from the description.
+            if "_thumb" not in msg:
+                for ref in refs:
+                    jpeg = encode_thumbnail(_bytes(ref)) if _bytes(ref) else b""
+                    if jpeg:
+                        msg["_thumb"] = data_uri(jpeg)
+                        break
+
             if not texts:
                 continue
             dirty = True

@@ -205,12 +205,15 @@ class TestPrepare:
         assert set(prepared[0]) == {
             "i", "title", "date", "time", "location", "link", "details",
             "source", "author", "platform", "region", "priority", "bucket",
-            "ticktick",
+            "ticktick", "thumb",
         }, (
             "`author` was added 2026-08-11 for the card byline. It is derived "
             "from `source`, which is already embedded, so it widens the "
             "rendering surface without widening what the forwarded file "
-            "discloses — which is the property this test exists to protect."
+            "discloses — which is the property this test exists to protect. "
+            "`thumb` (2026-08-23) is the flyer picture, display content the "
+            "card already embedded via the link-thumbnail step; carrying it "
+            "here lets the OCR-embedded flyer win, and it is meant to be shown."
         )
 
     def test_every_event_gets_a_ticktick_deep_link(self):

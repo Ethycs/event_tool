@@ -553,6 +553,7 @@ def attach_source_ids(events: list[dict], batch: list[dict]) -> None:
         source = (ev.get("source") or "").strip().lower()
 
         hits: list[str] = []
+        matched_msgs: list[dict] = []
         for m in batch:
             content = m.get("content") or ""
             author = (m.get("author") or "").strip().lower()
@@ -564,11 +565,19 @@ def attach_source_ids(events: list[dict], batch: list[dict]) -> None:
                 matched = bool(addr) and addr in source
             if matched and m.get("id"):
                 hits.append(m["id"])
+                matched_msgs.append(m)
 
         # Exactly one message must claim it. Two equally-good matches means
         # the signal did not discriminate, and guessing is not allowed here.
         if len(hits) == 1:
             ev["_source_ids"] = hits
+            # The dyad: carry the flyer the OCR pass embedded on the matched
+            # message onto the event, so its picture and its (OCR-informed)
+            # description travel together to the card. Only on a confident
+            # single match -- a wrong picture is worse than none.
+            thumb = matched_msgs[0].get("_thumb")
+            if thumb:
+                ev["_thumb"] = thumb
 
         # Platform is safe to take from the whole batch even when the message
         # is ambiguous: batches are built from the scored message list, which

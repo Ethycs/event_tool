@@ -111,6 +111,9 @@ def _events_for_report(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
             # which the model writes inconsistently — 148 of 240 events had no
             # source chip at all until this was preserved (2026-08-12).
             "_platforms": event.get("_platforms") or [],
+            # The dyad's picture: the flyer the OCR pass embedded, carried so
+            # the card shows it beside the description it came from.
+            "_thumb": event.get("_thumb") or "",
         })
     return out
 

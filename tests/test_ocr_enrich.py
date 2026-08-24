@@ -109,3 +109,55 @@ class TestNonFatal:
         msgs = [_msg("1", images=["blank.png"])]
         assert ocr_enrich.enrich_messages(msgs, OCRConfig(enabled=True)) == 0
         assert msgs[0]["content"] == "body"
+
+
+class TestTheDyad:
+    """The picture and its description are one unit: combined during analysis
+    (the OCR pass embeds the flyer it read), attached in presentation (carried
+    to the card so it shows *that* flyer beside *that* text)."""
+
+    def test_the_ocr_pass_embeds_a_thumbnail_of_the_flyer(self, monkeypatch):
+        monkeypatch.setattr(ocr_enrich.glm_ocr, "health", lambda *a, **k: True)
+        monkeypatch.setattr(ocr_enrich, "_fetch_image", lambda r, t: b"IMGBYTES")
+        monkeypatch.setattr(ocr_enrich.glm_ocr, "ocr_image_bytes", lambda d, **k: "text")
+        monkeypatch.setattr(ocr_enrich, "encode_thumbnail", lambda raw: b"JPEG" if raw else b"")
+        monkeypatch.setattr(ocr_enrich, "data_uri", lambda j: "data:image/jpeg;base64,AA")
+        msg = _msg("1", images=["flyer.png"])
+        ocr_enrich.enrich_messages([msg], OCRConfig(enabled=True))
+        assert msg["_thumb"] == "data:image/jpeg;base64,AA"
+
+    def test_a_thumb_is_embedded_even_when_ocr_finds_no_text(self, monkeypatch):
+        """The picture is worth showing even if the OCR text was empty."""
+        monkeypatch.setattr(ocr_enrich.glm_ocr, "health", lambda *a, **k: True)
+        monkeypatch.setattr(ocr_enrich, "_fetch_image", lambda r, t: b"IMG")
+        monkeypatch.setattr(ocr_enrich.glm_ocr, "ocr_image_bytes", lambda d, **k: "")
+        monkeypatch.setattr(ocr_enrich, "encode_thumbnail", lambda raw: b"J")
+        monkeypatch.setattr(ocr_enrich, "data_uri", lambda j: "data:image/jpeg;base64,Z")
+        msg = _msg("1", images=["f.png"])
+        ocr_enrich.enrich_messages([msg], OCRConfig(enabled=True))
+        assert msg.get("_thumb") == "data:image/jpeg;base64,Z"
+
+    def test_attach_source_ids_carries_the_flyer_onto_the_event(self):
+        from event_harvester.pipeline.analysis import attach_source_ids
+        msg = {"id": "9", "author": "@oasis", "content": "x",
+               "_thumb": "data:image/jpeg;base64,FLYER"}
+        ev = {"title": "Night", "source": "@oasis in #events", "link": ""}
+        attach_source_ids([ev], [msg])
+        assert ev["_source_ids"] == ["9"]
+        assert ev["_thumb"] == "data:image/jpeg;base64,FLYER"
+
+    def test_an_unmatched_event_gets_no_flyer(self):
+        from event_harvester.pipeline.analysis import attach_source_ids
+        msg = {"id": "9", "author": "@someone", "content": "x", "_thumb": "data:...FLYER"}
+        ev = {"title": "Night", "source": "@nobody in #x", "link": ""}
+        attach_source_ids([ev], [msg])
+        assert "_thumb" not in ev
+
+    def test_the_flyer_reaches_the_card_as_its_thumb(self):
+        from datetime import date
+
+        from event_harvester.outputs.html_report import _prepare
+        ev = {"title": "N", "date": "2026-09-06", "source": "s",
+              "_thumb": "data:image/jpeg;base64,FLYER"}
+        card = _prepare([ev], date(2026, 9, 1))
+        assert card[0]["thumb"] == "data:image/jpeg;base64,FLYER"

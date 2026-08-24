@@ -199,6 +199,11 @@ def _prepare(events: list[dict], today: date) -> list[dict[str, Any]]:
             "priority": ev.get("priority", ev.get("score", 3)),
             "bucket": _bucket(iso, today),
             "ticktick": ticktick_deep_link(title, iso or None, not ev.get("time"), details[:400]),
+            # The dyad's picture, embedded by the OCR pass — the flyer this
+            # event's description came from. Carried straight to `thumb` (the
+            # key the card reads); the link-thumbnail step below only fills in
+            # where this is absent, so a real flyer always wins.
+            "thumb": str(ev.get("_thumb") or ""),
         })
     return out
 
@@ -984,8 +989,11 @@ def generate_html_report(
         from event_harvester.outputs.thumbnails import thumbnails_for
 
         try:
-            by_link = thumbnails_for([ev["link"] for ev in prepared if ev["link"]])
-            for ev in prepared:
+            # Only for events without a flyer of their own — the OCR-embedded
+            # flyer (the dyad's picture) always wins over a generic link image.
+            need = [ev for ev in prepared if ev["link"] and not ev.get("thumb")]
+            by_link = thumbnails_for([ev["link"] for ev in need])
+            for ev in need:
                 uri = by_link.get(ev["link"])
                 if uri:
                     ev["thumb"] = uri
