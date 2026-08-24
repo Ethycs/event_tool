@@ -222,6 +222,33 @@ def _location_line(media: dict) -> str:
     return f"at: {name}" + (f", {city}" if city and city.lower() not in name.lower() else "")
 
 
+def _image_url(media: dict) -> str:
+    """The post's best still image, for OCR. Instagram serves this several ways
+    depending on which endpoint produced the payload; try them largest-first.
+
+    This is the whole point of OCR for Instagram: the code already notes an
+    image-only flyer "carries its real content in the image" and fell back to
+    Instagram's accessibility caption, which is usually the useless "may be an
+    image of ..." form. The real poster text is in the pixels.
+    """
+    iv = media.get("image_versions2")
+    if isinstance(iv, dict):
+        cands = iv.get("candidates")
+        if isinstance(cands, list) and cands:
+            best = max(cands, key=lambda c: (c.get("width", 0) or 0) * (c.get("height", 0) or 0))
+            if best.get("url"):
+                return str(best["url"])
+    for key in ("display_url", "thumbnail_src"):
+        if media.get(key):
+            return str(media[key])
+    dr = media.get("display_resources")
+    if isinstance(dr, list) and dr:
+        best = max(dr, key=lambda c: c.get("config_width", 0) or 0)
+        if best.get("src"):
+            return str(best["src"])
+    return ""
+
+
 def normalize_media(
     media: dict,
     *,
@@ -255,7 +282,7 @@ def normalize_media(
             parts.append(f"alt: {alt}")
 
     media_id = _media_id(media)
-    return {
+    record = {
         "platform": "web",
         "id": f"ig:{media_id}" if media_id else f"ig:{hash(text[:50])}",
         "timestamp": _post_timestamp(media) or datetime.now(timezone.utc).isoformat(),
@@ -263,6 +290,13 @@ def normalize_media(
         "channel": channel or f"{source_name}-feed",
         "content": "\n".join(parts)[:2000],
     }
+    # Hand the poster image to OCR enrichment — an Instagram event post is very
+    # often a flyer whose caption is just "🌈 tonight!!"; the date and venue are
+    # in the image.
+    img = _image_url(media)
+    if img:
+        record["images"] = [img]
+    return record
 
 
 def normalize_posts(

@@ -150,6 +150,8 @@ async def harvest_messages(
                             cfg.telegram,
                             channels_allowlist=cfg.telegram_channels,
                             channels_blocklist=cfg.telegram_exclude,
+                            # Download photos only when OCR will read them.
+                            download_images=cfg.ocr.enabled,
                         )
                         span.set_attribute("message.count", len(msgs or []))
                         return msgs

@@ -10,9 +10,8 @@ produce a confident number that means nothing.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
-
 import json
+from datetime import date, timedelta
 
 import pytest
 
