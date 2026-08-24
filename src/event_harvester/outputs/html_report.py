@@ -68,7 +68,13 @@ def _safe_json(payload: Any) -> str:
 
 
 def _bucket(iso_date: str | None, today: date) -> str:
-    """Group an event into a human bucket. Unknown dates sort last, not first."""
+    """Group an event into a human bucket. Unknown dates sort last, not first.
+
+    Written into `events.json` for other consumers. **The page itself does not
+    read it** — it recomputes the same buckets in the browser, because a page
+    built once and served for 24h would otherwise keep yesterday's answer. Keep
+    the two in step; `_SCRIPT`'s `bucketOf` is this function, in JS.
+    """
     if not iso_date:
         return "Undated"
     match = _ISO_DATE_RE.match(str(iso_date))
@@ -474,6 +480,65 @@ _SCRIPT = ICS_JS + r"""
 const DATA = JSON.parse(document.getElementById('events-data').textContent);
 const BUCKETS = JSON.parse(document.getElementById('bucket-order').textContent);
 const main = document.getElementById('list');
+
+// ── Which day it is ──────────────────────────────────────────────────────
+//
+// **Buckets are computed here, in the browser, not read off `ev.bucket`.**
+// The builder stamps a bucket per event against the date it ran, and the page
+// is then *served unchanged for up to `interval_hours`* — 24 by default. A
+// page built at 16:46 on the 18th therefore went on calling the 18th "Today"
+// and the 19th "Tomorrow" for the whole of the 19th, which is the one day it
+// mattered. Nothing was stale except the arithmetic, and the arithmetic is
+// three lines, so it belongs on the side that knows what day it is.
+//
+// `ev.bucket` is still written into `events.json` — other consumers read that
+// file — but this page ignores it.
+const DAY_MS = 86400000;
+
+function localToday() {
+  const n = new Date();
+  return new Date(n.getFullYear(), n.getMonth(), n.getDate());
+}
+
+let today = localToday();
+
+function bucketOf(ev) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(ev.date || ''));
+  if (!m) return 'Undated';
+  const y = Number(m[1]), mo = Number(m[2]) - 1, d = Number(m[3]);
+  const when = new Date(y, mo, d);
+  // `new Date(2026, 1, 31)` silently becomes 3 March. Reject what did not
+  // round-trip, so a nonsense date reads "Undated" here exactly as it does in
+  // the Python that writes the JSON.
+  if (when.getMonth() !== mo || when.getDate() !== d) return 'Undated';
+  // Local midnights, so DST transitions cannot turn a day into 23 or 25 hours
+  // and round the wrong way.
+  const delta = Math.round((when - today) / DAY_MS);
+  if (delta < 0) return 'Past';
+  if (delta === 0) return 'Today';
+  if (delta === 1) return 'Tomorrow';
+  if (delta <= 7) return 'This week';
+  if (delta <= 30) return 'This month';
+  return 'Later';
+}
+
+// A tab left open overnight is the common case on a phone, not an edge case:
+// the page someone checks at 9am was loaded the evening before. Re-render when
+// the date underfoot changes — cheap, since `render()` already rebuilds from
+// `DATA` on every keystroke.
+function checkRollover() {
+  const now = localToday();
+  if (now.getTime() === today.getTime()) return;
+  today = now;
+  render();
+}
+
+setInterval(checkRollover, 60000);
+// Not folded into the `LIVE` poll listener below: a copy opened from disk has
+// no server to poll but still rolls over at midnight like any other page.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) checkRollover();
+});
 const search = document.getElementById('q');
 let activeSource = null;
 let activeRegion = null;
@@ -708,7 +773,7 @@ function render() {
   // bucket can hold a hundred events, which would defeat the whole point.
   const work = [];
   for (const bucket of BUCKETS) {
-    const inBucket = matches.filter(ev => ev.bucket === bucket);
+    const inBucket = matches.filter(ev => bucketOf(ev) === bucket);
     if (!inBucket.length) continue;
     work.push({heading: bucket + ' · ' + inBucket.length});
     for (const ev of inBucket) work.push({ev});
@@ -976,6 +1041,11 @@ def generate_html_report(
     event tonight in "Past" from 5pm PDT onward — the exact hours someone opens
     this page to decide what to do that evening. Caught by rendering it, not by
     a test, because the tests computed both sides the same way.
+
+    It now only labels the JSON. The **page** buckets in the browser against
+    the viewer's own date, because this file is written once per refresh and
+    then served for `interval_hours` — 24 by default — so a build-time answer
+    to "what is today" is wrong for most of the time the page is up.
     """
     events = validated_events or (raw_events or [])
     today = today or datetime.now().astimezone().date()

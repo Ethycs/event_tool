@@ -25,11 +25,13 @@ Four sinks turn harvested/validated events into something a human (or TickTick) 
 
 **Interaction:** client-side search across title/location/details/source, per-platform filter chips (see "The filter bar" below), and date bucketing — `Today`, `Tomorrow`, `This week`, `This month`, `Later`, `Undated`, `Past`. `Undated` and `Past` sort **last** so a stale event never heads the page.
 
-### Two properties worth not breaking
+### Properties worth not breaking
 
 **Scraped text is never interpolated into markup.** Event titles and details come from arbitrary websites. The payload is embedded as JSON in a `<script type="application/json">` block and rendered through `textContent`, so an event titled `<img onerror=...>` renders as that literal string. `_safe_json` escapes `</` (an unescaped `</script` would close the block early and turn the rest of the payload into live markup) and U+2028/U+2029 (valid JSON, line terminators to a JS parser). Pinned by `tests/test_html_report.py::TestUntrustedContent`.
 
 **Dates are bucketed against the *local* date, not UTC.** Event dates are local wall-clock dates scraped from venue pages — a 9pm SF show is `2026-07-30`, not an instant. Bucketing them against `datetime.now(timezone.utc).date()` put every event happening tonight into `Past` from 5pm PDT onward, which is exactly when someone opens the page to decide what to do that evening. `today` is injectable for deterministic tests. This was found by rendering the page in a browser, not by a test — the tests computed both sides of the comparison the same way and agreed with each other.
+
+**And bucketed in the browser, not by the builder · changed 2026-08-19.** `_bucket` still stamps a `bucket` on every event in `events.json`, and other readers of that file use it, but **the page ignores the field** — `_SCRIPT`'s `bucketOf` recomputes it against `new Date()` at render time. The reason is the serving model, not the arithmetic: `servers/site.py` writes these files once per refresh and serves them unchanged for `interval_hours`, **24 by default and not aligned to midnight**. Observed 2026-08-19: `calendar.html`, built 16:46 the previous afternoon, still carried `data-today="2026-08-18"`, so the 19th sat under "Tomorrow" for the whole of the 19th. A page also outlives its build in the other direction — a tab left open overnight on a phone — so both pages re-check the local date on a 60s timer and on `visibilitychange`, and re-render only when it actually changed. Two copies of one rule is a drift risk, so `tests/test_day_rollover.py` lifts the threshold ladder out of the JS with a regex and runs it against `_bucket` for every day from a week back to a year out.
 
 **Forwarding the file forwards the data.** It embeds every event and the source channel each came from. `_prepare` therefore whitelists display fields only; internals like `_status` never reach the file.
 
@@ -54,6 +56,8 @@ Four sinks turn harvested/validated events into something a human (or TickTick) 
 **No thumbnails, and that is the point.** The list page embeds 95 inline JPEGs — 1276 KB of its 1562 KB. A grid cell is 96px tall and could not show one usefully. Measured 2026-08-12: **247 KB against 1562 KB for the same 240 events**. This is the one to open on a phone.
 
 **Local dates, again, and here it is worse.** `new Date('2026-08-12')` parses as **UTC midnight** and renders as the 11th anywhere west of Greenwich. The grid is built with `new Date(y, m, d)` and day keys are assembled by string formatting; `toISOString()` appears nowhere. This is the same defect as the `Past`-bucket one in §0, except a calendar renders 42 cells and would have been wrong in all of them at once. `tests/test_calendar_html.py::TestDateHandling` asserts the absent constructs, since there is no DOM to inspect.
+
+**Which day is outlined comes from the browser · changed 2026-08-19.** `TODAY` was `document.body.dataset.today` — the build date — on the reasoning that the outlined cell should agree with the "generated" line in the header. That does not survive the serving model above: the file is rebuilt every `interval_hours` and served unchanged in between, so it outlined the 18th all through the 19th. The header still carries the build time, which is where a build time belongs; the outline is a claim about *today*, and only the viewer's clock knows that. `data-today` is still written, and remains the fallback. Same 60s + `visibilitychange` rollover as the list page — a `render()` here rebuilds all 42 cells, so it fires only when the day actually turned.
 
 ### `outputs/ics.py` — the shared iCalendar builder
 

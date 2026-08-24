@@ -203,10 +203,25 @@ footer {
 
 _SCRIPT = ICS_JS + r"""
 const DATA = JSON.parse(document.getElementById('events-data').textContent);
-// The build date, not the browser's. They agree in practice, but the outlined
-// cell should match the "generated" line in the header even for a page opened
-// tomorrow from disk.
-const TODAY = document.body.dataset.today;
+const pad = (n) => String(n).padStart(2, '0');
+// The only correct way to name a day here. `toISOString()` would convert to UTC
+// first and shift the whole grid back a day for anyone west of Greenwich.
+const keyOf = (y, m, d) => y + '-' + pad(m + 1) + '-' + pad(d);
+
+// **The browser's date, not the build date.** This used to read
+// `document.body.dataset.today` on the reasoning that the outlined cell should
+// agree with the "generated" line in the header. It does not survive contact
+// with how the page is served: it is rebuilt on a schedule — every 24h by
+// default — and served unchanged in between, so a page built at 16:46 on the
+// 18th went on outlining the 18th for the whole of the 19th. The header still
+// says when it was generated, which is where a build time belongs; the
+// outlined cell is a claim about *today*, and only the viewer's clock knows
+// that. `data-today` stays as the fallback.
+function localToday() {
+  const n = new Date();
+  return keyOf(n.getFullYear(), n.getMonth(), n.getDate());
+}
+let TODAY = localToday() || document.body.dataset.today;
 const MONTHS = ['January','February','March','April','May','June','July',
                 'August','September','October','November','December'];
 
@@ -220,11 +235,6 @@ let picked = null;               // a 'YYYY-MM-DD' key, or 'undated', or null
 // past December is arithmetic instead of timezone-sensitive.
 let viewY = Number(TODAY.slice(0, 4));
 let viewM = Number(TODAY.slice(5, 7)) - 1;
-
-const pad = (n) => String(n).padStart(2, '0');
-// The only correct way to name a day here. `toISOString()` would convert to UTC
-// first and shift the whole grid back a day for anyone west of Greenwich.
-const keyOf = (y, m, d) => y + '-' + pad(m + 1) + '-' + pad(d);
 
 function matching() {
   const q = search.value.trim().toLowerCase();
@@ -503,6 +513,22 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'ArrowLeft') step(-1);
   else if (e.key === 'ArrowRight') step(1);
   else if (e.key.toLowerCase() === 't') toToday();
+});
+
+// A tab left open overnight — the phone in a pocket, reopened next morning —
+// has to notice the day turned over. Re-render only when it actually has;
+// `render()` rebuilds all 42 cells, and doing that every minute for nothing
+// would fight with a click on a day cell.
+function checkRollover() {
+  const now = localToday();
+  if (now === TODAY) return;
+  TODAY = now;
+  render();
+}
+
+setInterval(checkRollover, 60000);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) checkRollover();
 });
 
 render();
