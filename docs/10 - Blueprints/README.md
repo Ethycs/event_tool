@@ -33,3 +33,4 @@ usually the wrong answer.
 | Blueprint | Run when |
 |---|---|
 | `01 - Adding a Web Source.md` | Someone hands you a URL and wants its events harvested |
+| `02 - Re-running Web Sources Fast.md` | You're iterating on one source (parser/mode/pipeline) and don't want to re-run the whole list |
