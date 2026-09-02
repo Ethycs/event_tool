@@ -23,6 +23,7 @@ import logging
 from datetime import timedelta
 
 from event_harvester.observability.tracing import get_tracer
+from event_harvester.sources import web_checkpoint
 from event_harvester.sources.web_modes.calendar import _do_calendar
 from event_harvester.sources.web_modes.chat import _do_chat
 from event_harvester.sources.web_modes.feed import _do_feed
@@ -257,11 +258,21 @@ def fetch_web_sources(
                             logger.info("%s: %d messages.", name, len(msgs))
                             continue
 
-                        # All other modes: open page, detect mode if needed
-                        page = uc.open(
-                            src["url"], source_name=name, tracer=nav_tracer, capture=capture,
+                        # All other modes: open page, detect mode if needed.
+                        # A recorded MHTML checkpoint replaces the live open (and
+                        # its Cloudflare wait) when EH_WEB_CHECKPOINT=replay; a
+                        # miss falls through to the live fetch below.
+                        replayed = web_checkpoint.replay(
+                            uc, src["url"], source_name=name,
+                            tracer=nav_tracer, capture=capture,
                         )
-                        html = _wait_cloudflare(page, headless=False)
+                        if replayed is not None:
+                            page, html = replayed
+                        else:
+                            page = uc.open(
+                                src["url"], source_name=name, tracer=nav_tracer, capture=capture,
+                            )
+                            html = _wait_cloudflare(page, headless=False)
 
                         # Cloudflare blocked — queue for native Chrome retry
                         if "just a moment" in html.lower():
@@ -270,6 +281,9 @@ def fetch_web_sources(
                                 cf_retries.append(src)
                                 page.close()
                                 continue
+
+                        # Snapshot the cleared page (no-op unless recording).
+                        web_checkpoint.record(page, src["url"])
 
                         # Auto-mode: check saved signatures, then detect
                         if not mode or mode == "auto":

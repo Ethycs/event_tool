@@ -14,6 +14,7 @@ import re
 from datetime import date, datetime, timezone
 
 from event_harvester.observability.tracing import get_tracer
+from event_harvester.sources import web_checkpoint
 from event_harvester.sources.web_utils import (
     DEFAULT_SCROLL_SECONDS,
     _extract_event_links,
@@ -174,9 +175,18 @@ def _next_month_url(url: str, today: date | None = None) -> str:
 def _calcium_next_month(uc, src: dict, url: str, name: str, tracer, capture) -> list[dict]:
     """Links from next month's grid. Never raises — a second page is a bonus."""
     try:
-        page = uc.open(_next_month_url(url), source_name=name,
-                       tracer=tracer, capture=capture)
-        html = _wait_cloudflare(page, headless=False)
+        nm_url = _next_month_url(url)
+        # Replay from an MHTML checkpoint when one exists (EH_WEB_CHECKPOINT),
+        # else fetch live and snapshot it. Keyed by the next-month URL, so this
+        # grid is checkpointed independently of the current-month one.
+        replayed = web_checkpoint.replay(uc, nm_url, source_name=name,
+                                         tracer=tracer, capture=capture)
+        if replayed is not None:
+            page, html = replayed
+        else:
+            page = uc.open(nm_url, source_name=name, tracer=tracer, capture=capture)
+            html = _wait_cloudflare(page, headless=False)
+            web_checkpoint.record(page, nm_url)
         page.close()
         if "just a moment" in html.lower():
             logger.warning("%s: next-month grid blocked, using this month only", name)
