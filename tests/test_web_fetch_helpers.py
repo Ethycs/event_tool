@@ -18,12 +18,13 @@ a re-export, so the back-compat shim in web_fetch.py isn't usable here.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from event_harvester.sources import web_utils
-from event_harvester.sources.web_modes.calendar import _parse_calcium_links
+from event_harvester.sources.web_modes.calendar import _hint_header, _parse_calcium_links
 from event_harvester.sources.web_modes.feed import _extract_posts_from_api
 from event_harvester.sources.web_utils import (
     _decimate_text,
@@ -260,6 +261,126 @@ def test_parse_calcium_links_unescapes_html_entities():
     assert len(links) == 1
     assert links[0]["text"] == "Tom & Jerry Night"
     assert "&amp;" not in links[0]["url"]
+
+
+# Regression for erobay, 2026-09-01: a whole class of events was silently
+# dropped — those linking straight to an external ticket site (buytickets.at)
+# instead of an internal Calcium page. They have no <noscript> fallback and no
+# `Date=` in the URL, so both the noscript check and the per-link date lookup
+# bailed. Real, e.g. "House of Braids: a POC-exclusive Rope Jam" (VoxBody). The
+# day's date is available from the internal event above it in the same day cell.
+def test_parse_calcium_links_external_ticket_event_inherits_the_day():
+    html = """
+<table class="c_WickedGrounds">
+  <span class="TimeLabel">6:00pm - 8:00pm</span>
+  <noscript><a href="/x?Op=PopupWindow&amp;Date=2026%2F9%2F1&amp;ID=99">Hoe With Purpose</a></noscript>
+</table>
+<table class="c_VoxBody">
+  <span class="EventTag Category">VoxBody</span><br>
+  <span class="TimeLabel">7:00pm - 10:00pm</span><br>
+  <a href="https://buytickets.at/voxbodystudio/1986314">House of Braids: a POC-exclusive Rope Jam</a>
+</table>
+"""
+    links = _parse_calcium_links(html)
+    assert len(links) == 2
+    ext = next(l for l in links if "buytickets.at" in l["url"])
+    assert ext["text"] == "House of Braids: a POC-exclusive Rope Jam"
+    assert ext["date_hint"] == "2026-09-01"        # carried from the day cell
+    assert ext["time"] == "7:00pm - 10:00pm"
+    assert ext["venue"] == "Vox Body"
+
+
+# ── _hint_header (what the listing knew, handed to the detail page) ──
+#
+# Regression for erobay, 2026-08-29: **124 links fetched every run, 24 events
+# on the page.** The fetch layer was healthy the whole time; the date the
+# listing had already parsed was dropped when the message was built, and
+# `rerank_messages` then binned the message as "no date/link" before
+# extraction. The loss was invisible per source — the funnel line
+# (`dropped ... 2151 no date/link`) is logged after every source has merged
+# into one list.
+
+
+class TestTheListingsDateReachesTheMessage:
+    def test_the_header_leads_with_the_date(self):
+        lnk = {"date_hint": "2026-09-05", "time": "8:00 PM", "venue": "Wicked Grounds"}
+        assert _hint_header(lnk) == (
+            "date: 2026-09-05\ntime: 8:00 PM\nlocation: Wicked Grounds\n"
+        )
+
+    def test_it_matches_the_shape_the_inline_branch_emits(self):
+        """Three branches build web messages and the extraction prompt reads
+        all three. `date:`/`time:`/`location:`, in that order, is the one the
+        inline branch has always used."""
+        keys = re.findall(r"(\w+): ", _hint_header(
+            {"date_hint": "2026-09-05", "time": "8pm", "venue": "The Stud"}))
+        assert keys == ["date", "time", "location"]
+
+    def test_a_link_with_no_hints_adds_nothing(self):
+        """The detail text has to survive unchanged, or every fetched page
+        grows a stray leading newline."""
+        assert _hint_header({}) == ""
+        assert _hint_header({"url": "https://x.test/1", "text": "Thing"}) == ""
+
+    def test_partial_hints_do_not_emit_empty_lines(self):
+        assert _hint_header({"date_hint": "2026-09-05"}) == "date: 2026-09-05\n"
+        assert _hint_header({"venue": "The Stud"}) == "location: The Stud\n"
+
+    def test_every_calcium_link_carries_the_date_it_needs(self):
+        """`_parse_calcium_links` skips any block with no `Date=` in the URL,
+        so this is total, not typical — which is what makes dropping it a
+        pure loss."""
+        links = _parse_calcium_links(_CALCIUM_FIXTURE)
+        assert links
+        for lnk in links:
+            assert lnk["date_hint"]
+            assert _hint_header(lnk).startswith(f"date: {lnk['date_hint']}\n")
+
+
+class TestTheHeaderIsWhatKeepsTheMessage:
+    """The point of the header is surviving `rerank_messages`' pre-filter,
+    which keeps a message only if it has a future date or an event link."""
+
+    @staticmethod
+    def _body() -> str:
+        # A detail page written for someone who already knows what day they
+        # clicked — the common case, and the one that was being dropped.
+        return ("Join us for an evening of rope and conversation. Doors at 8. "
+                "Members and newcomers welcome. Ask at the desk.")
+
+    def test_without_the_date_the_message_is_dropped(self):
+        from event_harvester.pipeline.reranker import _resolve_message_dates
+
+        today = datetime.now().date()
+        text = "time: 8:00 PM\nlocation: Wicked Grounds\n" + self._body()
+        proximity, has_future, has_link = _resolve_message_dates(text, "", today)
+        assert not (has_future or has_link), "fixture no longer reproduces the bug"
+        assert proximity == 0
+
+    def test_with_the_date_it_survives_and_scores(self):
+        from event_harvester.pipeline.reranker import _resolve_message_dates
+
+        today = datetime.now().date()
+        lnk = {
+            "date_hint": (today + timedelta(days=6)).isoformat(),
+            "time": "8:00 PM",
+            "venue": "Wicked Grounds",
+        }
+        proximity, has_future, has_link = _resolve_message_dates(
+            _hint_header(lnk) + self._body(), "", today)
+        assert has_future
+        assert proximity > 0
+
+    def test_a_past_date_is_still_dropped(self):
+        """The header must not smuggle stale events past the filter — it
+        supplies the date, it does not vouch for it."""
+        from event_harvester.pipeline.reranker import _resolve_message_dates
+
+        today = datetime.now().date()
+        lnk = {"date_hint": (today - timedelta(days=30)).isoformat()}
+        _, has_future, _ = _resolve_message_dates(
+            _hint_header(lnk) + self._body(), "", today)
+        assert not has_future
 
 
 # ── _extract_posts_from_api (FEED mode core) ─────────────────────────
@@ -566,3 +687,101 @@ class TestNormalizeQueries:
 
     def test_non_strings_are_coerced(self):
         assert self._norm({"queries": [2026, "x"]}) == ["2026", "x"]
+
+
+# ── the calendar row IS the event (Calcium) ──────────────────────────
+#
+# Added 2026-08-29 with the erobay rewrite. A Calcium row carries title, exact
+# date, time, venue and a URL; we used to fetch 124 detail pages and then ask
+# an LLM whether each was an event and whether it was past -- both already
+# answered by the row, and both answered *wrongly* often enough to publish
+# invented dates. These pin the row-to-message path and the forward window.
+
+
+class TestTheForwardWindow:
+    """The default Calcium grid is the CURRENT month, which is mostly behind
+    us. Probed 2026-08-29: default grid `2026-07-26 -> 2026-09-05`, 8 forward
+    days; `Date=2026/9/1` gave `2026-08-30 -> 2026-10-03`, 35 forward days."""
+
+    def test_it_asks_for_next_month(self):
+        from datetime import date as _date
+
+        from event_harvester.sources.web_modes.calendar import _next_month_url
+        url = "https://erobay.com/calendar/Calcium40.pl?Op=ShowIt&CalendarName=Community"
+        assert _next_month_url(url, _date(2026, 8, 29)).endswith("&Date=2026%2F9%2F1")
+
+    def test_december_rolls_the_year(self):
+        from datetime import date as _date
+
+        from event_harvester.sources.web_modes.calendar import _next_month_url
+        assert _next_month_url("http://x/c.pl?a=1", _date(2026, 12, 3)).endswith(
+            "&Date=2027%2F1%2F1")
+
+    def test_it_starts_a_query_string_when_there_is_none(self):
+        from datetime import date as _date
+
+        from event_harvester.sources.web_modes.calendar import _next_month_url
+        assert _next_month_url("http://x/c.pl", _date(2026, 8, 1)) == \
+            "http://x/c.pl?Date=2026%2F9%2F1"
+
+
+class TestCalciumRowsBecomeMessages:
+    @pytest.fixture(autouse=True)
+    def _no_side_effects(self, monkeypatch):
+        """`_save_link_fingerprint` writes to data/; the fetcher opens tabs."""
+        import event_harvester.sources.web_modes.calendar as cal
+        monkeypatch.setattr(cal, "_save_link_fingerprint", lambda lnk: None)
+        monkeypatch.setattr(cal, "_filter_known_links", lambda links: links)
+        monkeypatch.setattr(cal, "_fetch_event_details_parallel",
+                            lambda *a, **k: pytest.fail("detail fetch must be opt-in"))
+
+    @staticmethod
+    def _row(day, title="Bondage 101", **kw):
+        return {"url": f"https://e.test/?ID={abs(hash(title)) % 999}&Date={day}",
+                "text": title, "date_hint": day, "time": "8:00 PM",
+                "venue": "Wicked Grounds", **kw}
+
+    def _run(self, links, **src):
+        from event_harvester.sources.web_modes.calendar import _calcium_messages
+        return _calcium_messages(None, {"name": "erobay", **src}, links, "e.test", 1000)
+
+    def test_a_row_becomes_a_message_with_no_detail_page(self):
+        today = datetime.now().date()
+        msgs = self._run([self._row((today + timedelta(days=3)).isoformat())])
+        assert len(msgs) == 1
+        assert "Bondage 101" in msgs[0]["content"]
+        # Title first, then labelled fields -- the order the inline branch
+        # uses. Reversed, the extractor reads "Janus" + title as one string.
+        assert msgs[0]["content"].startswith("Bondage 101\n")
+        assert "\ndate: " in msgs[0]["content"]
+
+    def test_past_rows_are_dropped_by_arithmetic_not_by_a_model(self):
+        today = datetime.now().date()
+        msgs = self._run([
+            self._row((today - timedelta(days=1)).isoformat(), title="Yesterday"),
+            self._row(today.isoformat(), title="Today"),
+            self._row((today + timedelta(days=9)).isoformat(), title="Next week"),
+        ])
+        assert sorted(m["content"].splitlines()[0] for m in msgs) == ["Next week", "Today"]
+
+    def test_the_timestamp_is_the_events_day_not_the_scrapes_clock(self):
+        """Relative phrases resolve against this downstream, and a message
+        stamped `now` puts every event on the day we happened to scrape."""
+        day = (datetime.now().date() + timedelta(days=5)).isoformat()
+        assert self._run([self._row(day)])[0]["timestamp"].startswith(day)
+
+    def test_the_two_grids_overlap_and_are_deduped_by_url(self):
+        """A month view spills into its neighbours, so the same row arrives
+        from both grids."""
+        day = (datetime.now().date() + timedelta(days=2)).isoformat()
+        row = self._row(day)
+        assert len(self._run([row, dict(row)])) == 1
+
+    def test_the_url_survives_as_the_events_page(self):
+        """With no detail fetch the link *is* the detail."""
+        day = (datetime.now().date() + timedelta(days=2)).isoformat()
+        assert "e.test" in self._run([self._row(day)])[0]["channel"]
+
+    def test_nothing_upcoming_yields_no_messages(self):
+        old = (datetime.now().date() - timedelta(days=40)).isoformat()
+        assert self._run([self._row(old)]) == []
