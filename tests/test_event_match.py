@@ -72,17 +72,72 @@ class TestEventsMatch:
         assert is_match is False  # title overlap < 50%
 
     def test_same_link_match(self):
-        a = {"title": "Some Event", "date": None, "location": None, "link": "https://hope.net"}
-        b = {"title": "Another Event", "date": None, "location": None, "link": "https://hope.net"}
+        # A specific event URL (with a path) is identifying; two events sharing
+        # it are the same event even with different LLM-written titles.
+        a = {"title": "Some Event", "date": None, "location": None, "link": "https://hope.net/talks/42"}
+        b = {"title": "Another Event", "date": None, "location": None, "link": "https://hope.net/talks/42"}
         is_match, score = events_match(a, b)
         assert is_match is True
         assert score >= 2  # link counts as 2
+
+    def test_same_date_same_location_different_titles_no_match(self):
+        # A venue hosts many events a day; date + location is not identity.
+        a = {"title": "Go Topless Subs Meetup", "date": "2026-09-02",
+             "location": "Munch", "link": None}
+        b = {"title": "Miss Vickis Munch", "date": "2026-09-02",
+             "location": "Munch", "link": None}
+        is_match, score = events_match(a, b)
+        assert is_match is False  # score reaches 2 (date+location) but no title/link identity
+
+    def test_bare_domain_link_is_not_identity(self):
+        # The LLM fills the link with the bare source domain for calendar rows.
+        a = {"title": "One", "date": "2026-09-02", "location": None, "link": "https://erobay.com"}
+        b = {"title": "Two", "date": "2026-09-02", "location": None, "link": "https://erobay.com"}
+        assert events_match(a, b)[0] is False
 
     def test_exact_title_same_date_match(self):
         a = {"title": "Belgian Waffle Party", "date": "2026-05-01", "location": None, "link": None}
         b = {"title": "Belgian Waffle Party", "date": "2026-05-01", "location": None, "link": None}
         is_match, score = events_match(a, b)
         assert is_match is True
+
+    def test_placeholder_link_is_not_a_match_key(self):
+        # Regression (erobay 2026-09-02): calendar events have no URL and the
+        # LLM emits `link=TBD`. Treating "TBD"=="TBD" as a link match (+2)
+        # collapsed a whole day of distinct same-date events into one.
+        a = {"title": "Exiles Munch", "date": "2026-09-02",
+             "location": "Exiles", "link": "TBD"}
+        b = {"title": "Go Topless Subs Meetup", "date": "2026-09-02",
+             "location": "Oakland", "link": "TBD"}
+        is_match, score = events_match(a, b)
+        assert is_match is False   # different events; shared date alone is score 1
+        assert score == 1
+
+    def test_placeholder_variants_all_neutralized(self):
+        for ph in ("TBD", "n/a", "None", "-", "unknown", "TODO"):
+            a = {"title": "Event One", "date": "2026-09-02", "location": None, "link": ph}
+            b = {"title": "Event Two", "date": "2026-09-02", "location": None, "link": ph}
+            is_match, _ = events_match(a, b)
+            assert is_match is False, f"placeholder {ph!r} wrongly matched"
+
+    def test_real_shared_link_still_matches(self):
+        a = {"title": "One Name", "date": "2026-09-02", "location": None, "link": "https://x.com/e/1"}
+        b = {"title": "Other Name", "date": "2026-09-02", "location": None, "link": "https://x.com/e/1"}
+        is_match, score = events_match(a, b)
+        assert is_match is True and score >= 2
+
+    def test_dedup_keeps_distinct_same_day_no_url_events(self):
+        events = [
+            {"title": "Exiles Munch", "date": "2026-09-02",
+             "location": "Exiles", "link": "TBD"},
+            {"title": "Go Topless Subs Meetup", "date": "2026-09-02",
+             "location": "Oakland", "link": "TBD"},
+            {"title": "SpankLab", "date": "2026-09-02",
+             "location": "Wicked Grounds", "link": "TBD"},
+            {"title": "Miss Vickis Munch", "date": "2026-09-02",
+             "location": "Milpitas", "link": "TBD"},
+        ]
+        assert len(dedup_events(events)) == 4
 
 
 class TestFingerprintStore:

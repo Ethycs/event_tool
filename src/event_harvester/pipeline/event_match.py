@@ -7,6 +7,7 @@ and maintains a fingerprint store for cross-run dedup.
 import logging
 import string
 from datetime import date
+from urllib.parse import urlparse
 
 from event_harvester.observability.tracing import set_span_attrs, traced
 from event_harvester.utils import data_path, load_json, save_json
@@ -22,6 +23,35 @@ _TRACER = "event_harvester.pipeline.event_match"
 FINGERPRINT_FILE = data_path(".event_fingerprints.json")
 
 _STOP_WORDS = frozenset({"the", "a", "an", "at", "in", "on", "for", "and", "of", "to"})
+
+# A link is only a dedup key when it identifies THE EVENT. When a message
+# carries no event URL (calendar rows don't), the LLM fills the field with
+# either a placeholder ("TBD") or the bare source domain ("https://erobay.com")
+# — both shared across every event from that source. A link match scores +2 (an
+# instant match), so either one collapsed a whole day of distinct events into
+# one. Measured on erobay 2026-09-02: 6 distinct same-day events → 1, every row
+# carrying `link=https://erobay.com`. Both are normalized to None in
+# `event_signature` so link only ever matches a specific event URL (one with a
+# path), never a placeholder or a homepage.
+_PLACEHOLDER_LINKS = frozenset({"tbd", "n/a", "na", "none", "null", "-", "--",
+                                "unknown", "todo", "no link", "not available"})
+
+
+def _link_key(link) -> str | None:
+    """A link usable as a dedup key, or None. None for placeholders and for
+    bare domains/homepages (no path), which identify a venue, not an event."""
+    if not link or not isinstance(link, str):
+        return None
+    s = link.strip().lower()
+    if not s or s in _PLACEHOLDER_LINKS:
+        return None
+    try:
+        p = urlparse(s)
+    except ValueError:
+        return s  # unparseable but non-empty: keep as-is, it's at least specific
+    if p.scheme and p.netloc and p.path.strip("/") == "" and not p.query:
+        return None  # scheme://host with no path/query — a homepage, shared by many
+    return s
 
 
 def _normalize_date(date_val) -> str | None:
@@ -130,38 +160,26 @@ def event_signature(event: dict) -> dict:
         "title_words": _normalize_title(title),
         "date": _normalize_date(event.get("date")),
         "location_words": _normalize_location(location),
-        "link": link.strip().lower() if link else None,
+        "link": _link_key(link),
     }
 
 
 def events_match(a: dict, b: dict) -> tuple[bool, int]:
     """Compare two events by structured fields.
 
-    Returns (is_match, score) where score = number of matching fields.
-    Link match counts as 2. Match requires score >= 2.
+    Returns (is_match, score) where score = number of matching fields; a link
+    match counts as 2. A match requires score >= 2 **and** agreement on the
+    identity of the event — a title or a link.
+
+    The identity guard matters because date and location are shared, not
+    identifying: a venue hosts many distinct events on the same day, so
+    date + location alone (score 2) would merge them. On erobay 2026-09-02
+    'Go Topless! Subs Meetup' and "Miss Vicki's Munch" both carried the
+    category "Munch" as their location on the same date and collapsed into one.
+    Two events are the same event only when they share a title or a specific
+    URL — never merely a day and a room.
     """
-    sig_a = event_signature(a)
-    sig_b = event_signature(b)
-    score = 0
-
-    # Title match (word overlap >= 50%)
-    if _titles_overlap(sig_a["title_words"], sig_b["title_words"]):
-        score += 1
-
-    # Date match
-    if sig_a["date"] and sig_b["date"] and sig_a["date"] == sig_b["date"]:
-        score += 1
-
-    # Location match
-    loc_a = sig_a["location_words"]
-    loc_b = sig_b["location_words"]
-    if loc_a and loc_b and _titles_overlap(loc_a, loc_b):
-        score += 1
-
-    # Link match (counts as 2)
-    if sig_a["link"] and sig_b["link"] and sig_a["link"] == sig_b["link"]:
-        score += 2
-
+    score = _sig_match_score(event_signature(a), event_signature(b))
     return (score >= 2, score)
 
 
@@ -358,15 +376,26 @@ def dedup_events(events: list[dict]) -> list[dict]:
 
 
 def _sig_match_score(sig_a: dict, sig_b: dict) -> int:
-    """Compare two pre-computed signatures. Returns match score."""
+    """Compare two pre-computed signatures. Returns match score.
+
+    The score is what the caller thresholds at >= 2. It carries the identity
+    guard: without agreement on title or link, date and location alone (both
+    shared, not identifying) are capped below the threshold, so two distinct
+    events in the same room on the same day never read as one. This is the sole
+    scorer for both `events_match` and `dedup_events` — the two must not drift.
+    """
     score = 0
-    if _titles_overlap(sig_a["title_words"], sig_b["title_words"]):
+    title_hit = _titles_overlap(sig_a["title_words"], sig_b["title_words"])
+    if title_hit:
         score += 1
     if sig_a["date"] and sig_b["date"] and sig_a["date"] == sig_b["date"]:
         score += 1
     loc_a, loc_b = sig_a["location_words"], sig_b["location_words"]
     if loc_a and loc_b and _titles_overlap(loc_a, loc_b):
         score += 1
-    if sig_a["link"] and sig_b["link"] and sig_a["link"] == sig_b["link"]:
+    link_hit = bool(sig_a["link"] and sig_b["link"] and sig_a["link"] == sig_b["link"])
+    if link_hit:
         score += 2
+    if not (title_hit or link_hit):
+        return min(score, 1)  # date+location is not identity
     return score
