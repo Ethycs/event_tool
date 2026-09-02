@@ -329,6 +329,16 @@
     "forward_days": 60
   },
   {
+    "url": "https://agendahero.com/feeds/private-b89ea787-2288-4967-96b3-d29c0c051414",
+    "name": "agendahero-ai",
+    "mode": "ics",
+    "forward_days": 60,
+    "keywords": [
+      "ai",
+      "tech"
+    ]
+  },
+  {
     "url": "https://forbiddentickets.com/events",
     "name": "forbiddentickets",
     "mode": "calendar",
