@@ -451,10 +451,12 @@ def _carry_calendar_dates(events: list[dict], messages: list[dict]) -> int:
 
     For every event whose title (asides stripped) or link matches such rows,
     reset its date to the **soonest upcoming** matching row — the instance a
-    reader wants surfaced now. Confined to ``platform == "web"`` messages that
-    carry an explicit ``date:`` line, so chat/mail extraction (where the LLM's
-    date reasoning is load-bearing and titles are rewritten) is untouched.
-    Returns the number of dates changed.
+    reader wants surfaced now — and set its ``link`` to that row's own event
+    URL, so the card's "open" link points at the source page (the LLM leaves it
+    blank or fills a bare domain for URL-less calendar rows). Confined to
+    ``platform == "web"`` messages that carry an explicit ``date:`` line, so
+    chat/mail extraction (where the LLM's date reasoning is load-bearing and
+    titles are rewritten) is untouched. Returns the number of dates changed.
     """
     from datetime import date
 
@@ -469,7 +471,9 @@ def _carry_calendar_dates(events: list[dict], messages: list[dict]) -> int:
         rows.append({
             "date": dm.group(1),
             "title": _norm_title(content.splitlines()[0] if content else ""),
-            "url": (m.get("channel") or "").strip(),
+            # Full event URL (calendar._calcium_messages preserves it as `url`);
+            # `channel` is truncated and not clickable, so prefer `url`.
+            "url": (m.get("url") or m.get("channel") or "").strip(),
         })
     if not rows:
         return 0
@@ -479,7 +483,7 @@ def _carry_calendar_dates(events: list[dict], messages: list[dict]) -> int:
     for ev in events:
         et = _norm_title(ev.get("title") or "")
         link = (ev.get("link") or "").strip()
-        cands: list[str] = []
+        matches: list[dict] = []
         for r in rows:
             title_hit = bool(et) and bool(r["title"]) and (
                 et == r["title"]
@@ -489,14 +493,18 @@ def _carry_calendar_dates(events: list[dict], messages: list[dict]) -> int:
             link_hit = (len(link) > 15 and bool(r["url"])
                         and (link in r["url"] or r["url"].startswith(link)))
             if title_hit or link_hit:
-                cands.append(r["date"])
-        if not cands:
+                matches.append(r)
+        if not matches:
             continue
-        upcoming = sorted(d for d in cands if d >= today)
-        target = upcoming[0] if upcoming else sorted(cands)[0]
-        if ev.get("date") != target:
-            ev["date"] = target
+        upcoming = [r for r in matches if r["date"] >= today]
+        target = min(upcoming or matches, key=lambda r: r["date"])
+        if ev.get("date") != target["date"]:
+            ev["date"] = target["date"]
             changed += 1
+        # Carry the row's real event URL as the open link.
+        url = target["url"]
+        if url.lower().startswith(("http://", "https://")) and ev.get("link") != url:
+            ev["link"] = url
     if changed:
         logger.info("carried calendar row dates onto %d event(s)", changed)
     return changed

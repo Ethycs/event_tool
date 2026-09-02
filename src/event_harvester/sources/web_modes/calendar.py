@@ -278,6 +278,11 @@ def _calcium_messages(uc, src: dict, event_links: list[dict], domain: str,
             "timestamp": f"{lnk['date_hint']}T00:00:00+00:00",
             "author": domain,
             "channel": unquote(lnk["url"])[:120],
+            # The full, untruncated event URL — the row's own page. `channel`
+            # is capped at 120 for display/grouping and cuts the URL mid-query,
+            # so it isn't clickable; this preserves the real link for the event
+            # to carry as its "open" link (see analysis._carry_calendar_dates).
+            "url": lnk["url"],
             "content": content[:5000],
         })
     logger.info("%s: %d messages.", name, len(messages))

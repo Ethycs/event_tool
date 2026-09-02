@@ -14,7 +14,8 @@ from event_harvester.pipeline.analysis import _carry_calendar_dates, _norm_title
 def _msg(title: str, date: str, url: str = "", platform: str = "web") -> dict:
     return {
         "platform": platform,
-        "channel": url,
+        "channel": url[:120],
+        "url": url,  # full, untruncated event URL (calcium messages carry this)
         "content": f"{title}\ndate: {date}\ntime: 7:00pm\nlocation: Somewhere",
     }
 
@@ -72,3 +73,20 @@ def test_unmatched_event_is_untouched():
     messages = [_msg("Completely Other Event", "2099-06-05")]
     assert _carry_calendar_dates(events, messages) == 0
     assert events[0]["date"] == "2099-06-01"
+
+
+def test_open_link_is_carried_from_the_row_url():
+    # The LLM leaves erobay events with a useless link; the row's own event
+    # URL should become the card's open link.
+    full = "https://erobay.com/calendar/Calcium40.pl?ID=99&Date=2099/2/13&Op=PopupWindow"
+    events = [{"title": "Go Topless Subs Meetup", "date": "2099-02-13", "link": "https://erobay.com"}]
+    messages = [_msg("Go Topless! Subs Meetup [Oakland]", "2099-02-13", url=full)]
+    _carry_calendar_dates(events, messages)
+    assert events[0]["link"] == full
+
+
+def test_unmatched_event_keeps_its_own_link():
+    events = [{"title": "Unrelated Thing", "date": "2099-06-01", "link": "https://real.example/e/1"}]
+    messages = [_msg("Completely Other Event", "2099-06-05", url="https://erobay.com/x?ID=1")]
+    _carry_calendar_dates(events, messages)
+    assert events[0]["link"] == "https://real.example/e/1"
