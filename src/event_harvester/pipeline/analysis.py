@@ -1,6 +1,7 @@
 """LLM-based task extraction from messages."""
 
 import logging
+import re
 from dataclasses import dataclass, field
 
 from event_harvester.config import LLMConfig
@@ -420,7 +421,85 @@ def extract_events_llm(
             filtered, days_back, cfg, batch_size=batch_size)
 
     rejects.update(llm_rejects)
+    _carry_calendar_dates(events, filtered)
     return ExtractionResult(summary, events, rejects)
+
+
+_DATE_LINE_RE = re.compile(r"(?mi)^date:\s*(\d{4}-\d{2}-\d{2})\b")
+
+
+def _norm_title(s: str) -> str:
+    """Lowercased title with parenthetical/bracket asides and punctuation
+    stripped, so 'Playland at the Cat Club (every Wednesday)' and the LLM's
+    'Playland at the Cat Club' compare equal."""
+    s = re.sub(r"\([^)]*\)", " ", s or "")
+    s = re.sub(r"\[[^\]]*\]", " ", s)
+    s = re.sub(r"[^a-z0-9 ]", " ", s.lower())
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _carry_calendar_dates(events: list[dict], messages: list[dict]) -> int:
+    """Snap calendar-sourced events onto their row's own date.
+
+    A web-calendar message is one event on a date the row already states (its
+    ``date:`` line — see ``web_modes/calendar._hint_header``). The LLM must not
+    move it, but it does: given a recurring row ('…(every Wednesday)') it mints
+    a *later* instance, and given several instances it collapses them onto one
+    far-off date — so today's occurrence silently vanishes from the feed
+    (measured on erobay 2026-09-02: 'Playland at the Cat Club' re-dated from
+    today to next Wednesday).
+
+    For every event whose title (asides stripped) or link matches such rows,
+    reset its date to the **soonest upcoming** matching row — the instance a
+    reader wants surfaced now. Confined to ``platform == "web"`` messages that
+    carry an explicit ``date:`` line, so chat/mail extraction (where the LLM's
+    date reasoning is load-bearing and titles are rewritten) is untouched.
+    Returns the number of dates changed.
+    """
+    from datetime import date
+
+    rows: list[dict] = []
+    for m in messages:
+        if m.get("platform") != "web":
+            continue
+        content = m.get("content") or ""
+        dm = _DATE_LINE_RE.search(content)
+        if not dm:
+            continue
+        rows.append({
+            "date": dm.group(1),
+            "title": _norm_title(content.splitlines()[0] if content else ""),
+            "url": (m.get("channel") or "").strip(),
+        })
+    if not rows:
+        return 0
+
+    today = date.today().isoformat()
+    changed = 0
+    for ev in events:
+        et = _norm_title(ev.get("title") or "")
+        link = (ev.get("link") or "").strip()
+        cands: list[str] = []
+        for r in rows:
+            title_hit = bool(et) and bool(r["title"]) and (
+                et == r["title"]
+                or (len(et) >= 6 and len(r["title"]) >= 6
+                    and (et.startswith(r["title"]) or r["title"].startswith(et)))
+            )
+            link_hit = (len(link) > 15 and bool(r["url"])
+                        and (link in r["url"] or r["url"].startswith(link)))
+            if title_hit or link_hit:
+                cands.append(r["date"])
+        if not cands:
+            continue
+        upcoming = sorted(d for d in cands if d >= today)
+        target = upcoming[0] if upcoming else sorted(cands)[0]
+        if ev.get("date") != target:
+            ev["date"] = target
+            changed += 1
+    if changed:
+        logger.info("carried calendar row dates onto %d event(s)", changed)
+    return changed
 
 
 def _extract_events_cloud(
