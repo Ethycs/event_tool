@@ -321,5 +321,111 @@
       "queer",
       "music"
     ]
+  },
+  {
+    "url": "https://calendar.google.com/calendar/ical/cb8skfu38u4kbnmtt8mhqpqnck%40group.calendar.google.com/public/basic.ics",
+    "name": "gay-agenda",
+    "mode": "ics",
+    "forward_days": 60
+  },
+  {
+    "url": "https://forbiddentickets.com/events",
+    "name": "forbiddentickets",
+    "mode": "calendar",
+    "scroll_seconds": 8
+  },
+  {
+    "url": "https://www.kqed.org/events",
+    "name": "kqed",
+    "mode": "calendar",
+    "scroll_seconds": 8
+  },
+  {
+    "url": "https://dothebay.com/",
+    "name": "dothebay",
+    "mode": "calendar",
+    "scroll_seconds": 8
+  },
+  {
+    "url": "https://gay.dothebay.com/",
+    "name": "gay-dothebay",
+    "mode": "calendar",
+    "scroll_seconds": 8
+  },
+  {
+    "url": "https://www.transform1060.org/calendar/",
+    "name": "transform1060",
+    "mode": "calendar",
+    "category": "venues",
+    "scroll_seconds": 8,
+    "cooldown_hours": 6
+  },
+  {
+    "url": "https://ra.co/events/us/sanfrancisco",
+    "name": "ra-sf",
+    "mode": "calendar",
+    "native_chrome": true,
+    "scroll_seconds": 8,
+    "cooldown_hours": 6,
+    "keywords": [
+      "music"
+    ]
+  },
+  {
+    "url": "https://themidwaysf.com/events/",
+    "name": "midway",
+    "mode": "calendar",
+    "category": "venues",
+    "native_chrome": true,
+    "scroll_seconds": 8,
+    "cooldown_hours": 6
+  },
+  {
+    "url": "https://audiosf.com/events",
+    "name": "audio-sf",
+    "mode": "calendar",
+    "category": "venues",
+    "scroll_seconds": 8,
+    "cooldown_hours": 6
+  },
+  {
+    "url": "https://www.sketchboard.co/",
+    "name": "sketchboard",
+    "mode": "calendar",
+    "category": "venues",
+    "scroll_seconds": 8,
+    "cooldown_hours": 6
+  },
+  {
+    "url": "https://syzygysf.com/",
+    "name": "syzygy",
+    "mode": "calendar",
+    "category": "venues",
+    "scroll_seconds": 8,
+    "cooldown_hours": 6
+  },
+  {
+    "url": "https://makerfaire.com/",
+    "name": "makerfaire",
+    "mode": "calendar",
+    "native_chrome": true,
+    "scroll_seconds": 8,
+    "cooldown_hours": 12
+  },
+  {
+    "url": "https://www.meetup.com/hardwarestartupsf/events/",
+    "name": "hardwarestartupsf",
+    "mode": "calendar",
+    "scroll_seconds": 8,
+    "keywords": [
+      "ai",
+      "tech"
+    ]
+  },
+  {
+    "url": "https://events.akiba.party/",
+    "name": "akiba",
+    "mode": "calendar",
+    "scroll_seconds": 8
   }
 ]
