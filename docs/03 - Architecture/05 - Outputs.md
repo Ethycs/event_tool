@@ -147,7 +147,7 @@ Built on Starlette + uvicorn, which `mcp`/`fastmcp` already pull in — **no new
 | `/calendar` | `data/.site/calendar.html` | the month grid, no thumbnails |
 | `/admin` | rendered per request | caps, keywords, profiles — `servers/admin.py` |
 | `/events.json` | `data/.site/events.json` | the same projection the pages embed |
-| `/healthz`, `POST /refresh` | — | state, identity, queue |
+| `/healthz`, `GET`/`POST /refresh` | — | state, identity, queue; `GET /refresh` is a control page (buttons + `/healthz` poll), `POST` triggers |
 
 `/` and `/calendar` are written together in one `_write` pass, so they cannot show different harvests. A calendar built lazily on first request would have been one more thing that can be stale. Both are served `no-store`: the point of the URL is that it is current.
 
@@ -158,7 +158,8 @@ Built on Starlette + uvicorn, which `mcp`/`fastmcp` already pull in — **no new
 | Builds from **cache first**, then harvests in the background | A cold start that waited for a full harvest would serve `503` for minutes |
 | A failed harvest keeps the **last good page** | The site must not go down because one source broke; the error surfaces on `/healthz` |
 | Refreshes serialised by a lock | A harvest opens browsers and calls an LLM. Two at once doubles the cost and races on the output file |
-| `POST`-only `/refresh` | A link preview or crawler must not be able to trigger a harvest |
+| `/refresh`: GET is a page, only POST triggers | A link preview or crawler (both GET) must not start a harvest — so the trigger is POST, while GET serves a safe control page with buttons that POST |
+| `POST /refresh` is fire-and-forget | A full harvest takes minutes; a blocking request dies at the proxy's read timeout (~60s). The POST returns `{"started": true}` at once and the page polls `/healthz`. Measured 2026-09-02: a blocking POST behind `central-dev.zt/harvester` hung the client until it was made non-blocking |
 | Loopback by default | **No authentication.** These are personal events; `--host 0.0.0.0` needs a proxy with auth in front |
 | Sleep floored at 60s | `--interval-hours 0.0001` would otherwise harvest in a hot loop |
 | The page **re-renders**, it does not reload | A reload discards the search term, active filter and scroll position — the state a browsing session has built up |

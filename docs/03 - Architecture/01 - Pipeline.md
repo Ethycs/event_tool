@@ -61,7 +61,8 @@ A checkpoint (`await reporter.checkpoint()`) fires before each of the four `upda
 3. If `classifier.has_trained_models()`: `filter_actionable()` → `rejects["classifier"]`; then `prioritize_with_caps()` (or a flat sort+slice to `cap_total` if `caps` is falsy) → `rejects["caps"]`; then `rerank_messages(top_k=cap_total)` (falls back to a plain score-sort if `sentence-transformers` isn't installed) → `rejects["reranker"]`.
 4. Else (no trained classifiers): skip straight to caps (`prioritize_with_caps` or `prioritize(max_messages=cap_total)`) → `rejects["caps"]`; `rejects["reranker"]` is never set in this branch (the orchestrator's `setdefault` fills it with `[]`).
 5. Rejects are **returned** on an `ExtractionResult(summary, events, rejects)`. *Changed 2026-07-30: they used to be stashed on the function object (`extract_events_llm._last_rejects`) and read back by the orchestrator via `getattr`.*
-6. Dispatch to `_extract_events_local` (backend `"local"`) or `_extract_events_cloud` (everything else).
+6. **Extraction cache** (`pipeline/extraction_cache.py`, added 2026-09-02): after filtering, `filtered` is split into cache hits and misses by `xcache.partition()`. Only the misses (`to_extract`) go to the backend; hits contribute their previously-extracted events with no LLM call. After the backend returns, `xcache.record()` stores each miss's outcome and `xcache.save()` persists it; cached + fresh events are then `dedup_events()`-merged. On by default; `EH_EXTRACTION_CACHE=0` restores the old send-everything path. See the module entry below for the safety rule.
+7. Dispatch to `_extract_events_local` (backend `"local"`) or `_extract_events_cloud` (everything else) — on `to_extract`, not the full filtered set.
 
 `_extract_events_cloud`: splits into batches of 10, submits each to the thread pool, calls `chat_completion()` then `_parse_event_ini(raw)`, and for empty-result batches records the whole batch into `llm_no_events`. Returns `(summary, events, llm_rejects)`. Finally runs `dedup_events()` (from `event_match.py`) as a within-run fingerprint-based collapse.
 
@@ -85,6 +86,25 @@ Returning the data closed both, and was the prerequisite for moving the whole st
 The test that should have caught it, `tests/test_pipeline.py::test_unlimited_caps_passes_none_to_extract`, asserted only that `caps is None` *reaches* `extract_events_llm`. The regression test added with the fix, `tests/test_analysis.py::TestCapEffect`, counts the messages that actually reach `_extract_events_cloud` instead — 200 in, 200 out for both `caps=None` and an all-`-1` `CapConfig`, with `CapConfig(total=40)` still trimming.
 
 **`dead code?`** — `summary` returned by both `_extract_events_local` and `_extract_events_cloud` is effectively always `""`/unused downstream: `_extract_events_cloud` hardcodes `return "", unique`; `_extract_events_local` threads `batch_summary` from `_parse_event_ini`, but `_parse_event_ini` always returns `""` as its first element (`analysis.py:568`, `_PRIO_MAP`/`PRIORITY_LABEL` constants near the top of the file also appear unused by any code path read here — `unverified`, not traced further outside this subsystem).
+
+### `pipeline/extraction_cache.py` — memoize extraction, keyed by message content
+
+**Domain:** stop re-sending unchanged messages to the LLM every harvest. **Why it exists:** once the Discord collector 10×'d message volume (measured 2026-09-02: **11,093** cached messages, caps off, batch-of-5 at ~10 s each), a harvest wedged for 30+ min in `stage: extract` — not a deadlock, just an uncapped re-extraction of the same messages every run. **Runs at:** sync, inside `extract_events_llm` between filtering and backend dispatch; file I/O once per harvest (`load` at start, `save` at end — not per message).
+
+| | |
+|---|---|
+| File | `data/.extraction_cache.json` (`CACHE_FILE`) — gitignored under `data/*` |
+| Key | `sha256(_VERSION ␟ platform ␟ content)` — an edit is a miss; bumping `_VERSION` invalidates all entries at once when the prompt/schema changes |
+| Value | `{"events": [...], "ts": epoch}` — the events attributed to that message, or `[]` for a message proven to yield nothing |
+| Toggle | on by default; `EH_EXTRACTION_CACHE` ∈ {`0`,`false`,`off`,`no`} disables |
+| Pruned | `save()` drops entries older than 30 days, then caps at 100k oldest-first |
+
+**The safety rule (the whole point):** never suppress an event we are not certain about, because a false negative is an event that silently stops appearing.
+- A message is cached as **no-event** only when its *entire batch* was empty (`llm_no_events`) — proof it yielded nothing, not merely that nothing linked to it.
+- A message is cached **with events** only for events confidently linked to it (`_source_ids`, from `attach_source_ids`'s single-match rule).
+- A message that reached the model in an event-producing batch but linked to none of them, and any message whose batch **errored** (`llm_errors`), is **not** cached — re-extracted next run. Correctness over hit-rate.
+
+**Interaction with dates:** web-calendar events are immune to staleness — `_carry_calendar_dates` re-applies each row's stated date every run over the full filtered set (cached messages included). Chat events the LLM dated *relative to today* are cached with their first-seen date; if identical text recurs on a later day the date can be stale (v1 limitation — bump `_VERSION` if it bites). **Tests:** `tests/test_extraction_cache.py` (19, incl. a two-run wiring test proving the second run sends zero messages to the LLM); the real cache is isolated per-test in `tests/conftest.py`.
 
 ### `pipeline/classifier.py` — noise pre-filter
 

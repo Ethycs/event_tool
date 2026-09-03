@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from event_harvester.config import LLMConfig
 from event_harvester.llm import chat_completion
 from event_harvester.observability.tracing import get_tracer
+from event_harvester.pipeline import extraction_cache as xcache
 
 logger = logging.getLogger("event_harvester.pipeline.analysis")
 tracer = get_tracer("event_harvester.pipeline.analysis")
@@ -409,16 +410,43 @@ def extract_events_llm(
     # of the model being served, not of the extractor. The default model's
     # context window is what sets it — see `LLMConfig.batch_size`.
     batch_size = getattr(cfg, "batch_size", 5) or 5
+
+    # Extraction cache: skip the LLM for messages seen unchanged before. Most
+    # of a harvest is the same messages as last run, and most produce nothing;
+    # sending them again is what turned harvests into hours-long extracts once
+    # the collector 10x'd message volume. See `pipeline/extraction_cache.py`.
+    use_cache = xcache.enabled()
+    cache = xcache.load() if use_cache else {}
+    if use_cache:
+        to_extract, cached_events, hits = xcache.partition(filtered, cache)
+        if hits:
+            logger.info(
+                "extraction cache: %d/%d message(s) from cache (%d event(s) reused); "
+                "%d to extract",
+                hits, len(filtered), len(cached_events), len(to_extract),
+            )
+    else:
+        to_extract, cached_events = filtered, []
+
     if cfg.backend == "local":
         summary, events, llm_rejects = _extract_events_local(
-            filtered, days_back, cfg, batch_size=batch_size)
+            to_extract, days_back, cfg, batch_size=batch_size)
     else:
         logger.info(
             "Sending %d messages to %s (backend=%s) in batches of %d ...",
-            len(filtered), cfg.display_name, cfg.backend, batch_size,
+            len(to_extract), cfg.display_name, cfg.backend, batch_size,
         )
         summary, events, llm_rejects = _extract_events_cloud(
-            filtered, days_back, cfg, batch_size=batch_size)
+            to_extract, days_back, cfg, batch_size=batch_size)
+
+    if use_cache:
+        xcache.record(cache, to_extract, events, llm_rejects)
+        xcache.save(cache)
+        if cached_events:
+            # Cached and freshly-extracted events were each deduped in
+            # isolation; a final pass collapses duplicates across the two sets.
+            from event_harvester.pipeline.event_match import dedup_events
+            events = dedup_events(events + cached_events)
 
     rejects.update(llm_rejects)
     _carry_calendar_dates(events, filtered)

@@ -22,6 +22,22 @@ def _isolate_job_queue(tmp_path, monkeypatch):
     monkeypatch.setattr(jobs, "JOBS_DIR", tmp_path / "_jobs")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_extraction_cache(tmp_path, monkeypatch):
+    """No test may read or write the real extraction cache.
+
+    `extract_events_llm` now memoizes to `data/.extraction_cache.json`; without
+    this, any test that reaches the extractor pollutes that file and the next
+    test's hit/miss behaviour depends on run order. Autouse for the same reason
+    as the job queue above — remembering to patch it per test is the discipline
+    that fails.
+    """
+    from event_harvester.pipeline import extraction_cache
+
+    monkeypatch.setattr(extraction_cache, "CACHE_FILE",
+                        tmp_path / ".extraction_cache.json")
+
+
 @pytest.fixture
 def sample_messages():
     """A set of sample messages from both platforms."""

@@ -135,7 +135,8 @@ Entry point: `commands/site.py:site_cmd` → `servers/site.py`. Serves the event
 | `GET /` | The page. `Cache-Control: no-store` — a cached copy of yesterday's events is worse than a slow load. `503` with an explanation if it has not been built |
 | `GET /events.json` | The same projection the page embeds, so a client cannot see a different set of events than a browser does |
 | `GET /healthz` | Build age, event count, last error, whether a refresh is in flight. `503` when the last build failed |
-| `POST /refresh` | Manual rebuild. **POST-only** so a link preview or crawler cannot trigger a harvest. `?harvest=0` rebuilds from cache |
+| `GET /refresh` | A control page: two buttons that POST, and a live status readout that polls `/healthz`. A GET has **no side effect** (a link preview or crawler still cannot start a harvest), so navigating here in a browser gives buttons, not a `405` |
+| `POST /refresh` | Manual rebuild — **fire-and-forget**: kicks the harvest onto a background task and returns immediately (`{"started": true}`), because a full harvest takes minutes and a blocking request times out behind a proxy. Watch progress on `/healthz`. `?harvest=0` rebuilds from cache. A second POST while one is in flight returns `{"already_refreshing": true}` (single-flight lock) |
 
 **Startup order matters**: it builds from the cached events *first* so the URL answers immediately, then harvests in the background. A cold start that waited for a full harvest would serve `503` for minutes.
 

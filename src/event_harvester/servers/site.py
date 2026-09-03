@@ -47,6 +47,103 @@ SITE_JSON = SITE_DIR / "events.json"
 
 DEFAULT_INTERVAL_HOURS = 24
 
+# The browser-facing side of `/refresh`. GET returns this page (a crawler
+# fetching it triggers nothing); the buttons POST, and the page then polls
+# `/healthz` so a multi-minute harvest never rides on one long HTTP request
+# that a proxy would time out. Relative URLs (`refresh`, `healthz`, `.`) so it
+# works identically on the bare port and under a `--root-path` mount.
+_REFRESH_PAGE = """<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Refresh — Event Harvester</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.5 system-ui, -apple-system, sans-serif; max-width: 42rem;
+         margin: 3rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.3rem; }
+  button { font: inherit; padding: .55rem 1rem; margin: .25rem .5rem .25rem 0;
+           border-radius: .4rem; border: 1px solid #8888; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { margin-top: 1rem; padding: .75rem 1rem; border-radius: .4rem;
+            background: #8881; white-space: pre-wrap; font-variant-numeric: tabular-nums; }
+  #status.err { color: #c0392b; }
+  a { color: inherit; }
+  .muted { opacity: .7; font-size: .9em; }
+</style>
+<h1>Event site refresh</h1>
+<p class="muted">A full refresh runs a harvest (browsers + LLM) on the server, so
+it takes a few minutes. This page fires it and watches progress &mdash; you can
+close the tab; the harvest keeps running.</p>
+<button id="full">Refresh now (full harvest)</button>
+<button id="cache">Rebuild from cache (fast)</button>
+<div id="status">Loading current status&hellip;</div>
+<p class="muted"><a href=".">&larr; back to events</a></p>
+<script>
+(function () {
+  const statusEl = document.getElementById('status');
+  const full = document.getElementById('full');
+  const cache = document.getElementById('cache');
+  let polling = false, start = 0;
+
+  function render(s, note) {
+    const lines = [];
+    if (note) lines.push(note);
+    lines.push('events served: ' + (s.events != null ? s.events : '?'));
+    lines.push('refreshing: ' + (s.refreshing ? 'yes' : 'no'));
+    if (s.age_seconds != null) lines.push('last refresh: ' + s.age_seconds + 's ago');
+    if (s.refreshes != null) lines.push('refreshes this run: ' + s.refreshes);
+    if (s.error) lines.push('error: ' + s.error);
+    statusEl.classList.toggle('err', !!s.error);
+    statusEl.textContent = lines.join('\\n');
+  }
+
+  const health = () => fetch('healthz', { cache: 'no-store' }).then(r => r.json());
+
+  async function poll() {
+    if (polling) return;
+    polling = true;
+    let sawRefreshing = false;
+    try {
+      for (;;) {
+        const s = await health();
+        if (s.refreshing) sawRefreshing = true;
+        render(s, s.refreshing ? '\\u23f3 harvesting\\u2026'
+                               : (sawRefreshing ? '\\u2705 done' : 'idle'));
+        if (sawRefreshing && !s.refreshing) break;
+        // finished fast, or never started:
+        if (!sawRefreshing && (Date.now() - start) > 15000) break;
+        await new Promise(r => setTimeout(r, 3000));
+      }
+    } finally {
+      polling = false;
+      full.disabled = cache.disabled = false;
+    }
+  }
+
+  async function trigger(harvest) {
+    full.disabled = cache.disabled = true;
+    start = Date.now();
+    try {
+      const r = await fetch('refresh' + (harvest ? '' : '?harvest=0'), { method: 'POST' });
+      const s = await r.json();
+      render(s, s.already_refreshing ? 'a refresh is already running \\u2014 watching it'
+                                     : 'started\\u2026');
+      poll();
+    } catch (e) {
+      statusEl.classList.add('err');
+      statusEl.textContent = 'could not start: ' + e;
+      full.disabled = cache.disabled = false;
+    }
+  }
+
+  full.addEventListener('click', () => trigger(true));
+  cache.addEventListener('click', () => trigger(false));
+  health().then(s => render(s, null))
+          .catch(e => { statusEl.textContent = 'status unavailable: ' + e; });
+})();
+</script>
+"""
+
 
 class SiteState:
     """What the server knows about the page it is serving.
@@ -247,11 +344,20 @@ def build_app(cfg, *, interval_hours: float = DEFAULT_INTERVAL_HOURS,
     keeps working while the proxy path does too.
     """
     from starlette.applications import Starlette
-    from starlette.responses import FileResponse, JSONResponse, PlainTextResponse
+    from starlette.responses import (
+        FileResponse,
+        HTMLResponse,
+        JSONResponse,
+        PlainTextResponse,
+    )
     from starlette.routing import Mount, Route
 
     state = SiteState()
     tracer = get_tracer(_TRACER)
+    # Hold a strong ref to each in-flight fire-and-forget refresh, or the event
+    # loop may garbage-collect the task mid-harvest (asyncio only keeps weak
+    # refs). The done-callback drops it once finished.
+    refresh_tasks: set[asyncio.Task] = set()
 
     async def index(request):
         with tracer.start_as_current_span("site.GET./") as span:
@@ -307,9 +413,26 @@ def build_app(cfg, *, interval_hours: float = DEFAULT_INTERVAL_HOURS,
         return JSONResponse(payload, status_code=200 if payload["ok"] else 503)
 
     async def refresh_now(request):
-        """Manual rebuild. POST-only so a link preview cannot trigger a harvest."""
+        """`/refresh`: GET renders a control page, POST triggers a rebuild.
+
+        A GET has no side effect (so a link preview or crawler still cannot
+        start a harvest — the original reason this was POST-only); it just
+        serves buttons that POST. The POST is **fire-and-forget**: it kicks the
+        refresh onto a background task and returns immediately, because a full
+        harvest takes minutes and a proxy would time the request out. The page
+        polls `/healthz` for progress. `?harvest=0` rebuilds from cache.
+        """
+        if request.method == "GET":
+            return HTMLResponse(_REFRESH_PAGE)
+
         do_harvest = request.query_params.get("harvest", "1") not in ("0", "false", "no")
-        return JSONResponse(await refresh(state, cfg, harvest=do_harvest))
+        if state.refreshing or state.lock.locked():
+            return JSONResponse({"started": False, "already_refreshing": True,
+                                 **state.snapshot()})
+        task = asyncio.create_task(refresh(state, cfg, harvest=do_harvest))
+        refresh_tasks.add(task)
+        task.add_done_callback(refresh_tasks.discard)
+        return JSONResponse({"started": True, "harvest": do_harvest, **state.snapshot()})
 
     async def _loop():
         """Rebuild every `interval_hours`, forever."""
@@ -353,7 +476,7 @@ def build_app(cfg, *, interval_hours: float = DEFAULT_INTERVAL_HOURS,
         Route("/calendar", calendar_page),
         Route("/events.json", events_json),
         Route("/healthz", healthz),
-        Route("/refresh", refresh_now, methods=["POST"]),
+        Route("/refresh", refresh_now, methods=["GET", "POST"]),
         *sources_routes(),
         *admin_routes(),
     ]
