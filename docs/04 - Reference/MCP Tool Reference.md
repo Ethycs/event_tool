@@ -39,8 +39,9 @@ No parameters.
 | Param | Type | Required | Default | Meaning |
 |---|---|---|---|---|
 | `status` | `str` | No | `"all"` | One of `all, new, known, approved, declined`. Anything else returns `{"ok": False, "error": "..."}` without touching the cache. |
+| `period` | `str` | No | `"all"` | Filter by *when the event happens*, relative to today: `today` (day 0), `this_week` (today → 7 days), `this_month` (today → 30 days), `upcoming` (today or later), `all` (no date filter). Cumulative and forward-looking; any value other than `all` excludes past-dated and undated events. `-`/space are accepted (`this-week`, `this week`). Invalid values return `{"ok": False, "error": "..."}`. Thresholds match `outputs/html_report._bucket` (0/7/30). |
 
-**Returns:** `{ok, generated_at, stats, events}` read straight from `data/.mcp_events.json`, filtered by `status` (`known` matches any status other than `"new"`).
+**Returns:** `{ok, generated_at, stats, period, count, events}` read straight from `data/.mcp_events.json`, filtered by `status` (`known` matches any status other than `"new"`) then by `period`. `count` is the number of events after filtering; `period` echoes the normalized value.
 
 **Mutates state:** No — read-only against the current cache. **`stateful`** in the sense that its output depends entirely on the last `harvest_events` call.
 

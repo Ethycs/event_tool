@@ -276,6 +276,132 @@ def _read_cached_events() -> tuple[list[dict], dict[str, int], int]:
     )
 
 
+# Fields whose absence makes an event a data-quality problem worth surfacing on
+# the debug endpoint. A calendar event with no date or no link is broken; one
+# with no time or location is thin. See `debug_incomplete`.
+_KEY_FIELDS = ("date", "time", "location", "link")
+_BLANK_VALUES = frozenset({"", "tbd", "none", "null"})
+
+
+def _is_blank(value: Any) -> bool:
+    """Empty for debug purposes: None, or a string that is empty/TBD/None/null."""
+    return value is None or str(value).strip().lower() in _BLANK_VALUES
+
+
+def _incomplete_events(events: list[dict]) -> tuple[list[dict], dict[str, int]]:
+    """Events missing one or more key fields, plus per-field missing counts.
+
+    Returns ``(rows, counts)``. Each row carries the event's ``index`` (its
+    position in the cache, stable until the next harvest), its identifying
+    fields, and the ``missing`` list — so 'why is this event blank?' is one
+    request, not a cache dump.
+    """
+    counts = {field: 0 for field in _KEY_FIELDS}
+    rows: list[dict] = []
+    for index, event in enumerate(events):
+        missing = [f for f in _KEY_FIELDS if _is_blank(event.get(f))]
+        if not missing:
+            continue
+        for field in missing:
+            counts[field] += 1
+        rows.append({
+            "index": index,
+            "title": event.get("title"),
+            "source": event.get("source"),
+            "date": event.get("date"),
+            "time": event.get("time"),
+            "location": event.get("location"),
+            "link": event.get("link"),
+            "missing": missing,
+        })
+    return rows, counts
+
+
+# Messaging platforms we always report on the empty-sources view, so a platform
+# that has gone dark (0 events) shows up even when nothing references it.
+_KNOWN_PLATFORMS = ("discord", "telegram", "signal", "gmail")
+# Aggregator hosts that front many distinct sources — a link on one of these
+# identifies the platform, not which configured source it came from, so they are
+# not used to attribute an event to a source by host.
+_GENERIC_HOSTS = frozenset({"calendar.google.com", "google.com"})
+
+
+def _host(url: Any) -> str:
+    """Bare registrable-ish host of a URL (``www.`` stripped), or ""."""
+    from urllib.parse import urlparse
+
+    try:
+        return urlparse(str(url or "")).netloc.lower().replace("www.", "")
+    except Exception:
+        return ""
+
+
+def _empty_sources(
+    events: list[dict], web_sources: list[dict]
+) -> tuple[list[dict], dict[str, int], int]:
+    """Tally events per configured source so dead sources are visible.
+
+    Returns ``(web_rows, platform_counts, unattributed)``:
+
+    - ``web_rows`` — one row per configured web source with the number of events
+      attributed to it, zero-count sources first. A web event is attributed by,
+      in order: an ``ics:<name>:``/``web:<name>:`` source-id prefix, its link
+      host matching a source's link/site/url host, then the source name
+      appearing in its link or ``source`` text.
+    - ``platform_counts`` — events per messaging platform, including the known
+      platforms at 0 so a silent one is obvious.
+    - ``unattributed`` — web events no configured source claimed (honest: link
+      attribution is best-effort, so a nonzero here means "look closer").
+    """
+    from collections import Counter
+
+    counts = {s.get("name", ""): 0 for s in web_sources if s.get("name")}
+    modes = {s.get("name", ""): s.get("mode") for s in web_sources if s.get("name")}
+    host_index: dict[str, str] = {}
+    for s in web_sources:
+        name = s.get("name")
+        if not name:
+            continue
+        for key in ("link", "site", "url"):
+            h = _host(s.get(key))
+            if h and h not in _GENERIC_HOSTS:
+                host_index.setdefault(h, name)
+
+    unattributed = 0
+    platform_counts: Counter = Counter({p: 0 for p in _KNOWN_PLATFORMS})
+    for e in events:
+        platforms = e.get("_platforms") or []
+        for p in platforms:
+            if p != "web":
+                platform_counts[p] += 1
+        if "web" not in platforms:
+            continue
+        name = None
+        for sid in e.get("_source_ids") or []:
+            parts = str(sid).split(":")
+            if len(parts) >= 2 and parts[0] in ("ics", "web") and parts[1] in counts:
+                name = parts[1]
+                break
+        if name is None:
+            name = host_index.get(_host(e.get("link")))
+        if name is None:
+            hay = f"{e.get('link') or ''} {e.get('source') or ''}".lower()
+            for cand in counts:
+                if cand.lower() in hay:
+                    name = cand
+                    break
+        if name in counts:
+            counts[name] += 1
+        else:
+            unattributed += 1
+
+    web_rows = [
+        {"name": n, "mode": modes.get(n), "events": counts[n]} for n in counts
+    ]
+    web_rows.sort(key=lambda r: (r["events"], r["name"]))
+    return web_rows, dict(platform_counts), unattributed
+
+
 def _write(events: list[dict], source_counts: dict[str, int], total_messages: int) -> None:
     import json
 
@@ -434,6 +560,52 @@ def build_app(cfg, *, interval_hours: float = DEFAULT_INTERVAL_HOURS,
         task.add_done_callback(refresh_tasks.discard)
         return JSONResponse({"started": True, "harvest": do_harvest, **state.snapshot()})
 
+    async def debug_incomplete(request):
+        """Events with empty key fields (date/time/location/link) — a
+        data-quality view for debugging. `?field=link` narrows to one missing
+        field. Reads the same cache the page serves."""
+        events, _counts, _total = _read_cached_events()
+        rows, missing_counts = _incomplete_events(events)
+        only = request.query_params.get("field")
+        if only in _KEY_FIELDS:
+            rows = [r for r in rows if only in r["missing"]]
+        return JSONResponse(
+            {
+                "ok": True,
+                "total_events": len(events),
+                "incomplete": len(rows),
+                "missing_counts": missing_counts,
+                "events": rows,
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async def debug_empty(request):
+        """Configured sources that produced no events — the 'which source went
+        dark?' view. Every web source and known messaging platform is listed
+        with its event count, zero-count first, so a source contributing nothing
+        (e.g. an ICS feed drowned in junk rows) is obvious. Reads the same cache
+        the page serves."""
+        from event_harvester.sources.web_utils import _load_web_sources
+
+        events, _counts, _total = _read_cached_events()
+        web_sources = _load_web_sources() or []
+        web_rows, platform_counts, unattributed = _empty_sources(events, web_sources)
+        empty_web = [r["name"] for r in web_rows if r["events"] == 0]
+        empty_platforms = [p for p, c in platform_counts.items() if c == 0]
+        return JSONResponse(
+            {
+                "ok": True,
+                "total_events": len(events),
+                "empty_web_sources": empty_web,
+                "empty_platforms": empty_platforms,
+                "web_sources": web_rows,
+                "platform_counts": platform_counts,
+                "unattributed_web_events": unattributed,
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
     async def _loop():
         """Rebuild every `interval_hours`, forever."""
         seconds = max(60.0, float(interval_hours) * 3600.0)
@@ -477,6 +649,8 @@ def build_app(cfg, *, interval_hours: float = DEFAULT_INTERVAL_HOURS,
         Route("/events.json", events_json),
         Route("/healthz", healthz),
         Route("/refresh", refresh_now, methods=["GET", "POST"]),
+        Route("/debug/incomplete", debug_incomplete),
+        Route("/debug/empty", debug_empty),
         *sources_routes(),
         *admin_routes(),
     ]

@@ -109,27 +109,159 @@ class TestServing:
         assert "disk full" in health.json()["error"]
 
 
+class TestIncompleteEventsDebug:
+    """The /debug/incomplete endpoint surfaces events with empty key fields."""
+
+    def test_helper_flags_missing_key_fields(self):
+        events = [
+            {"title": "Good", "date": "2026-09-10", "time": "19:00",
+             "location": "X", "link": "https://x/1"},
+            {"title": "No link", "date": "2026-09-10", "time": "19:00",
+             "location": "X", "link": ""},
+            {"title": "TBD date", "date": "TBD", "time": None,
+             "location": "X", "link": "https://x/2"},
+            {"title": "Empty", "date": None, "time": None, "location": None, "link": None},
+        ]
+        rows, counts = site_mod._incomplete_events(events)
+        assert [r["title"] for r in rows] == ["No link", "TBD date", "Empty"]
+        assert rows[0]["index"] == 1 and rows[0]["missing"] == ["link"]
+        assert counts["link"] == 2 and counts["date"] == 2 and counts["time"] == 2
+
+    def test_helper_all_complete_is_empty(self):
+        events = [{"date": "2026-09-10", "time": "19:00", "location": "X",
+                   "link": "https://x/1"}]
+        rows, counts = site_mod._incomplete_events(events)
+        assert rows == [] and all(v == 0 for v in counts.values())
+
+    def test_endpoint_returns_incomplete_events(self):
+        events = [
+            {"title": "Good", "date": "2026-09-10", "time": "19:00",
+             "location": "X", "link": "https://x/1"},
+            {"title": "Broken", "date": "2026-09-10", "time": None,
+             "location": "X", "link": ""},
+        ]
+        with patch.object(site_mod, "_collect", side_effect=_collect_ok), \
+             patch.object(site_mod, "_read_cached_events", return_value=(events, {}, 5)):
+            with client() as c:
+                res = c.get("/debug/incomplete")
+        assert res.status_code == 200
+        body = res.json()
+        assert body["total_events"] == 2 and body["incomplete"] == 1
+        assert body["events"][0]["title"] == "Broken"
+        assert set(body["events"][0]["missing"]) == {"time", "link"}
+        assert res.headers["cache-control"] == "no-store"
+
+    def test_endpoint_field_filter(self):
+        events = [
+            {"title": "NoLink", "date": "2026-09-10", "time": "19:00",
+             "location": "X", "link": ""},
+            {"title": "NoTime", "date": "2026-09-10", "time": "",
+             "location": "X", "link": "https://x/1"},
+        ]
+        with patch.object(site_mod, "_collect", side_effect=_collect_ok), \
+             patch.object(site_mod, "_read_cached_events", return_value=(events, {}, 0)):
+            with client() as c:
+                res = c.get("/debug/incomplete?field=link")
+        assert [e["title"] for e in res.json()["events"]] == ["NoLink"]
+
+
+class TestEmptySourcesDebug:
+    """The /debug/empty endpoint surfaces sources that produced no events."""
+
+    WEB_SOURCES = [
+        {"name": "erobay", "mode": "calendar", "url": "https://erobay.com/cal"},
+        {"name": "tamarackoakland", "mode": "ics",
+         "url": "https://calendar.google.com/calendar/ical/abc/public/basic.ics",
+         "link": "https://tamarackoakland.com/calendar"},
+        {"name": "theknockoutsf", "mode": "calendar",
+         "url": "https://theknockoutsf.com/calendar2"},
+    ]
+
+    def _events(self):
+        return [
+            {"title": "Rope Jam", "_platforms": ["web"],
+             "link": "https://erobay.com/e/1", "source": "erobay.com"},
+            {"title": "Poetry", "_platforms": ["web"],
+             "link": "https://tamarackoakland.com/calendar",
+             "_source_ids": ["ics:tamarackoakland:uid1"]},
+            {"title": "Chat night", "_platforms": ["discord"]},
+        ]
+
+    def test_helper_flags_zero_count_sources(self):
+        rows, platform_counts, unattributed = site_mod._empty_sources(
+            self._events(), self.WEB_SOURCES)
+        by_name = {r["name"]: r["events"] for r in rows}
+        assert by_name["erobay"] == 1
+        assert by_name["tamarackoakland"] == 1        # matched by ics: source-id
+        assert by_name["theknockoutsf"] == 0          # dark
+        assert rows[0]["events"] == 0                 # zero-count sorted first
+        assert unattributed == 0
+        assert platform_counts["discord"] == 1
+        assert platform_counts["signal"] == 0         # known platform, reported at 0
+
+    def test_helper_counts_unattributed_web_events(self):
+        events = [{"title": "Mystery", "_platforms": ["web"],
+                   "link": "https://who.example/x", "source": "who"}]
+        _rows, _plat, unattributed = site_mod._empty_sources(events, self.WEB_SOURCES)
+        assert unattributed == 1
+
+    def test_endpoint_lists_empty_sources(self):
+        with patch.object(site_mod, "_collect", side_effect=_collect_ok), \
+             patch.object(site_mod, "_read_cached_events",
+                          return_value=(self._events(), {}, 3)), \
+             patch("event_harvester.sources.web_utils._load_web_sources",
+                   return_value=self.WEB_SOURCES):
+            with client() as c:
+                res = c.get("/debug/empty")
+        assert res.status_code == 200
+        body = res.json()
+        assert body["empty_web_sources"] == ["theknockoutsf"]
+        assert "signal" in body["empty_platforms"]
+        assert body["total_events"] == 3
+        assert res.headers["cache-control"] == "no-store"
+
+
 class TestRefreshIsSurvivable:
     def test_a_failed_harvest_keeps_the_last_good_page(self):
-        """The site must not go down because one harvest broke."""
+        """A failed refresh must not raise, and must keep the last good events.
+
+        Driven directly on `refresh()` rather than through `POST /refresh`,
+        which is now fire-and-forget — the HTTP layer returns before the harvest
+        runs, so the survivability property lives on `refresh`, not the response.
+        """
+        state = site_mod.SiteState()
+
+        async def scenario():
+            with patch.object(site_mod, "_collect", side_effect=_collect_ok):
+                await site_mod.refresh(state, object(), harvest=False)  # 2 good events
+            assert state.event_count == 2
+            with patch.object(site_mod, "_collect",
+                              side_effect=RuntimeError("cloudflare said no")):
+                return await site_mod.refresh(state, object(), harvest=True)  # fails
+
+        snap = asyncio.run(scenario())
+        assert snap["error"] is not None
+        assert state.event_count == 2  # the failure kept the previous build
+
+    def test_refresh_get_is_a_safe_control_page(self):
+        """GET returns a buttons page with no side effect, so a link preview or
+        crawler cannot trigger a harvest — the reason it is not a plain GET."""
+        with patch.object(site_mod, "_collect", side_effect=_collect_ok) as collect:
+            with client() as c:
+                before = collect.call_count
+                res = c.get("/refresh")
+                assert res.status_code == 200
+                assert "text/html" in res.headers["content-type"]
+                assert collect.call_count == before  # GET harvested nothing
+                # A method that is neither GET nor POST is still rejected.
+                assert c.request("DELETE", "/refresh").status_code == 405
+
+    def test_refresh_post_is_fire_and_forget(self):
+        """POST returns immediately (a full harvest would time out a proxy)."""
         with patch.object(site_mod, "_collect", side_effect=_collect_ok):
             with client() as c:
-                assert c.get("/").status_code == 200
-
-                with patch.object(site_mod, "_collect",
-                                  side_effect=RuntimeError("cloudflare said no")):
-                    res = c.post("/refresh?harvest=1")
-
-                assert res.json()["error"] is not None
-                # Still serving.
-                assert c.get("/").status_code == 200
-                assert c.get("/healthz").json()["events"] == 2
-
-    def test_refresh_is_post_only(self):
-        """So a link preview or a crawler cannot trigger a harvest."""
-        with patch.object(site_mod, "_collect", side_effect=_collect_ok):
-            with client() as c:
-                assert c.get("/refresh").status_code == 405
+                body = c.post("/refresh?harvest=0").json()
+        assert body.get("started") is True or body.get("already_refreshing") is True
 
     def test_a_second_refresh_is_skipped_while_one_is_running(self):
         """A harvest opens browsers and calls an LLM; two at once doubles it."""

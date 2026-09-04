@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 from event_harvester import __version__
@@ -116,6 +116,48 @@ def _events_for_report(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "_thumb": event.get("_thumb") or "",
         })
     return out
+
+
+# Upcoming-window horizons (days from today, inclusive) for the `period` filter
+# on `list_latest_events`. Cumulative and forward-looking — "this_week" means
+# today through 7 days out, not the disjoint "This week" display bucket. Kept in
+# step with `outputs/html_report._bucket`'s day thresholds (0 / 7 / 30).
+_PERIOD_HORIZONS = {"today": 0, "this_week": 7, "this_month": 30}
+
+
+def _days_until(iso_date: str | None, today: date) -> int | None:
+    """Days from ``today`` to an ISO date (negative = past); None if unparseable.
+
+    Tolerates a ``'YYYY-MM-DD to …'`` range by taking the start date.
+    """
+    if not iso_date:
+        return None
+    stem = str(iso_date).split(" to ")[0].strip()[:10]
+    try:
+        return (date.fromisoformat(stem) - today).days
+    except ValueError:
+        return None
+
+
+def _filter_by_period(events: list[dict[str, Any]], period: str,
+                      today: date | None = None) -> list[dict[str, Any]]:
+    """Keep only events happening within the forward window ``period``.
+
+    ``period`` is one of ``_PERIOD_HORIZONS`` or ``"upcoming"``. Past-dated and
+    undated events are always excluded — a "what's on this week" question is
+    about the future. ``"all"`` should be handled by the caller (it means no
+    filtering); passed here it excludes past/undated like ``"upcoming"`` would.
+    """
+    today = today or date.today()
+    horizon = _PERIOD_HORIZONS.get(period)  # None for "upcoming"/"all"
+    kept: list[dict[str, Any]] = []
+    for event in events:
+        delta = _days_until(event.get("date"), today)
+        if delta is None or delta < 0:
+            continue
+        if horizon is None or delta <= horizon:
+            kept.append(event)
+    return kept
 
 
 def _public_event(event: dict[str, Any], index: int) -> dict[str, Any]:
@@ -571,21 +613,44 @@ def build_server(
 
     @server.tool()
     @traced("mcp.tool.list_latest_events", tracer_name=_TRACER)
-    def list_latest_events(status: str = "all") -> dict[str, Any]:
-        """List events from the latest MCP harvest cache."""
+    def list_latest_events(status: str = "all", period: str = "all") -> dict[str, Any]:
+        """List events from the latest MCP harvest cache.
+
+        ``status`` filters by review state: all | new | known | approved | declined.
+
+        ``period`` filters by *when the event happens*, relative to today — a
+        cumulative, forward-looking window (past and undated events are excluded
+        by any period other than ``all``):
+          today       — happening today
+          this_week   — today through 7 days out
+          this_month  — today through 30 days out
+          upcoming    — today or any time later
+          all         — no date filter (default)
+        """
         wanted = status.strip().lower()
         if wanted not in {"all", "new", "known", "approved", "declined"}:
             return {"ok": False, "error": "status must be all, new, known, approved, or declined"}
+
+        chosen = period.strip().lower().replace("-", "_").replace(" ", "_")
+        if chosen not in {"all", "upcoming", *_PERIOD_HORIZONS}:
+            return {"ok": False,
+                    "error": "period must be all, today, this_week, this_month, or upcoming"}
 
         data = _load_latest_events()
         events = data.get("events", [])
         public = [_public_event(event, i) for i, event in enumerate(events)]
         if wanted != "all":
             public = [event for event in public if event.get("status") == wanted]
+
+        if chosen != "all":
+            public = _filter_by_period(public, chosen)
+
         return {
             "ok": True,
             "generated_at": data.get("generated_at"),
             "stats": data.get("stats", {}),
+            "period": chosen,
+            "count": len(public),
             "events": public,
         }
 

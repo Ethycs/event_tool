@@ -85,6 +85,26 @@ def test_web_row_without_url_goes_to_llm():
     assert remaining == [m]           # no authoritative URL -> let the LLM handle it
 
 
+def test_url_in_channel_and_title_after_day_header():
+    # ma.to shape: the URL is only in `channel` (not `url`), and a `date: 3 Sep`
+    # day header precedes the real title. Both must be handled.
+    m = {
+        "platform": "web", "id": "mt1", "author": "ma.to",
+        "timestamp": f"{FUTURE}T00:00:00+00:00",
+        "content": (f"date: 3 Sep\nOdoo Experience Americas\ndate: {FUTURE}\n"
+                    "time: 09:00 - 18:00\nlocation: Pier 27, San Francisco\nblurb"),
+        "channel": "https://ma.to/event/odoo-experience-americas",
+        "url": None,
+    }
+    bypass, remaining = _calendar_rows_to_events([m])
+    assert remaining == [] and len(bypass) == 1
+    e = bypass[0]
+    assert e["title"] == "Odoo Experience Americas"     # not 'date: 3 Sep'
+    assert e["date"] == FUTURE                           # the ISO line, not '3 Sep'
+    assert e["time"] == "09:00"
+    assert e["link"] == "https://ma.to/event/odoo-experience-americas"  # from channel
+
+
 def test_non_web_message_untouched():
     chat = {"platform": "discord", "id": "d1", "author": "alice",
             "content": "event tonight\ndate: " + FUTURE, "channel": "123"}

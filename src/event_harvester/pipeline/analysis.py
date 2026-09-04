@@ -473,10 +473,28 @@ _NOISE_TITLES = frozenset({"reserved", "reserved meeting", "tbd", "private",
                            "private event", "hold", "closed"})
 
 
+_FIELD_PREFIX_RE = re.compile(r"(?i)^\s*(date|time|location|when|where)\s*:")
+
+
 def _field_line(content: str, field: str) -> str:
     """Value after a ``field:`` line in a calendar message, or ""."""
     m = re.search(rf"(?mi)^{field}:\s*(.+)$", content or "")
     return m.group(1).strip() if m else ""
+
+
+def _row_title(content: str) -> str:
+    """The event title in a calendar message: the first line that isn't a
+    ``date:``/``time:``/``location:`` field.
+
+    Most sources put the title on line 1, but some (ma.to) prepend a day header
+    like ``date: 3 Sep`` before it — taking line 1 blindly would title the event
+    'date: 3 Sep'. Skipping field-prefixed lines finds the real title either way.
+    """
+    for line in (content or "").splitlines():
+        s = line.strip()
+        if s and not _FIELD_PREFIX_RE.match(s):
+            return s
+    return ""
 
 
 def _row_time_to_24h(time_line: str) -> str | None:
@@ -531,8 +549,10 @@ def _calendar_rows_to_events(messages: list[dict]) -> tuple[list[dict], list[dic
     remaining: list[dict] = []
     for m in messages:
         content = m.get("content") or ""
-        url = (m.get("url") or "").strip()
-        title = content.splitlines()[0].strip() if content else ""
+        # The full event URL lives in `url`, but some calendar parsers only set
+        # `channel` (ma.to) — fall back to it, matching `_carry_calendar_dates`.
+        url = (m.get("url") or m.get("channel") or "").strip()
+        title = _row_title(content)
         dm = _DATE_LINE_RE.search(content)
         structured = (
             m.get("platform") == "web"
