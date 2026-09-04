@@ -14,7 +14,8 @@ to lose a day's harvest:
   attributable, and a drop attributed to the *wrong stage* is worse than an
   unattributed one, because it reads as a finding.
 * `TestTheCacheSurvives` — the write. A total outage leaves the previous cache
-  alone; a genuine empty result and a partial outage both still write.
+  alone. With accumulation (the default), a genuine empty night and a partial
+  outage both keep the standing future events rather than replacing them.
 """
 
 from __future__ import annotations
@@ -89,16 +90,21 @@ class TestTheCacheSurvives:
         held = json.loads(cache.read_text(encoding="utf-8"))["events"]
         assert len(held) == 2, "an outage overwrote the last good harvest"
 
-    def test_a_genuine_empty_night_still_writes(self, cache):
-        """Nothing found, nothing failed — that is a result, not an outage."""
+    def test_a_genuine_empty_night_keeps_standing_events(self, cache):
+        """Nothing found, nothing failed. Under accumulation this no longer wipes
+        the board — a night that harvested nothing new keeps the standing future
+        events rather than clearing them (the old wholesale-replace flicker)."""
         self._save([], 0)
-        assert json.loads(cache.read_text(encoding="utf-8"))["events"] == []
+        held = json.loads(cache.read_text(encoding="utf-8"))["events"]
+        assert {e["title"] for e in held} == {"Queer Night", "AI Meetup"}
 
-    def test_a_partial_outage_still_writes(self, cache):
-        """Some batches answered, so what came back is strictly newer."""
+    def test_a_partial_outage_unions_with_prior(self, cache):
+        """Some batches answered — what came back is unioned onto the standing
+        events, not written over them."""
         self._save([{"title": "Only one got through"}], 400)
         held = json.loads(cache.read_text(encoding="utf-8"))["events"]
-        assert [e["title"] for e in held] == ["Only one got through"]
+        assert {e["title"] for e in held} == {
+            "Queer Night", "AI Meetup", "Only one got through"}
 
     def test_an_empty_cache_is_not_protected(self, tmp_path, monkeypatch):
         """There is nothing to lose, so the write must proceed and record the

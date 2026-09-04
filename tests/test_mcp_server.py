@@ -6,6 +6,7 @@ import pytest
 
 from event_harvester.config import AppConfig
 from event_harvester.servers.mcp_server import (
+    _accumulate_events,
     _days_until,
     _filter_by_period,
     _load_latest_events,
@@ -15,6 +16,10 @@ from event_harvester.servers.mcp_server import (
     _source_kwargs,
     _summarize_config,
 )
+
+_FUT = (date.today() + timedelta(days=10)).isoformat()
+_FUT2 = (date.today() + timedelta(days=11)).isoformat()
+_PAST = (date.today() - timedelta(days=3)).isoformat()
 
 
 def test_parse_source_filter_accepts_csv_and_arrays():
@@ -70,6 +75,70 @@ def test_latest_event_cache_round_trip(tmp_path, monkeypatch):
     assert marked["_status"] == "declined"
     assert loaded["events"][0]["title"] == "AI Meetup"
     assert loaded["events"][0]["_status"] == "declined"
+
+
+# ── accumulation (keep prior future events, union the new run, expire past) ──
+
+def test_accumulate_unions_new_with_prior_future_events():
+    new = [{"title": "Fresh Gig", "date": _FUT, "link": "https://x/new"}]
+    prior = [{"title": "Standing Night", "date": _FUT2, "link": "https://x/old"}]
+    merged = _accumulate_events(new, prior)
+    titles = {e["title"] for e in merged}
+    assert titles == {"Fresh Gig", "Standing Night"}
+
+
+def test_accumulate_expires_past_prior_events():
+    new = [{"title": "Fresh", "date": _FUT, "link": "https://x/n"}]
+    prior = [{"title": "Gone By", "date": _PAST, "link": "https://x/old"}]
+    merged = _accumulate_events(new, prior)
+    assert [e["title"] for e in merged] == ["Fresh"]   # past prior dropped
+
+
+def test_accumulate_keeps_undated_prior():
+    prior = [{"title": "Someday", "date": None, "link": "https://x/someday"}]
+    merged = _accumulate_events([], prior)
+    assert [e["title"] for e in merged] == ["Someday"]  # can't expire undated
+
+
+def test_accumulate_collapses_the_same_event_seen_twice():
+    ev = {"title": "Repeat", "date": _FUT, "link": "https://x/same"}
+    merged = _accumulate_events([dict(ev)], [dict(ev)])
+    assert len(merged) == 1
+
+
+def test_accumulate_preserves_a_prior_decline_on_a_re_extracted_event():
+    prior = [{"title": "No Thanks", "date": _FUT, "link": "https://x/nt",
+              "_status": "declined"}]
+    # the new run re-extracts the same event as fresh ("new")
+    new = [{"title": "No Thanks", "date": _FUT, "link": "https://x/nt"}]
+    merged = _accumulate_events(new, prior)
+    assert len(merged) == 1
+    assert merged[0]["_status"] == "declined"   # decision survives the union
+
+
+def test_save_latest_events_accumulates_against_the_existing_cache(tmp_path, monkeypatch):
+    cache_file = tmp_path / ".mcp_events.json"
+    monkeypatch.setattr("event_harvester.servers.mcp_server.LATEST_EVENTS_FILE", cache_file)
+    monkeypatch.delenv("EH_ACCUMULATE", raising=False)  # default = on
+    _save_latest_events([{"title": "First", "date": _FUT, "link": "https://x/1"}],
+                        stats={"events": 1}, source_counts={}, links=[])
+    # a second, disjoint run must not wipe the first
+    _save_latest_events([{"title": "Second", "date": _FUT2, "link": "https://x/2"}],
+                        stats={"events": 1}, source_counts={}, links=[])
+    loaded = _load_latest_events()
+    assert {e["title"] for e in loaded["events"]} == {"First", "Second"}
+
+
+def test_accumulation_can_be_disabled(tmp_path, monkeypatch):
+    cache_file = tmp_path / ".mcp_events.json"
+    monkeypatch.setattr("event_harvester.servers.mcp_server.LATEST_EVENTS_FILE", cache_file)
+    monkeypatch.setenv("EH_ACCUMULATE", "0")
+    _save_latest_events([{"title": "First", "date": _FUT, "link": "https://x/1"}],
+                        stats={"events": 1}, source_counts={}, links=[])
+    _save_latest_events([{"title": "Second", "date": _FUT2, "link": "https://x/2"}],
+                        stats={"events": 1}, source_counts={}, links=[])
+    loaded = _load_latest_events()
+    assert {e["title"] for e in loaded["events"]} == {"Second"}   # wholesale replace
 
 
 # ── list_latest_events period filter (today / this week / this month) ──────

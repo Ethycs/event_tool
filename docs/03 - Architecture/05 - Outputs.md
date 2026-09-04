@@ -149,7 +149,7 @@ Built on Starlette + uvicorn, which `mcp`/`fastmcp` already pull in — **no new
 | `/events.json` | `data/.site/events.json` | the same projection the pages embed |
 | `/healthz`, `GET`/`POST /refresh` | — | state, identity, queue; `GET /refresh` is a control page (buttons + `/healthz` poll), `POST` triggers |
 | `/debug/incomplete` | — | events with an empty key field (date/time/location/link), with per-field counts and each event's `missing` list — a data-quality view; `?field=` narrows it |
-| `/debug/empty` | — | configured sources that produced no events — every web source and known messaging platform with its event count (zero-count first), plus `empty_web_sources`, `empty_platforms`, and an `unattributed_web_events` count for events no source claimed. The "which source went dark?" view |
+| `/debug/empty` | — | configured sources that produced no events — every web source and known messaging platform with its event count (zero-count first). Each web source also carries its cooldown state (`cooling`, `last_fetch_hours`), so the response splits the zeros into `skipped_sources` (empty because a run passed them over while cooling) vs `empty_after_fetch` (fetched and genuinely produced nothing — the ones worth looking at). Also `empty_web_sources`, `empty_platforms`, and `unattributed_web_events`. The "which source went dark, and why?" view |
 
 `/` and `/calendar` are written together in one `_write` pass, so they cannot show different harvests. A calendar built lazily on first request would have been one more thing that can be stale. Both are served `no-store`: the point of the URL is that it is current.
 

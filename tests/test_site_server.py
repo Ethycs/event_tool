@@ -210,7 +210,9 @@ class TestEmptySourcesDebug:
              patch.object(site_mod, "_read_cached_events",
                           return_value=(self._events(), {}, 3)), \
              patch("event_harvester.sources.web_utils._load_web_sources",
-                   return_value=self.WEB_SOURCES):
+                   return_value=self.WEB_SOURCES), \
+             patch("event_harvester.sources.web_utils._load_cooldowns",
+                   return_value={}):
             with client() as c:
                 res = c.get("/debug/empty")
         assert res.status_code == 200
@@ -219,6 +221,46 @@ class TestEmptySourcesDebug:
         assert "signal" in body["empty_platforms"]
         assert body["total_events"] == 3
         assert res.headers["cache-control"] == "no-store"
+
+    def test_cooldown_state_flags_a_recently_fetched_source_as_cooling(self):
+        from datetime import datetime, timedelta, timezone
+        recent = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        old = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+        sources = [
+            {"name": "cools", "url": "https://a/1", "cooldown_hours": 6},   # 1h < 6h
+            {"name": "readya", "url": "https://a/2", "cooldown_hours": 6},  # 48h > 6h
+            {"name": "nocool", "url": "https://a/3"},                       # opted out
+        ]
+        with patch("event_harvester.sources.web_utils._load_cooldowns",
+                   return_value={"https://a/1": recent, "https://a/2": old}):
+            state = site_mod._cooldown_state(sources)
+        assert state["cools"]["cooling"] is True
+        assert state["readya"]["cooling"] is False
+        assert state["nocool"]["cooling"] is False   # no cooldown_hours => never skipped
+
+    def test_endpoint_separates_skipped_from_fetched_empty(self):
+        # theknockoutsf produces 0 events; make it cooling so it reads as
+        # *skipped*, not as a broken scraper.
+        from datetime import datetime, timedelta, timezone
+        recent = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        sources = [
+            {"name": "erobay", "mode": "calendar", "url": "https://erobay.com/cal"},
+            {"name": "theknockoutsf", "mode": "calendar",
+             "url": "https://theknockoutsf.com/calendar2", "cooldown_hours": 6},
+        ]
+        with patch.object(site_mod, "_collect", side_effect=_collect_ok), \
+             patch.object(site_mod, "_read_cached_events",
+                          return_value=(self._events(), {}, 3)), \
+             patch("event_harvester.sources.web_utils._load_web_sources",
+                   return_value=sources), \
+             patch("event_harvester.sources.web_utils._load_cooldowns",
+                   return_value={"https://theknockoutsf.com/calendar2": recent}):
+            with client() as c:
+                body = c.get("/debug/empty").json()
+        assert "theknockoutsf" in body["skipped_sources"]
+        assert "theknockoutsf" not in body["empty_after_fetch"]
+        knockout = next(r for r in body["web_sources"] if r["name"] == "theknockoutsf")
+        assert knockout["cooling"] is True and knockout["events"] == 0
 
 
 class TestRefreshIsSurvivable:

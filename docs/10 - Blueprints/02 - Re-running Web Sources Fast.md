@@ -18,10 +18,14 @@ this session on 2026-09-02:
   on every fetch, even under `--no-cooldown` (that flag skips the *check*, not
   the *write*). Re-run erobay ten times and it — and anything else you touched —
   is now "recently fetched".
-- **The scheduled site harvest replaces `events.json` wholesale.** So a *later*
-  cooldown-starved harvest (only the un-cooled sources eligible) overwrites the
-  full file with a sparse one. Measured: the site went **138 events → 4** after a
-  boot harvest ran with 37 sources on cooldown and only erobay got through.
+- **The event cache accumulates (default on; `EH_ACCUMULATE=0` to disable).**
+  A harvest no longer replaces the events wholesale — it unions its output with
+  the prior cache's still-future events and expires only what has passed
+  (`_save_latest_events`, `servers/mcp_server.py`). This is what stops the
+  historical failure mode: a *later* cooldown-starved harvest (only the un-cooled
+  sources eligible) used to overwrite the full file with a sparse one — measured
+  once as **138 events → 4** after a boot harvest with 37 sources on cooldown.
+  With accumulation the cooled sources' still-future events survive that run.
 
 So: **iterate with the CLI/scripts below, never by bouncing the live `site`
 service** — and expect to clear cooldowns before the *next* real full harvest.

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import date, datetime, timezone
 from typing import Any
 
@@ -24,7 +25,13 @@ from event_harvester.config import AppConfig, load_config
 from event_harvester.observability.tracing import traced
 from event_harvester.outputs.report import generate_report
 from event_harvester.pipeline import Pipeline
-from event_harvester.pipeline.event_match import find_acted_fingerprint, save_fingerprint
+from event_harvester.pipeline.event_match import (
+    _normalize_date,
+    dedup_events,
+    events_match,
+    find_acted_fingerprint,
+    save_fingerprint,
+)
 from event_harvester.utils import DATA_DIR as _DATA_DIR
 from event_harvester.utils import load_json, save_json
 
@@ -267,6 +274,60 @@ def _load_latest_events() -> dict[str, Any]:
     return data
 
 
+# Safety ceiling; date-expiry is the real bound (typical volume is ~500).
+_ACCUMULATE_CAP = 5000
+_DECIDED = ("approved", "declined")
+
+
+def _accumulation_enabled() -> bool:
+    """Accumulation keeps the cache from flickering: the pipeline replaces it
+    wholesale each run, so any source a run didn't fetch-with-events (cooled
+    down, down, or just varied) dropped to zero. On by default; `EH_ACCUMULATE=0`
+    opts out (the old wholesale-replace behavior). Read at call time so it can be
+    toggled per-run without a restart."""
+    return os.environ.get("EH_ACCUMULATE", "1").strip().lower() not in ("0", "false", "no")
+
+
+def _accumulate_events(
+    new_events: list[dict[str, Any]], existing_events: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Union this run's events with still-future events from the prior cache.
+
+    Wholesale replacement is why ``/debug/empty`` shows a rotating cast of
+    zeros: a source contributes nothing unless *this* run both fetched it and
+    extracted from it. Instead we KEEP the prior cache's future events and union
+    the new run's events on top, expiring only what has already passed. A prior
+    approve/decline is preserved across the union even though dedup lets the
+    fresh copy win on the mutable fields (date/time/location).
+    """
+    today = date.today().isoformat()
+
+    def _is_future(e: dict[str, Any]) -> bool:
+        d = _normalize_date(e.get("date"))
+        return d is None or d >= today  # keep undated (can't expire) and future
+
+    future_existing = [e for e in existing_events if _is_future(e)]
+    decided = [e for e in future_existing if str(e.get("_status") or "") in _DECIDED]
+
+    # New first so a re-extracted event's fresh fields win; dedup merges the
+    # dropped twin's provenance onto the survivor.
+    merged = dedup_events(list(new_events) + future_existing)
+
+    # Re-apply a prior decision that "new wins" would otherwise have discarded.
+    for e in merged:
+        if str(e.get("_status") or "") in _DECIDED:
+            continue
+        for d in decided:
+            if events_match(e, d)[0]:
+                e["_status"] = d["_status"]
+                break
+
+    if len(merged) > _ACCUMULATE_CAP:
+        merged.sort(key=lambda e: _normalize_date(e.get("date")) or "9999-12-31")
+        merged = merged[:_ACCUMULATE_CAP]
+    return merged
+
+
 def _save_latest_events(
     events: list[dict[str, Any]],
     *,
@@ -308,6 +369,15 @@ def _save_latest_events(
                 held, errors,
             )
             return
+
+    if _accumulation_enabled():
+        prior = load_json(LATEST_EVENTS_FILE, default={}) or {}
+        before = len(events)
+        events = _accumulate_events(events, prior.get("events") or [])
+        logger.info(
+            "accumulate: %d new + %d prior -> %d total events",
+            before, len(prior.get("events") or []), len(events),
+        )
 
     save_json(
         LATEST_EVENTS_FILE,

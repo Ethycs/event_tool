@@ -402,6 +402,42 @@ def _empty_sources(
     return web_rows, dict(platform_counts), unattributed
 
 
+def _cooldown_state(web_sources: list[dict]) -> dict[str, dict]:
+    """Per-source cooldown status, so the empty view distinguishes *skipped*
+    from *fetched-but-empty*.
+
+    A run skips a source when it opted into cooldown (`cooldown_hours >= 0`) and
+    was fetched within that window; a source with no `cooldown_hours` is never
+    skipped. Returns ``{name: {last_fetch_hours, cooling, cooldown_hours}}`` —
+    ``cooling`` meaning a run right now would skip it.
+    """
+    from datetime import datetime, timezone
+
+    from event_harvester.sources.web_utils import _load_cooldowns
+
+    cds = _load_cooldowns()
+    now = datetime.now(timezone.utc)
+    out: dict[str, dict] = {}
+    for s in web_sources:
+        name = s.get("name")
+        if not name:
+            continue
+        last = cds.get(s.get("url"))
+        hrs = None
+        if last:
+            try:
+                hrs = round((now - datetime.fromisoformat(last)).total_seconds() / 3600, 2)
+            except Exception:
+                hrs = None
+        try:
+            cd_hours = float(s.get("cooldown_hours", -1))
+        except (TypeError, ValueError):
+            cd_hours = -1.0
+        cooling = cd_hours >= 0 and hrs is not None and hrs < cd_hours
+        out[name] = {"last_fetch_hours": hrs, "cooling": cooling, "cooldown_hours": cd_hours}
+    return out
+
+
 def _write(events: list[dict], source_counts: dict[str, int], total_messages: int) -> None:
     import json
 
@@ -583,21 +619,34 @@ def build_app(cfg, *, interval_hours: float = DEFAULT_INTERVAL_HOURS,
     async def debug_empty(request):
         """Configured sources that produced no events — the 'which source went
         dark?' view. Every web source and known messaging platform is listed
-        with its event count, zero-count first, so a source contributing nothing
-        (e.g. an ICS feed drowned in junk rows) is obvious. Reads the same cache
-        the page serves."""
+        with its event count, zero-count first. Each web source also carries its
+        cooldown state so a *skipped* source (fetched too recently, so the last
+        run passed it over) is distinguished from one that was fetched and
+        genuinely produced nothing. Reads the same cache the page serves."""
         from event_harvester.sources.web_utils import _load_web_sources
 
         events, _counts, _total = _read_cached_events()
         web_sources = _load_web_sources() or []
         web_rows, platform_counts, unattributed = _empty_sources(events, web_sources)
+        cooldowns = _cooldown_state(web_sources)
+        for r in web_rows:
+            r.update(cooldowns.get(r["name"], {}))
+
         empty_web = [r["name"] for r in web_rows if r["events"] == 0]
+        # A skipped source is empty *because a run passed it over* (cooling),
+        # not because it produced nothing — call those out separately so they
+        # aren't mistaken for broken scrapers.
+        skipped = [r["name"] for r in web_rows if r["events"] == 0 and r.get("cooling")]
+        empty_fetched = [r["name"] for r in web_rows
+                         if r["events"] == 0 and not r.get("cooling")]
         empty_platforms = [p for p, c in platform_counts.items() if c == 0]
         return JSONResponse(
             {
                 "ok": True,
                 "total_events": len(events),
                 "empty_web_sources": empty_web,
+                "skipped_sources": skipped,
+                "empty_after_fetch": empty_fetched,
                 "empty_platforms": empty_platforms,
                 "web_sources": web_rows,
                 "platform_counts": platform_counts,
