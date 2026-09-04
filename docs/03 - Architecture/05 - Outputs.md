@@ -144,7 +144,7 @@ Built on Starlette + uvicorn, which `mcp`/`fastmcp` already pull in — **no new
 | Route | File | |
 |---|---|---|
 | `/` | `data/.site/index.html` | the list, with thumbnails |
-| `/calendar` | `data/.site/calendar.html` | month **and** week views (selectable toggle; the choice is remembered per-viewer in `localStorage`), no thumbnails. Week view is a time grid — day columns, an hour axis, events as blocks positioned by start time with overlapping events lane-packed side by side, plus an all-day row for timeless events |
+| `/calendar` | `data/.site/calendar.html` | month **and** week views (selectable toggle; the choice is remembered per-viewer in `localStorage`), no thumbnails. Week view is a time grid — day columns, an hour axis, events as blocks positioned by start time with overlapping events lane-packed side by side, plus an all-day row for timeless events. The day panel below the grid (shared by both views) bins the selected day's events by the hour they start: same-hour events sit side by side, empty hours are omitted, and timeless events fall into one "Time TBD" bin |
 | `/admin` | rendered per request | caps, keywords, profiles — `servers/admin.py` |
 | `/events.json` | `data/.site/events.json` | the same projection the pages embed |
 | `/healthz`, `GET`/`POST /refresh` | — | state, identity, queue; `GET /refresh` is a control page (buttons + `/healthz` poll), `POST` triggers |

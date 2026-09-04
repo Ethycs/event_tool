@@ -5,7 +5,9 @@ Two views on one page, chosen by a toggle (remembered per-viewer in
 **week** time grid — day columns over an hour axis, each event a block placed by
 its start time, with overlapping events lane-packed side by side and timeless
 events in an all-day row. Both read the same filtered projection and share the
-day panel, filters, and ICS export; only the layout differs. The week grid
+day panel, filters, and ICS export; only the layout differs. The day panel bins
+the selected day's events by the hour they start — same-hour events side by
+side, empty hours omitted, timeless events in one "Time TBD" bin. The week grid
 assumes a fixed block length (events carry only a start) and, like the month
 grid, is assembled from local ``new Date(y, m, d)`` values — never an ISO string
 — so it does not shift a day west of Greenwich.
@@ -263,6 +265,18 @@ footer {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer;
 }
 .weekchip:hover { border-color: var(--accent); }
+
+/* ── Day panel: events binned by the hour they start ────────────────────── */
+.hourbin { margin: 0 0 14px; }
+.hourlabel {
+  font-size: 12px; font-weight: 700; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .04em; margin: 0 0 6px;
+}
+/* Events in the same hour sit side by side and wrap to the next line when they
+   run out of width; `min-width:0` lets a card shrink so its text can ellipsis
+   rather than force a horizontal scrollbar. */
+.hourrow { display: flex; flex-wrap: wrap; gap: 8px; }
+.hourrow .ev { flex: 1 1 260px; min-width: 0; margin-bottom: 0; }
 
 /* Last in the file on purpose — same specificity as the base rules, so an
    earlier position loses on source order and only on a touch device. */
@@ -631,8 +645,40 @@ function renderDay(map) {
     panel.appendChild(p);
     return;
   }
-  for (const ev of list) panel.appendChild(eventCard(ev));
+
+  // Bin by the hour each event starts, so two events in the same hour sit side
+  // by side. `list` is already sorted by start time, so appending in order both
+  // orders the bins and orders events within a bin; only hours that have an
+  // event get a bin, so empty hours never render. Events with no parseable time
+  // fall into a single 'Time TBD' bin at the end (minutes() returns 1e6).
+  const bins = new Map();                     // hour (0-23) or 'tbd' -> [events]
+  for (const ev of list) {
+    const m = minutes(ev.time);
+    const key = m >= 1e6 ? 'tbd' : Math.floor(m / 60);
+    if (!bins.has(key)) bins.set(key, []);
+    bins.get(key).push(ev);
+  }
+  for (const [key, evs] of bins) {
+    const bin = document.createElement('div');
+    bin.className = 'hourbin';
+    const label = document.createElement('div');
+    label.className = 'hourlabel';
+    label.textContent = key === 'tbd' ? 'Time TBD' : hourBinLabel(key);
+    bin.appendChild(label);
+    const row = document.createElement('div');
+    row.className = 'hourrow';
+    for (const ev of evs) row.appendChild(eventCard(ev));
+    bin.appendChild(row);
+    panel.appendChild(bin);
+  }
   panel.scrollIntoView({behavior: 'smooth', block: 'nearest'});
+}
+
+// The hour heading for a day-panel bin: "6 PM", "12 AM", "12 PM".
+function hourBinLabel(h) {
+  const ap = h < 12 ? 'AM' : 'PM';
+  const hh = h % 12 === 0 ? 12 : h % 12;
+  return hh + ' ' + ap;
 }
 
 // Parsed by hand into local numbers, for the same reason keyOf exists.

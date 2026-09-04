@@ -256,6 +256,32 @@ class TestWeekView:
         assert "toISOString" not in code
 
 
+class TestDayHourBins:
+    """The day panel bins events by the hour they start; same-hour events sit
+    side by side and empty hours are omitted. Pinned by source inspection."""
+
+    def test_the_day_panel_bins_by_start_hour(self, page):
+        code = _code(page)
+        assert "function renderDay(" in code
+        assert "Math.floor(m / 60)" in code          # the bin key is the start hour
+        assert "function hourBinLabel(" in code
+
+    def test_same_hour_events_are_laid_out_side_by_side(self, page):
+        assert re.search(r"\.hourrow\s*\{[^}]*display:\s*flex", page)
+        assert re.search(r"\.hourrow\s+\.ev\s*\{[^}]*flex:", page)  # cards flex to fill
+
+    def test_only_hours_with_events_get_a_bin(self, page):
+        """Bins come from a Map filled as events are seen, never a 0–23 sweep, so
+        an hour with nothing in it never renders."""
+        code = _code(page)
+        assert "bins.set(key, [])" in code
+        assert not re.search(r"for\s*\(\s*let\s+h\s*=\s*0;\s*h\s*<\s*24", code)
+
+    def test_events_without_a_time_fall_into_one_tbd_bin(self, page):
+        code = _code(page)
+        assert "'tbd'" in code and "Time TBD" in code
+
+
 class TestEmpty:
     def test_a_harvest_with_nothing_in_it_still_renders(self, tmp_path):
         path = tmp_path / "c.html"
