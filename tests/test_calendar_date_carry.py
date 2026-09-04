@@ -85,6 +85,39 @@ def test_open_link_is_carried_from_the_row_url():
     assert events[0]["link"] == full
 
 
+def test_title_match_beats_a_wrong_link_to_another_row():
+    # Regression for erobay 2026-09-03: the LLM gave 'House Party' the link of a
+    # sibling 'Wild Jam' row (batch cross-contamination). The event then matched
+    # BOTH its own row (by title) and Wild Jam's row (by that bad link), and the
+    # soonest-upcoming pick snapped it onto Wild Jam's earlier date + URL. Title
+    # must win, so it lands on its own row.
+    wild_jam_url = "https://forbiddentickets.com/events/afterdark/9ebf4f4b7b"
+    house_url = "https://forbiddentickets.com/events/stopgap/bf9c203bc2"
+    events = [{
+        "title": "House Party - On Every First Friday!",
+        "date": "2099-09-03",           # the LLM's wrong (Wild Jam) date
+        "link": wild_jam_url,           # the LLM's wrong (Wild Jam) link
+    }]
+    messages = [
+        _msg("Wild Jam - A Primal Play Workshop", "2099-09-03", url=wild_jam_url),
+        _msg("House Party - On Every First Friday!", "2099-09-04", url=house_url),
+    ]
+    _carry_calendar_dates(events, messages)
+    assert events[0]["date"] == "2099-09-04"   # its own row, not Wild Jam's 09-03
+    assert events[0]["link"] == house_url      # its own URL, not the afterdark one
+
+
+def test_link_only_fallback_when_title_was_rewritten():
+    # The link fallback must still work when the LLM rewrote the title so it no
+    # longer matches any row (the House of Braids / external-ticket case).
+    events = [{"title": "Totally Rewritten Name", "date": "2099-05-08",
+               "link": "https://buytickets.at/voxbodystudio"}]
+    messages = [_msg("Original Row Title", "2099-05-01",
+                     url="https://buytickets.at/voxbodystudio/2392597")]
+    _carry_calendar_dates(events, messages)
+    assert events[0]["date"] == "2099-05-01"   # matched by link alone
+
+
 def test_unmatched_event_keeps_its_own_link():
     events = [{"title": "Unrelated Thing", "date": "2099-06-01", "link": "https://real.example/e/1"}]
     messages = [_msg("Completely Other Event", "2099-06-05", url="https://erobay.com/x?ID=1")]

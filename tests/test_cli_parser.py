@@ -10,8 +10,10 @@ from event_harvester.cli.parse_helpers import (
     VALID_CAP_KEYS,
     VALID_PLATFORMS,
     apply_caps_to_config,
+    flatten_web_sources,
     parse_cap_arg,
     parse_platform_csv,
+    parse_web_sources_csv,
     resolve_platforms,
 )
 from event_harvester.cli.parser import build_parser
@@ -93,6 +95,43 @@ class TestParsePlatformCsv:
 
     def test_all_valid_platforms(self):
         assert parse_platform_csv("discord,telegram,gmail,signal,web") == set(VALID_PLATFORMS)
+
+
+# ── parse_web_sources_csv / flatten_web_sources ──────────────────────
+
+
+class TestParseWebSourcesCsv:
+    def test_single(self):
+        assert parse_web_sources_csv("erobay") == ["erobay"]
+
+    def test_comma_separated(self):
+        assert parse_web_sources_csv("erobay,luma") == ["erobay", "luma"]
+
+    def test_whitespace_and_blanks_dropped(self):
+        assert parse_web_sources_csv(" erobay , , luma ") == ["erobay", "luma"]
+
+    def test_names_not_validated(self):
+        # Unlike platforms/caps, a web-source name is matched at fetch time,
+        # so an unknown one parses fine (it is skipped later, not rejected).
+        assert parse_web_sources_csv("not-a-real-source") == ["not-a-real-source"]
+
+
+class TestFlattenWebSources:
+    def test_none_stays_none(self):
+        assert flatten_web_sources(None) is None
+        assert flatten_web_sources([]) is None
+
+    def test_list_of_lists_from_append(self):
+        # action='append' + type=parse_web_sources_csv yields a list of lists
+        assert flatten_web_sources([["erobay", "luma"], ["ra-sf"]]) == ["erobay", "luma", "ra-sf"]
+
+    def test_dedup_order_preserving(self):
+        assert flatten_web_sources([["erobay", "luma"], ["erobay", "ra-sf"]]) == \
+            ["erobay", "luma", "ra-sf"]
+
+    def test_bare_string_backcompat(self):
+        assert flatten_web_sources("erobay") == ["erobay"]
+        assert flatten_web_sources("erobay,luma") == ["erobay", "luma"]
 
 
 # ── resolve_platforms ────────────────────────────────────────────────
@@ -317,6 +356,33 @@ class TestParserPlatformFilter:
     def test_unknown_platform_exits(self):
         with pytest.raises(SystemExit):
             self.parser.parse_args(["harvest", "--only", "facebook"])
+
+
+# ── Web-source filter through argparse ───────────────────────────────
+
+
+class TestParserWebSourceFlag:
+    def setup_method(self):
+        self.parser = build_parser()
+
+    def test_default_is_none(self):
+        args = self.parser.parse_args(["harvest"])
+        assert args.web_source is None
+        assert flatten_web_sources(args.web_source) is None
+
+    def test_single_source_backcompat(self):
+        args = self.parser.parse_args(["harvest", "--web-source", "erobay"])
+        assert flatten_web_sources(args.web_source) == ["erobay"]
+
+    def test_comma_separated_list(self):
+        args = self.parser.parse_args(["harvest", "--web-source", "erobay,luma"])
+        assert flatten_web_sources(args.web_source) == ["erobay", "luma"]
+
+    def test_repeated_flag(self):
+        args = self.parser.parse_args(
+            ["harvest", "--web-source", "erobay,luma", "--web-source", "ra-sf"],
+        )
+        assert flatten_web_sources(args.web_source) == ["erobay", "luma", "ra-sf"]
 
 
 # ── Pre-dispatch normalization ───────────────────────────────────────

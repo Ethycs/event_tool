@@ -33,7 +33,7 @@ Default subcommand. Entry point: `commands/harvest.py:harvest_cmd`.
 | `--show-rejects` | flag | `False` | `undocumented`. Prints per-stage reject counts and writes `data/rejects.ini` with full reject details. |
 | `--save` | path | `None` | `undocumented` label, but the flag itself is documented. Saves raw harvested messages to the given JSON file. |
 | `--load` | path | `None` | Loads messages from a JSON file instead of harvesting live. |
-| `--web-source` | name | `None` | `undocumented`. Restrict web harvesting to a single named source (e.g. `luma`). |
+| `--web-source` | name[,name…] | `None` | Restrict web harvesting to these named sources. Comma-separate and/or repeat the flag (e.g. `--web-source erobay,luma --web-source ra-sf`). Unknown names are skipped with a warning, not rejected. Any `--web-source` (like `--only`) scopes the run and bypasses per-source caps. |
 | `--no-cooldown` | flag | `False` | `undocumented`. Ignore per-source web cooldowns and force re-fetch. |
 | `--profile` | name | `None` | Apply a named profile from `data/profiles.json` before `--cap`/`--web-source` overrides are applied. |
 | `--report` | path, optional value (`nargs="?"`) | `None`; `"events_report.html"` if the bare flag is given with no value | Generate a report. **Format follows the extension** — anything but `.md`/`.markdown` produces the self-contained mobile HTML view (inline CSS/JS, no network, safe to forward). A `.md` path selects the **deprecated** Markdown report and logs a warning. Default changed from `.md` to `.html` on 2026-07-30. |
@@ -353,7 +353,7 @@ Every variable is read once, in `config.py:load_config()`, at process start — 
 | `TICKTICK_CLIENT_ID`, `TICKTICK_CLIENT_SECRET`, `TICKTICK_REDIRECT_URI`, `TICKTICK_USERNAME`, `TICKTICK_PASSWORD`, `TICKTICK_PROJECT` | none | |
 | `WEB_SOURCES_FILE`, `WEB_MAX_EVENTS`, `WEB_TIMEOUT_MS` | none | |
 | `WEB_NO_COOLDOWN` | `--no-cooldown` (`harvest` only) | |
-| `WEB_SOURCE_NAMES` | `--web-source` (`harvest` only, partial) | Env accepts a CSV **list** of names; the CLI flag accepts exactly one — not a 1:1 mirror. |
+| `WEB_SOURCE_NAMES` | `--web-source` (`harvest` only) | Both accept a CSV **list** of names now (the flag also repeats); aligned since 2026-09-03. |
 | `WEB_PARALLEL` | none | README-documented env-only tunable. |
 | `WEB_DEBUG_TRACE` | `--debug-web-trace` | |
 | `WEB_DEBUG_SCREENSHOTS` | `--debug-web-screenshots` | |

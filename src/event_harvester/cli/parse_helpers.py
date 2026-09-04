@@ -59,6 +59,43 @@ def parse_cap_arg(raw: str) -> dict[str, int]:
     return out
 
 
+def parse_web_sources_csv(raw: str) -> list[str]:
+    """Parse one ``--web-source`` value: ``'erobay,luma'`` -> ``['erobay', 'luma']``.
+
+    Used as ``type=`` on ``--web-source`` (``action='append'``), so a targeted
+    re-run can name a *set* of sites either way, or both at once:
+
+        --web-source erobay,luma --web-source ra-sf
+
+    Names are not validated here — they are matched against
+    ``data/web_sources.json`` at fetch time, and a name with no match is simply
+    skipped (with a warning) rather than being a parse error.
+    """
+    return [n.strip() for n in raw.split(",") if n.strip()]
+
+
+def flatten_web_sources(appended) -> list[str] | None:
+    """Flatten ``--web-source`` occurrences into one name list.
+
+    ``action='append'`` with ``type=parse_web_sources_csv`` yields a list of
+    lists; a profile or back-compat caller may hand a bare string. Return an
+    order-preserving, de-duplicated list, or ``None`` when the flag was unset —
+    which the pipeline reads as "all web sources".
+    """
+    if not appended:
+        return None
+    if isinstance(appended, str):
+        appended = [appended]
+    names: list[str] = []
+    for group in appended:
+        items = group if isinstance(group, (list, tuple)) else str(group).split(",")
+        for n in items:
+            n = str(n).strip()
+            if n and n not in names:
+                names.append(n)
+    return names or None
+
+
 def parse_platform_csv(raw: str) -> set[str]:
     """Parse 'discord,telegram' into {'discord', 'telegram'}.
 

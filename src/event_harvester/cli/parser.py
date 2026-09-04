@@ -22,6 +22,7 @@ from event_harvester import __version__
 from event_harvester.cli.parse_helpers import (
     parse_cap_arg,
     parse_platform_csv,
+    parse_web_sources_csv,
 )
 
 
@@ -114,8 +115,11 @@ def _add_harvest_args(p: argparse.ArgumentParser) -> None:
     )
 
     p.add_argument(
-        "--web-source", metavar="NAME",
-        help="Only fetch this web source by name (e.g. erobay, luma)",
+        "--web-source", metavar="NAME[,NAME…]", action="append",
+        type=parse_web_sources_csv, default=None,
+        help="Fetch only these web sources — repeat the flag or comma-separate "
+             "(e.g. --web-source erobay,luma --web-source ra-sf). Pair with "
+             "'--only web' for a fast, targeted re-run of a set of sites.",
     )
     p.add_argument(
         "--no-cooldown", action="store_true",

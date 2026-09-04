@@ -8,7 +8,11 @@ Obsidian reports.
 import logging
 from collections import defaultdict
 
-from event_harvester.cli.parse_helpers import apply_caps_to_config, resolve_platforms
+from event_harvester.cli.parse_helpers import (
+    apply_caps_to_config,
+    flatten_web_sources,
+    resolve_platforms,
+)
 from event_harvester.outputs.report import generate_report
 from event_harvester.outputs.ticktick import create_ticktick_tasks, get_ticktick_client
 from event_harvester.pipeline import Pipeline
@@ -72,21 +76,27 @@ async def harvest_cmd(args, cfg) -> int:
     print(f"  Event Harvester - last {cfg.days_back} day(s)")
     print(f"{'=' * W}\n")
 
-    # When --only is used, the user has explicitly scoped to specific
-    # sources — don't apply per-source caps that would silently drop
-    # events. Caps exist to prevent noisy sources from crowding out
-    # quiet ones in the default mixed-source pipeline; that concern
-    # doesn't apply when --only is set.
-    if args.only is not None:
-        logger.info("--only set; ignoring per-source caps")
+    # A targeted set of web sources, if --web-source was given (repeatable /
+    # comma-separated). None means "all web sources".
+    web_sources = flatten_web_sources(getattr(args, "web_source", None))
+
+    # When --only is used, or the run is scoped to specific web sources, the
+    # user has explicitly narrowed the run — don't apply per-source caps that
+    # would silently drop events. Caps exist to keep noisy sources from
+    # crowding out quiet ones in the default mixed-source pipeline; that
+    # concern doesn't apply to a scoped, targeted re-run.
+    scoped = args.only is not None or bool(web_sources)
+    if scoped:
+        logger.info("scoped run (%s); ignoring per-source caps",
+                    "--only" if args.only is not None else "--web-source")
 
     result = await pipeline.run(
         no_kwargs=platform_kwargs,
         load_path=args.load,
         save_path=args.save,
-        web_source=getattr(args, "web_source", None),
+        web_sources=web_sources,
         no_cooldown=getattr(args, "no_cooldown", False),
-        unlimited_caps=args.only is not None,
+        unlimited_caps=scoped,
     )
 
     if result.no_messages:

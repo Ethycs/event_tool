@@ -396,10 +396,19 @@ def extract_events_llm(
         logger.warning("LLM not configured - skipping analysis.")
         return ExtractionResult("", [])
 
+    # Row-as-event bypass: a web-calendar message already states title, date,
+    # time, location and its own URL — it *is* an event. The LLM adds nothing
+    # for it but cost and the chance to mis-attach its link (it cannot dedup;
+    # that is `event_match`). Emit those directly and keep them out of the batch.
+    bypass_events, remaining = _calendar_rows_to_events(messages)
+    if bypass_events:
+        logger.info("row-as-event bypass: %d calendar row(s) emitted directly "
+                    "(not sent to the LLM)", len(bypass_events))
+
     # The free stages, and their arithmetic. Everything above the LLM lives in
     # `filtering` now so it can be run without one — see that module's
     # docstring and `01 - Design/04 - Decomposing the Pipeline.md`.
-    filtered_result = filter_for_extraction(messages, caps, label=cfg.display_name)
+    filtered_result = filter_for_extraction(remaining, caps, label=cfg.display_name)
     filtered = filtered_result.messages
     rejects: dict[str, list[dict]] = filtered_result.rejects
 
@@ -449,11 +458,114 @@ def extract_events_llm(
             events = dedup_events(events + cached_events)
 
     rejects.update(llm_rejects)
+    # Fold in the bypassed calendar rows, then one dedup pass over the union
+    # (the LLM path already deduped its own output in isolation).
+    if bypass_events:
+        from event_harvester.pipeline.event_match import dedup_events
+        events = dedup_events(events + bypass_events)
     _carry_calendar_dates(events, filtered)
     return ExtractionResult(summary, events, rejects)
 
 
 _DATE_LINE_RE = re.compile(r"(?mi)^date:\s*(\d{4}-\d{2}-\d{2})\b")
+_TIME_TOKEN_RE = re.compile(r"(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\.?", re.I)
+_NOISE_TITLES = frozenset({"reserved", "reserved meeting", "tbd", "private",
+                           "private event", "hold", "closed"})
+
+
+def _field_line(content: str, field: str) -> str:
+    """Value after a ``field:`` line in a calendar message, or ""."""
+    m = re.search(rf"(?mi)^{field}:\s*(.+)$", content or "")
+    return m.group(1).strip() if m else ""
+
+
+def _row_time_to_24h(time_line: str) -> str | None:
+    """First time token of a ``time:`` line as ``HH:MM`` (24h), else None.
+
+    ``8:00pm - 1:00am`` -> ``20:00``; ``7pm`` -> ``19:00``; ``19:00`` -> ``19:00``.
+    A bare ``19:00`` (already 24h, no am/pm) is passed through.
+    """
+    line = (time_line or "").strip()
+    if not line:
+        return None
+    m = _TIME_TOKEN_RE.search(line)
+    if m:
+        hh, mm = int(m.group(1)), int(m.group(2) or 0)
+        ap = m.group(3).lower()
+        if ap == "p" and hh != 12:
+            hh += 12
+        elif ap == "a" and hh == 12:
+            hh = 0
+    else:
+        m24 = re.match(r"(\d{1,2}):(\d{2})", line)
+        if not m24:
+            return None
+        hh, mm = int(m24.group(1)), int(m24.group(2))
+    return f"{hh:02d}:{mm:02d}" if 0 <= hh <= 23 and 0 <= mm <= 59 else None
+
+
+def _is_noise_title(title: str) -> bool:
+    t = (title or "").strip().lower()
+    return (not t) or t in _NOISE_TITLES
+
+
+def _calendar_rows_to_events(messages: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Split structured web-calendar rows off and emit them as events directly.
+
+    A web message whose content already states a title and a ``date:`` line and
+    that carries its own event URL *is* an event; the LLM would only add cost
+    and the chance to mis-attach its link, and it cannot dedup (that is
+    ``event_match``). So emit it deterministically and keep it out of the LLM
+    batch. Returns ``(bypass_events, remaining_messages)``.
+
+    Past-dated rows and obvious non-events (RESERVED / TBD / empty titles) are
+    dropped rather than passed on — the LLM would only have dropped them too.
+    A web row *without* a real URL (e.g. a recurring calcium row that never got
+    one) is left in ``remaining`` for the LLM, where ``_carry_calendar_dates``
+    still tends its date.
+    """
+    from datetime import date
+
+    today = date.today().isoformat()
+    bypass: list[dict] = []
+    remaining: list[dict] = []
+    for m in messages:
+        content = m.get("content") or ""
+        url = (m.get("url") or "").strip()
+        title = content.splitlines()[0].strip() if content else ""
+        dm = _DATE_LINE_RE.search(content)
+        structured = (
+            m.get("platform") == "web"
+            and dm is not None
+            and bool(title)
+            and url.lower().startswith(("http://", "https://"))
+        )
+        if not structured:
+            remaining.append(m)
+            continue
+        row_date = dm.group(1)
+        if row_date < today or _is_noise_title(title):
+            continue  # past or non-event — don't emit, don't spend the LLM
+
+        loc = _field_line(content, "location") or None
+        notes = " | ".join(p for p in (loc, url) if p)
+        ev = {
+            "title": title,
+            "date": row_date,
+            "time": _row_time_to_24h(_field_line(content, "time")),
+            "location": loc,
+            "link": url,
+            "notes": notes,
+            "source": (m.get("author") or "").strip(),
+            "priority": 3,
+            "due_in_days": None,
+            "_source_ids": [m["id"]] if m.get("id") else [],
+            "_platforms": ["web"],
+        }
+        if m.get("_thumb"):
+            ev["_thumb"] = m["_thumb"]
+        bypass.append(ev)
+    return bypass, remaining
 
 
 def _norm_title(s: str) -> str:
@@ -511,17 +623,28 @@ def _carry_calendar_dates(events: list[dict], messages: list[dict]) -> int:
     for ev in events:
         et = _norm_title(ev.get("title") or "")
         link = (ev.get("link") or "").strip()
-        matches: list[dict] = []
+        title_matches: list[dict] = []
+        link_matches: list[dict] = []
         for r in rows:
             title_hit = bool(et) and bool(r["title"]) and (
                 et == r["title"]
                 or (len(et) >= 6 and len(r["title"]) >= 6
                     and (et.startswith(r["title"]) or r["title"].startswith(et)))
             )
+            if title_hit:
+                title_matches.append(r)
+                continue
             link_hit = (len(link) > 15 and bool(r["url"])
                         and (link in r["url"] or r["url"].startswith(link)))
-            if title_hit or link_hit:
-                matches.append(r)
+            if link_hit:
+                link_matches.append(r)
+        # Title beats link. The LLM copies a row's title faithfully but
+        # cross-contaminates links within a batch — it once handed 'House Party'
+        # the link of a sibling 'Wild Jam' row, and matching on that link then
+        # snapped House Party onto Wild Jam's earlier date and URL. So when a
+        # title match exists it wins; link-only matching is the fallback for
+        # external-ticket rows whose title the LLM rewrote (e.g. House of Braids).
+        matches = title_matches or link_matches
         if not matches:
             continue
         upcoming = [r for r in matches if r["date"] >= today]

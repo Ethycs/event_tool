@@ -437,5 +437,18 @@
     "name": "akiba",
     "mode": "calendar",
     "scroll_seconds": 8
+  },
+  {
+    "url": "https://theknockoutsf.com/calendar2",
+    "name": "theknockoutsf",
+    "mode": "calendar"
+  },
+  {
+    "url": "https://calendar.google.com/calendar/ical/01b5fe92358ed0aed1cbb5c52428696a32a32fa1da31b10f6b65ca5777845b00%40group.calendar.google.com/public/basic.ics",
+    "name": "tamarackoakland",
+    "mode": "ics",
+    "category": "venues",
+    "forward_days": 60,
+    "cooldown_hours": 6
   }
 ]

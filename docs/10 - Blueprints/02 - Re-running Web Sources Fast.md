@@ -125,23 +125,26 @@ pixi run event-harvester harvest --only web --web-source erobay --no-cooldown --
 
 ## A *set* of sources
 
-`--web-source` takes **one** name; there is no multi-source CLI flag. For a set,
-drop to the Python API, which takes a list — put this in the scratchpad, not the
-repo:
+`--web-source` takes a **list** — comma-separate it, repeat the flag, or both
+(added 2026-09-03). A scoped run (any `--web-source`, or `--only`) also bypasses
+per-source caps, so a targeted source can't be silently trimmed:
 
-```python
-# fetch-layer only (fast; add EH_WEB_CHECKPOINT=replay for offline)
-from event_harvester.sources.web_fetch import fetch_web_sources, _load_web_sources
-names = {"erobay", "audio-sf", "transform1060"}
-srcs = [s for s in _load_web_sources() if s["name"] in names]
-msgs = fetch_web_sources(sources=srcs, no_cooldown=True)
-
-# full pipeline for a set (fetch → extract):
-#   await harvest_messages(cfg, no_web=False, web_sources=list(names), no_cooldown=True)
-#   — harvest_messages accepts web_sources (plural); the CLI only exposes the singular.
+```powershell
+pixi run event-harvester harvest --only web `
+  --web-source erobay,luma --web-source ra-sf `
+  --no-cooldown --dry-run --show-rejects
 ```
 
-*Prevents:* running the whole list (and cooling it) to compare three sources.
+Names are matched against `data/web_sources.json` at fetch time; an unknown name
+is skipped with a warning, not a parse error. Pair with `EH_WEB_CHECKPOINT=replay`
+(Layer 1) to iterate on the set offline.
+
+The Python API is still there for programmatic use — `fetch_web_sources(sources=[…])`
+for the fetch layer, or `harvest_messages(cfg, web_sources=[…])` for the full
+pipeline — but for an operator re-run the CLI flag above is the one to reach for.
+
+*Prevents:* running the whole list (and cooling it) to compare three sources —
+without dropping to a scratchpad Python script.
 
 ---
 
