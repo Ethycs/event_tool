@@ -1,4 +1,14 @@
-"""The month grid — the same events, arranged by when rather than by rank.
+"""The calendar — the same events, arranged by when rather than by rank.
+
+Two views on one page, chosen by a toggle (remembered per-viewer in
+``localStorage``): a **month grid** (every day, including empty ones) and a
+**week** time grid — day columns over an hour axis, each event a block placed by
+its start time, with overlapping events lane-packed side by side and timeless
+events in an all-day row. Both read the same filtered projection and share the
+day panel, filters, and ICS export; only the layout differs. The week grid
+assumes a fixed block length (events carry only a start) and, like the month
+grid, is assembled from local ``new Date(y, m, d)`` values — never an ISO string
+— so it does not shift a day west of Greenwich.
 
 **Why a second page and not a toggle on the first.** The event list answers
 "what is there?" and sorts by relevance; a calendar answers "what is on
@@ -191,6 +201,69 @@ footer {
   .monthbar h2 { flex: 1 1 100%; }
 }
 
+/* ── View toggle (Month / Week) ─────────────────────────────────────────── */
+.viewseg { display: inline-flex; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.viewseg button { border: 0; border-radius: 0; padding: 9px 14px; background: var(--card); }
+.viewseg button + button { border-left: 1px solid var(--line); }
+.viewseg button[aria-pressed="true"] { background: var(--accent); color: #fff; }
+.viewseg button:hover { border-color: transparent; }
+
+/* ── Week view ──────────────────────────────────────────────────────────── */
+/* `.grid`/`.dow` set `display: grid`, which beats the user-agent `[hidden]`
+   rule — the same trap the Export button hit above — so switching to the week
+   view would leave the month grid showing underneath. Hide them explicitly. */
+.grid[hidden], .dow[hidden] { display: none; }
+#weekwrap[hidden] { display: none; }
+/* One horizontal scroller so a 7-column time grid stays usable on a phone;
+   the inner min-width keeps the head, all-day row and body columns aligned. */
+#weekwrap { overflow-x: auto; }
+.weekinner { min-width: 660px; }
+.weekhead, .weekallday, .weekgrid { display: grid; grid-template-columns: 52px repeat(7, 1fr); }
+.weekhead .wh {
+  text-align: center; font-size: 12px; color: var(--muted); padding: 5px 0 6px;
+  border-radius: 8px 8px 0 0; border-bottom: 2px solid transparent;
+}
+.weekhead .wh .wd { font-weight: 700; text-transform: uppercase; letter-spacing: .03em; }
+.weekhead .wh .wn { display: block; font-size: 17px; font-weight: 700; color: var(--fg); }
+.weekhead .wh.today { color: var(--accent); border-bottom-color: var(--accent); background: var(--today); }
+.weekallday {
+  border-top: 1px solid var(--line); border-bottom: 1px solid var(--line);
+  min-height: 28px; align-items: stretch;
+}
+.weekallday .adlabel {
+  font-size: 10px; color: var(--muted); text-transform: uppercase;
+  padding: 5px 6px 0 0; text-align: right; letter-spacing: .03em;
+}
+.weekallday .adcell {
+  padding: 3px; display: flex; flex-direction: column; gap: 3px;
+  border-left: 1px solid var(--line); min-height: 28px;
+}
+.weekallday .adcell.today { background: var(--today); }
+.weekbody { max-height: 66vh; overflow-y: auto; }
+.tglabel { height: 44px; font-size: 11px; color: var(--muted); text-align: right; padding-right: 6px; }
+.tglabel span { position: relative; top: -7px; }
+.daycol {
+  position: relative; border-left: 1px solid var(--line);
+  background-image: repeating-linear-gradient(
+    to bottom, var(--line) 0, var(--line) 1px, transparent 1px, transparent 44px);
+}
+.daycol.today { background-color: var(--today); }
+.wevent {
+  position: absolute; text-align: left; overflow: hidden; cursor: pointer;
+  border-radius: 6px; padding: 2px 5px; font-size: 11px; line-height: 1.25;
+  background: var(--accent); color: #fff; border: 1px solid rgba(0,0,0,.18);
+  box-shadow: var(--shadow);
+}
+.wevent:hover { filter: brightness(1.08); z-index: 5; }
+.wevent .wt { font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wevent .wn { opacity: .95; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.weekchip {
+  font-size: 11px; padding: 3px 7px; border-radius: 999px; text-align: left;
+  background: var(--chip); color: var(--fg); border: 1px solid var(--line);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer;
+}
+.weekchip:hover { border-color: var(--accent); }
+
 /* Last in the file on purpose — same specificity as the base rules, so an
    earlier position loses on source order and only on a touch device. */
 @media (pointer: coarse) {
@@ -198,6 +271,7 @@ footer {
   button, .btn, input[type=search] { min-height: 44px; }
   .cell { min-height: 62px; }
   .ev .actions .btn { min-height: 40px; }
+  .viewseg button { min-height: 44px; }
 }
 """
 
@@ -231,10 +305,40 @@ let activeSource = null;
 let activeRegion = null;
 let picked = null;               // a 'YYYY-MM-DD' key, or 'undated', or null
 
-// The view month, held as plain numbers rather than a Date so that stepping
-// past December is arithmetic instead of timezone-sensitive.
-let viewY = Number(TODAY.slice(0, 4));
-let viewM = Number(TODAY.slice(5, 7)) - 1;
+// A single local-midnight cursor anchors both views: the month view shows the
+// cursor's month, the week view shows the cursor's week. Stepping is done on it.
+let cursor = new Date(Number(TODAY.slice(0, 4)), Number(TODAY.slice(5, 7)) - 1,
+                      Number(TODAY.slice(8, 10)));
+// Month or week. Remembered per-viewer; storage may throw (private mode), so
+// every read/write is guarded and falls back to 'month'.
+let view = 'month';
+try { if (localStorage.getItem('cal-view') === 'week') view = 'week'; } catch (e) {}
+
+const HOURPX = 44;          // px per hour in the week grid; matches the CSS line spacing
+const WEEK_DUR = 75;        // assumed event length (min) — events carry only a start
+const WDOW = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+
+// Local-midnight start (Sunday) of the week containing `d`.
+function weekStartOf(d) {
+  const s = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  s.setDate(s.getDate() - s.getDay());
+  return s;
+}
+// The seven 'YYYY-MM-DD' keys of the week containing `d`.
+function weekKeys(d) {
+  const s = weekStartOf(d);
+  const out = [];
+  for (let i = 0; i < 7; i++) {
+    const x = new Date(s.getFullYear(), s.getMonth(), s.getDate() + i);
+    out.push(keyOf(x.getFullYear(), x.getMonth(), x.getDate()));
+  }
+  return out;
+}
+function hourLabel(h) {
+  const ap = h < 12 || h === 24 ? 'am' : 'pm';
+  const hh = h % 12 === 0 ? 12 : h % 12;
+  return hh + ap;
+}
 
 function matching() {
   const q = search.value.trim().toLowerCase();
@@ -277,6 +381,28 @@ function render() {
   const events = matching();
   const map = byDay(events);
 
+  // Only one view's DOM is shown at a time; both read the same filtered map.
+  $('grid').hidden = view === 'week';
+  $('dow').hidden = view === 'week';
+  $('weekwrap').hidden = view !== 'week';
+
+  if (view === 'week') renderWeek(events, map);
+  else renderMonth(events, map);
+
+  // The undated bucket belongs to neither day nor hour, so it is a button in
+  // both views rather than a cell.
+  const undated = (map.get('undated') || []).length;
+  const btn = $('undated');
+  btn.hidden = !undated;
+  btn.textContent = undated + ' undated';
+  btn.setAttribute('aria-pressed', String(picked === 'undated'));
+
+  renderDay(map);
+  renderExport(events);
+}
+
+function renderMonth(events, map) {
+  const viewY = cursor.getFullYear(), viewM = cursor.getMonth();
   $('month-label').textContent = MONTHS[viewM] + ' ' + viewY;
 
   const first = new Date(viewY, viewM, 1);
@@ -342,15 +468,148 @@ function render() {
     grid.appendChild(cell);
   }
 
-  const undated = (map.get('undated') || []).length;
-  const btn = $('undated');
-  btn.hidden = !undated;
-  btn.textContent = undated + ' undated';
-  btn.setAttribute('aria-pressed', String(picked === 'undated'));
-
   $('count').textContent = inMonth + ' this month · ' + events.length + ' total';
-  renderDay(map);
-  renderExport(events);
+}
+
+// Split a day's timed events into non-overlapping lanes so concurrent events sit
+// side by side instead of on top of each other. Each event is placed in the
+// first lane whose previous event has already ended; a fresh lane opens only
+// when none has. Returns the placements and the lane count (the block width
+// denominator). Events an hour apart reuse one lane, so a quiet day is full
+// width and only genuine overlaps narrow.
+function packLanes(evs) {
+  const laneEnd = [];
+  const placed = [];
+  for (const ev of evs) {
+    const s = minutes(ev.time), e = s + WEEK_DUR;
+    let lane = laneEnd.findIndex(end => end <= s);
+    if (lane < 0) { lane = laneEnd.length; laneEnd.push(e); }
+    else laneEnd[lane] = e;
+    placed.push({ ev, lane, s, e });
+  }
+  return { placed, lanes: Math.max(1, laneEnd.length) };
+}
+
+function renderWeek(events, map) {
+  const keys = weekKeys(cursor);
+  const start = weekStartOf(cursor);
+  const days = keys.map((k, i) => new Date(start.getFullYear(), start.getMonth(),
+                                           start.getDate() + i));
+
+  // Label the span, e.g. "Aug 31 – Sep 6, 2026".
+  const a = days[0], b = days[6];
+  const fmt = (d) => MONTHS[d.getMonth()].slice(0, 3) + ' ' + d.getDate();
+  $('month-label').textContent = fmt(a) + ' – ' + fmt(b) + ', ' + b.getFullYear();
+
+  // Which hours to show: cover the week's timed events, default 8am–10pm, and
+  // never taller than the full day. Undated-time events go to the all-day row.
+  let minM = 8 * 60, maxM = 22 * 60;
+  for (const k of keys) {
+    for (const ev of (map.get(k) || [])) {
+      const m = minutes(ev.time);
+      if (m >= 1e6) continue;
+      minM = Math.min(minM, m);
+      maxM = Math.max(maxM, m + WEEK_DUR);
+    }
+  }
+  const startH = Math.max(0, Math.floor(minM / 60));
+  const endH = Math.min(24, Math.max(startH + 6, Math.ceil(maxM / 60)));
+  const bodyH = (endH - startH) * HOURPX;
+
+  const wrap = $('weekwrap');
+  wrap.textContent = '';
+  const inner = document.createElement('div');
+  inner.className = 'weekinner';
+
+  // ── Header row: day name + date, today highlighted ──
+  const head = document.createElement('div');
+  head.className = 'weekhead';
+  head.appendChild(document.createElement('div'));            // corner over the gutter
+  days.forEach((d, i) => {
+    const wh = document.createElement('div');
+    wh.className = 'wh' + (keys[i] === TODAY ? ' today' : '');
+    const wd = document.createElement('span');
+    wd.className = 'wd'; wd.textContent = WDOW[d.getDay()];
+    const wn = document.createElement('span');
+    wn.className = 'wn'; wn.textContent = d.getDate();
+    wh.appendChild(wd); wh.appendChild(wn);
+    head.appendChild(wh);
+  });
+  inner.appendChild(head);
+
+  // ── All-day / timeless row ──
+  const allday = document.createElement('div');
+  allday.className = 'weekallday';
+  const adlabel = document.createElement('div');
+  adlabel.className = 'adlabel'; adlabel.textContent = 'all-day';
+  allday.appendChild(adlabel);
+  let anyAllDay = false;
+  keys.forEach((k, i) => {
+    const cell = document.createElement('div');
+    cell.className = 'adcell' + (k === TODAY ? ' today' : '');
+    for (const ev of (map.get(k) || [])) {
+      if (minutes(ev.time) < 1e6) continue;
+      anyAllDay = true;
+      const chip = document.createElement('button');
+      chip.type = 'button'; chip.className = 'weekchip';
+      chip.textContent = ev.title;
+      chip.onclick = () => { picked = k; render(); };
+      cell.appendChild(chip);
+    }
+    allday.appendChild(cell);
+  });
+  allday.hidden = !anyAllDay;
+  inner.appendChild(allday);
+
+  // ── Time grid: gutter of hour labels + seven positioned day columns ──
+  const body = document.createElement('div');
+  body.className = 'weekbody';
+  const grid = document.createElement('div');
+  grid.className = 'weekgrid';
+
+  const gutter = document.createElement('div');
+  gutter.className = 'timegutter';
+  gutter.style.height = bodyH + 'px';
+  for (let h = startH; h < endH; h++) {
+    const lab = document.createElement('div');
+    lab.className = 'tglabel';
+    const s = document.createElement('span');
+    s.textContent = hourLabel(h);
+    lab.appendChild(s);
+    gutter.appendChild(lab);
+  }
+  grid.appendChild(gutter);
+
+  keys.forEach((k) => {
+    const col = document.createElement('div');
+    col.className = 'daycol' + (k === TODAY ? ' today' : '');
+    col.style.height = bodyH + 'px';
+    const timed = (map.get(k) || []).filter(ev => minutes(ev.time) < 1e6);
+    const { placed, lanes } = packLanes(timed);
+    for (const p of placed) {
+      const el = document.createElement('button');
+      el.type = 'button'; el.className = 'wevent';
+      el.style.top = ((p.s - startH * 60) / 60 * HOURPX) + 'px';
+      el.style.height = Math.max(20, (p.e - p.s) / 60 * HOURPX - 2) + 'px';
+      el.style.left = 'calc(' + (p.lane * 100 / lanes) + '% + 1px)';
+      el.style.width = 'calc(' + (100 / lanes) + '% - 3px)';
+      const t = document.createElement('div');
+      t.className = 'wt'; t.textContent = p.ev.time;
+      const n = document.createElement('div');
+      n.className = 'wn'; n.textContent = p.ev.title;
+      el.appendChild(t); el.appendChild(n);
+      el.onclick = () => { picked = k; render(); };
+      col.appendChild(el);
+    }
+    grid.appendChild(col);
+  });
+
+  body.appendChild(grid);
+  inner.appendChild(body);
+  wrap.appendChild(inner);
+
+  const wk = keys.reduce((acc, k) => acc + (map.get(k) || []).length, 0);
+  $('count').textContent = wk + ' this week · ' + events.length + ' total';
 }
 
 function renderDay(map) {
@@ -431,27 +690,43 @@ function eventCard(ev) {
 // One .ics for everything visible this month. Thirty separate downloads is not
 // an import; this is the button that makes the page worth opening on a laptop.
 function renderExport(events) {
-  const prefix = keyOf(viewY, viewM, 1).slice(0, 7);
-  const month = events.filter(ev => ev.date && ev.date.slice(0, 7) === prefix);
+  let scope, label;
+  if (view === 'week') {
+    const keys = new Set(weekKeys(cursor));
+    scope = events.filter(ev => ev.date && keys.has(ev.date));
+    label = 'week of ' + weekKeys(cursor)[0];
+  } else {
+    const prefix = keyOf(cursor.getFullYear(), cursor.getMonth(), 1).slice(0, 7);
+    scope = events.filter(ev => ev.date && ev.date.slice(0, 7) === prefix);
+    label = MONTHS[cursor.getMonth()] + ' ' + cursor.getFullYear();
+  }
   const link = $('export');
-  const href = icsForMany(month);
+  const href = icsForMany(scope);
   link.hidden = !href;
   if (!href) return;
   link.href = href;
-  link.setAttribute('download', icsName(MONTHS[viewM] + ' ' + viewY));
-  link.textContent = 'Export ' + month.length + ' to calendar';
+  link.setAttribute('download', icsName(label));
+  link.textContent = 'Export ' + scope.length + ' to calendar';
 }
 
 function step(delta) {
-  const d = new Date(viewY, viewM + delta, 1);
-  viewY = d.getFullYear(); viewM = d.getMonth();
+  if (view === 'week') cursor.setDate(cursor.getDate() + 7 * delta);
+  else cursor = new Date(cursor.getFullYear(), cursor.getMonth() + delta, 1);
   render();
 }
 
 function toToday() {
-  viewY = Number(TODAY.slice(0, 4));
-  viewM = Number(TODAY.slice(5, 7)) - 1;
+  cursor = new Date(Number(TODAY.slice(0, 4)), Number(TODAY.slice(5, 7)) - 1,
+                    Number(TODAY.slice(8, 10)));
   picked = TODAY;
+  render();
+}
+
+function setView(v) {
+  view = v;
+  try { localStorage.setItem('cal-view', v); } catch (e) {}
+  $('view-month').setAttribute('aria-pressed', String(v === 'month'));
+  $('view-week').setAttribute('aria-pressed', String(v === 'week'));
   render();
 }
 
@@ -499,6 +774,11 @@ filterToggle.onclick = () => {
 $('prev').onclick = () => step(-1);
 $('next').onclick = () => step(1);
 $('today-btn').onclick = toToday;
+$('view-month').onclick = () => setView('month');
+$('view-week').onclick = () => setView('week');
+// Reflect the remembered view before the first paint.
+$('view-month').setAttribute('aria-pressed', String(view === 'month'));
+$('view-week').setAttribute('aria-pressed', String(view === 'week'));
 $('undated').onclick = () => {
   picked = (picked === 'undated' ? null : 'undated');
   render();
@@ -595,6 +875,10 @@ def generate_calendar_html(
   <div class="bar">
     <input id="q" type="search" placeholder="Search events, venues, people"
            autocomplete="off" aria-label="Search events">
+    <div class="viewseg" role="group" aria-label="Calendar view">
+      <button id="view-month" type="button" aria-pressed="true">Month</button>
+      <button id="view-week" type="button" aria-pressed="false">Week</button>
+    </div>
     <button id="today-btn" type="button">Today</button>
     <button id="filter-toggle" type="button" aria-expanded="false">Filters</button>
     <button id="undated" type="button" aria-pressed="false" hidden></button>
@@ -616,16 +900,17 @@ def generate_calendar_html(
     <h2 id="month-label"></h2>
     <span class="meta" id="count"></span>
     <span class="stepper">
-      <button class="nav-btn" id="prev" type="button" aria-label="Previous month">&larr;</button>
-      <button class="nav-btn" id="next" type="button" aria-label="Next month">&rarr;</button>
+      <button class="nav-btn" id="prev" type="button" aria-label="Previous">&larr;</button>
+      <button class="nav-btn" id="next" type="button" aria-label="Next">&rarr;</button>
     </span>
   </div>
-  <div class="dow" aria-hidden="true">{dow}</div>
+  <div class="dow" id="dow" aria-hidden="true">{dow}</div>
   <div class="grid" id="grid" role="grid" aria-label="Month"></div>
+  <div id="weekwrap" hidden></div>
   <section id="day" aria-live="polite"></section>
 </main>
-<footer>Generated by event-harvester. Arrow keys change month, T jumps to today.
-This file contains the event data — forwarding it forwards them.</footer>
+<footer>Generated by event-harvester. Arrow keys change the range, T jumps to
+today. This file contains the event data — forwarding it forwards them.</footer>
 <script type="application/json" id="events-data">{_safe_json(prepared)}</script>
 <script>{_SCRIPT}</script>
 </body>

@@ -203,6 +203,59 @@ class TestNav:
         assert 'href="admin"' not in path.read_text(encoding="utf-8")
 
 
+class TestWeekView:
+    """The selectable week view. Pinned by source inspection, like the rest of
+    this file — the page has no browser here to render into."""
+
+    def test_the_view_toggle_is_present(self, page):
+        assert 'class="viewseg"' in page
+        assert 'id="view-month"' in page and 'id="view-week"' in page
+
+    def test_the_week_container_exists_and_starts_hidden(self, page):
+        assert '<div id="weekwrap" hidden></div>' in page
+
+    def test_it_builds_a_time_grid_with_day_columns(self, page):
+        code = _code(page)
+        assert "function renderWeek(" in code
+        assert "weekgrid" in page and "daycol" in page      # the grid + columns
+        assert "timegutter" in page                          # the hour axis
+
+    def test_overlapping_events_are_lane_packed_into_blocks(self, page):
+        """Concurrent events sit side by side, not stacked — that is packLanes."""
+        assert "function packLanes(" in _code(page)
+        assert "class=\"wevent\"" not in page  # blocks are built in JS, not static
+        assert ".wevent" in page               # but their style is declared
+
+    def test_it_has_an_all_day_row_for_timeless_events(self, page):
+        assert "weekallday" in page and "all-day" in page
+
+    def test_the_remembered_view_is_read_but_guarded(self, page):
+        """Per-viewer preference in localStorage, wrapped so private mode (which
+        throws on access) still renders."""
+        code = _code(page)
+        assert "localStorage.getItem('cal-view')" in code
+        assert "localStorage.setItem('cal-view'" in code
+        assert "try {" in code and "catch (e) {}" in code
+
+    def test_week_navigation_steps_seven_days_not_a_month(self, page):
+        code = _code(page)
+        assert "cursor.getDate() + 7 * delta" in code
+
+    def test_the_month_grid_can_actually_be_hidden(self, page):
+        """`.grid`/`.dow` set `display: grid`, which beats the UA `[hidden]`
+        rule, so toggling to week view needs an explicit hide or both views
+        show at once."""
+        assert re.search(r"\.grid\[hidden\][^}]*display:\s*none", page)
+        assert re.search(r"\.dow\[hidden\][^}]*display:\s*none", page)
+
+    def test_the_week_grid_is_built_from_local_dates_only(self, page):
+        """Same defect the month grid guards against — a week assembled through
+        UTC would shift every column a day west of Greenwich."""
+        code = _code(page)
+        assert not re.search(r"new Date\(\s*['\"]", code)
+        assert "toISOString" not in code
+
+
 class TestEmpty:
     def test_a_harvest_with_nothing_in_it_still_renders(self, tmp_path):
         path = tmp_path / "c.html"
