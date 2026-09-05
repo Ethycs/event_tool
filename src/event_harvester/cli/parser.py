@@ -373,6 +373,11 @@ def build_parser() -> argparse.ArgumentParser:
                              help="mcp/gateway only: HTTP path (default: /mcp)")
     svc_install.add_argument("--allow-any-host", action="store_true",
                              help="mcp only: disable the DNS-rebinding Host check")
+    svc_install.add_argument("--allow-insecure", action="store_true",
+                             help="gateway only: permit a non-loopback bind with "
+                                  "auth=none, for a network that authenticates on "
+                                  "its own (e.g. a ZeroTier mesh). Sets "
+                                  "EH_GATEWAY_ALLOW_INSECURE on the service")
     svc_install.add_argument("--backend-url", default=None, metavar="URL",
                              help="gateway only: the MCP backend to proxy "
                                   "(default: http://127.0.0.1:8765/mcp)")

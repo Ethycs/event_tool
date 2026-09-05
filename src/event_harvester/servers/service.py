@@ -251,6 +251,7 @@ def build_service_env(
     path: str = "/mcp",
     backend_url: str | None = None,
     browsers_path: str | None = None,
+    allow_insecure: bool = False,
 ) -> dict[str, str]:
     """Non-secret wiring passed to the service as environment.
 
@@ -282,6 +283,13 @@ def build_service_env(
             "EH_MCP_URL": backend_url
             or f"http://127.0.0.1:{SERVICES['mcp'].default_port}/mcp",
         })
+        # A non-loopback bind with auth=none is refused by the gateway's
+        # exposure guard unless the operator asserts the network authenticates
+        # (the ZeroTier-mesh case). Wiring it into the service env — rather than
+        # relying on `.env` — keeps the mesh bind self-contained and visible in
+        # `nssm get ... AppEnvironmentExtra`. Not a secret; a path/flag.
+        if allow_insecure:
+            env["EH_GATEWAY_ALLOW_INSECURE"] = "1"
     return env
 
 
@@ -294,6 +302,7 @@ def build_install_commands(
     interval_hours: float = 24.0,
     path: str = "/mcp",
     allow_any_host: bool = False,
+    allow_insecure: bool = False,
     backend_url: str | None = None,
     nssm: str = "nssm",
     pixi: str = "pixi",
@@ -351,6 +360,7 @@ def build_install_commands(
 
     env = build_service_env(
         spec, host=host, port=bind_port, path=path, backend_url=backend_url,
+        allow_insecure=allow_insecure,
     )
     if env:
         commands.append(
@@ -393,6 +403,7 @@ def install(
     interval_hours: float = 24.0,
     path: str = "/mcp",
     allow_any_host: bool = False,
+    allow_insecure: bool = False,
     backend_url: str | None = None,
     extra_args: list[str] | None = None,
 ) -> dict:
@@ -415,7 +426,8 @@ def install(
     commands = build_install_commands(
         service=service, name=svc_name, host=host, port=bind_port,
         interval_hours=interval_hours, path=path, allow_any_host=allow_any_host,
-        backend_url=backend_url, nssm=nssm, pixi=pixi, extra_args=extra_args,
+        allow_insecure=allow_insecure, backend_url=backend_url, nssm=nssm,
+        pixi=pixi, extra_args=extra_args,
     )
     for cmd in commands:
         _check(cmd)

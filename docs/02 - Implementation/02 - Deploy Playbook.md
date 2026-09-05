@@ -291,6 +291,32 @@ To inject Infisical secrets, wrap the command in a `.cmd` that prefixes
 
 ---
 
+## 5b. Expose the gateway on the ZeroTier mesh (no OAuth)
+
+When the only clients are your own machines on the ZeroTier mesh — where every
+peer is already authenticated — you do not need OAuth or a public tunnel. Bind
+the gateway to the mesh and let the network be the boundary. The gateway's
+exposure guard refuses a non-loopback bind with `auth=none` by default; the
+`--allow-insecure` flag is how you assert "the network authenticates," and it
+wires `EH_GATEWAY_ALLOW_INSECURE=1` into the service (visible in
+`nssm get EventHarvesterGateway AppEnvironmentExtra`), so it does not depend on
+`.env`.
+
+```powershell
+# elevated — bind the mesh interface (0.0.0.0 covers it), no auth, mesh-scoped
+pixi run event-harvester service install --service gateway --host 0.0.0.0 --allow-insecure
+pixi run event-harvester service start --service gateway
+```
+
+Reach it from any mesh peer at `http://<mesh-host>:9000/mcp` (e.g.
+`central-dev.zt:9000/mcp`), or add a reverse-proxy route under the existing
+`central-dev.zt` host if you prefer the gateway to stay on loopback. `0.0.0.0`
+binds every interface, so use it only on a box with no public interface; to
+scope tighter, pass the ZeroTier IP to `--host` instead. This is **not** the
+mode for a Claude custom connector — that flow is OAuth (§5c).
+
+---
+
 ## 5c. Expose the gateway as a Claude custom connector
 
 A **custom connector** takes exactly one URL, and whatever answers at that URL

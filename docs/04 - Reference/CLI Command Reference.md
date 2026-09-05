@@ -171,7 +171,7 @@ Entry point: `commands/service.py` → `servers/service.py`. Runs a long-lived p
 
 `--all` acts on every service in dependency order — reversed for `stop` and `uninstall`, so a gateway is never left proxying a backend that is going away underneath it. `--all` with `--name` is refused: one name cannot rename three services.
 
-All subcommands take `--service` and `--name` (default: per service). `install` also takes `--host`, `--port` (defaults per service), `--interval-hours` (site), `--path` and `--allow-any-host` (mcp), `--backend-url` (gateway). `logs` takes `--lines` and has no `--all`.
+All subcommands take `--service` and `--name` (default: per service). `install` also takes `--host`, `--port` (defaults per service), `--interval-hours` (site), `--path` and `--allow-any-host` (mcp), `--backend-url` and `--allow-insecure` (gateway). `--allow-insecure` wires `EH_GATEWAY_ALLOW_INSECURE=1` into the gateway service so it will bind a non-loopback address with `auth=none` — for a network that authenticates on its own (a ZeroTier mesh), see Deploy Playbook §5b. `logs` takes `--lines` and has no `--all`.
 
 Install/uninstall/start/stop **require an elevated shell**; `status` and `logs` do not.
 

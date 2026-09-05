@@ -83,6 +83,7 @@ def _install(key: str, args, svc) -> int:
         interval_hours=args.interval_hours,
         path=args.path,
         allow_any_host=args.allow_any_host,
+        allow_insecure=getattr(args, "allow_insecure", False),
         backend_url=args.backend_url,
     )
     print(f"\n  {GREEN}Installed{RESET} {BOLD}{info['name']}{RESET} -> {info['url']}")
@@ -105,7 +106,9 @@ def _install(key: str, args, svc) -> int:
               f"proxies and reads no user credentials.{RESET}\n")
 
     if info["service"] == "gateway":
-        _gateway_exposure_notice()
+        _gateway_exposure_notice(
+            host=args.host, allow_insecure=getattr(args, "allow_insecure", False),
+        )
 
     print(f"  Then start it:  {BOLD}event-harvester service start "
           f"--service {info['service']}{RESET}")
@@ -114,19 +117,24 @@ def _install(key: str, args, svc) -> int:
     return 0
 
 
-def _gateway_exposure_notice() -> None:
+def _gateway_exposure_notice(*, host: str = "127.0.0.1", allow_insecure: bool = False) -> None:
     """The gateway is the only service meant to face outward. Say what that costs."""
-    from event_harvester.servers.gateway import auth_mode
+    from event_harvester.servers.gateway import auth_mode, is_loopback
 
     mode = auth_mode()
     print(f"  {BOLD}This is the endpoint a remote connector points at.{RESET}")
     print(f"  {DIM}auth: EH_GATEWAY_AUTH={mode}{RESET}")
-    if mode == "none":
+    if mode == "none" and not is_loopback(host) and allow_insecure:
+        print(f"  {YELLOW}Binding {host} with auth=none and "
+              f"EH_GATEWAY_ALLOW_INSECURE=1.{RESET}")
+        print("  Every mesh peer that reaches this port gets harvest, approve, chat")
+        print("  and the grok tools with no further auth — sound only if the network")
+        print("  itself authenticates (a ZeroTier mesh). Not for the public internet.")
+    elif mode == "none":
         print(f"  {YELLOW}With auth=none it will refuse to bind anything but "
               f"loopback.{RESET}")
-        print("  For a Claude custom connector set an OAuth provider "
-              "(github/google/...),")
-        print("  because that flow is OAuth — a static token cannot be used there.")
+        print("  For a mesh bind add --allow-insecure; for a Claude custom connector")
+        print("  set an OAuth provider (github/google/...), because that flow is OAuth.")
     print(f"  {DIM}Reachability is separate: Claude connects inbound over public "
           f"HTTPS,{RESET}")
     print(f"  {DIM}so put cloudflared/ngrok/a reverse proxy in front. "

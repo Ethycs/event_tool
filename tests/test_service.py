@@ -128,6 +128,28 @@ class TestTheServiceRegistry:
             if "AppEnvironmentExtra" in c)
         assert "EH_MCP_URL=http://127.0.0.1:7000/mcp" in line
 
+    def test_allow_insecure_is_off_unless_asked_for(self):
+        env = svc.build_service_env(svc.spec_for("gateway"), host="0.0.0.0", port=9000)
+        assert "EH_GATEWAY_ALLOW_INSECURE" not in env
+
+    def test_allow_insecure_wires_the_env_for_a_mesh_bind(self):
+        """A ZeroTier bind: non-loopback host, auth stays none, the guard is told
+        the network authenticates via the service env (not .env)."""
+        line = next(c for c in svc.build_install_commands(
+            service="gateway", host="0.0.0.0", allow_insecure=True)
+            if "AppEnvironmentExtra" in c)
+        # pairs start at index 4 (nssm, set, <name>, AppEnvironmentExtra, k=v...)
+        env = dict(pair.split("=", 1) for pair in line[4:])
+        assert env["GATEWAY_HOST"] == "0.0.0.0"
+        assert env["EH_GATEWAY_ALLOW_INSECURE"] == "1"
+
+    def test_allow_insecure_is_gateway_only(self):
+        """The mcp/site services never carry the flag even if it is passed."""
+        for service in ("mcp", "site"):
+            env = svc.build_service_env(
+                svc.spec_for(service), host="0.0.0.0", port=9000, allow_insecure=True)
+            assert "EH_GATEWAY_ALLOW_INSECURE" not in env
+
     def test_no_secret_is_written_into_the_service_config(self):
         """`AppEnvironmentExtra` lands in the registry in plaintext.
 
