@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -38,6 +39,31 @@ UA = "event-harvester/1.0 (+partiful)"
 DEFAULT_FORWARD_DAYS = 30
 DEFAULT_CITY = "SF"
 DESC_LIMIT = 400
+
+# `startDate` is UTC; the per-event `timezone` field is unreliable (it read
+# America/New_York for SF and LA events alike, 2026-09-05), so the *configured
+# city* is the trustworthy zone. An 8pm-Pacific event is stored 03:00Z the next
+# day — slicing the raw string put it at 3am, a day early.
+_CITY_TZ = {
+    "SF": "America/Los_Angeles",
+    "LA": "America/Los_Angeles",
+    "NYC": "America/New_York",
+}
+DEFAULT_TZ = "America/Los_Angeles"
+
+
+def _local_start(start_raw: str, city: str) -> tuple[str, str]:
+    """``(date, time)`` of a UTC ``startDate`` in the configured city's zone."""
+    tz_name = _CITY_TZ.get((city or "").upper(), DEFAULT_TZ)
+    try:
+        dt = datetime.fromisoformat((start_raw or "").replace("Z", "+00:00"))
+    except ValueError:
+        return start_raw[:10], start_raw[11:16]
+    try:
+        local = dt.astimezone(ZoneInfo(tz_name))
+    except Exception:
+        local = dt.astimezone(ZoneInfo(DEFAULT_TZ))
+    return local.strftime("%Y-%m-%d"), local.strftime("%H:%M")
 
 
 def city_sections(html: str) -> dict[str, list[dict]]:
@@ -89,8 +115,9 @@ def _message(event: dict, name: str, city: str) -> dict | None:
     eid = event.get("id") or ""
     link = f"https://partiful.com/e/{eid}" if eid else ""
     venue = _venue(event)
+    date_str, time_str = _local_start(start, city)
 
-    parts = [title, f"Date: {start[:10]}", f"Time: {start[11:16]} UTC"]
+    parts = [title, f"Date: {date_str}", f"Time: {time_str}"]
     if venue:
         parts.append(f"Venue: {venue}")
     if link:

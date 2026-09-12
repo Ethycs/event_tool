@@ -32,6 +32,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -43,6 +44,10 @@ _TRACER = "event_harvester.sources.web_modes.luma"
 
 API = "https://api.lu.ma/discover/get-paginated-events"
 UA = "event-harvester/1.0 (+luma)"
+# Luma's API returns `start_at` in UTC and the event's own `timezone` separately;
+# an 8pm-Pacific event is stored 03:00Z the *next* day. Falls back to Pacific
+# when an event omits its zone, matching the SF/Bay-Area focus of this tool.
+DEFAULT_TZ = "America/Los_Angeles"
 
 DEFAULT_FORWARD_DAYS = 21
 DEFAULT_MAX_EVENTS = 60
@@ -124,6 +129,24 @@ def fetch_entries(
     return out[:max_events]
 
 
+def _local_start(start_raw: str, tz_name: str) -> tuple[str, str]:
+    """``(date, time)`` of a Luma UTC ``start_at``, in the event's local zone.
+
+    ``start_at`` is UTC (``…Z``); the event carries its own ``timezone``. Taking
+    the raw string's date/time slice put an 8pm-Pacific event at 03:00 on the
+    *next* day — the "shows at 3am, a day early" bug. Convert first.
+    """
+    try:
+        dt = datetime.fromisoformat((start_raw or "").replace("Z", "+00:00"))
+    except ValueError:
+        return start_raw[:10], start_raw[11:16]     # unparseable: last-resort slice
+    try:
+        local = dt.astimezone(ZoneInfo(tz_name or DEFAULT_TZ))
+    except Exception:
+        local = dt.astimezone(ZoneInfo(DEFAULT_TZ))
+    return local.strftime("%Y-%m-%d"), local.strftime("%H:%M")
+
+
 def _venue(event: dict) -> str:
     """Best available place string, without inventing precision.
 
@@ -155,10 +178,12 @@ def _message(entry: dict, name: str) -> dict | None:
     slug = event.get("url") or ""
     link = f"https://luma.com/{slug}" if slug else ""
     venue = _venue(event)
+    date_str, time_str = _local_start(start, event.get("timezone") or DEFAULT_TZ)
 
     # Facts first: `analysis.build_prompt` keeps 400 chars per message, and
-    # these are exact where any prose would be inferred.
-    parts = [title, f"Date: {start[:10]}", f"Time: {start[11:16]} UTC"]
+    # these are exact where any prose would be inferred. Date/Time are the
+    # event's local wall-clock, converted from the UTC `start_at`.
+    parts = [title, f"Date: {date_str}", f"Time: {time_str}"]
     if venue:
         parts.append(f"Venue: {venue}")
     if link:

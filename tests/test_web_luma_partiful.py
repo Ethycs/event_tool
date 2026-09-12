@@ -52,6 +52,7 @@ class TestParseNextData:
 def _luma_event(name="Party", start="2026-08-12T01:00:00.000Z", **over):
     ev = {
         "api_id": "evt-1", "name": name, "start_at": start,
+        "timezone": "America/Los_Angeles",
         "url": "slug1", "geo_address_info": {
             "address": "550 Laguna", "city_state": "San Francisco, CA",
         },
@@ -66,9 +67,27 @@ class TestLumaMessages:
         assert msg["platform"] == "web"
         assert msg["id"] == "luma:evt-1"
         assert msg["channel"] == "luma"
-        assert "Date: 2026-08-12" in msg["content"]
+        # 01:00Z in Pacific is 18:00 the previous day — the date/time are the
+        # event's local wall-clock, not the raw UTC slice.
+        assert "Date: 2026-08-11" in msg["content"]
+        assert "Time: 18:00" in msg["content"]
         assert "Venue: 550 Laguna, San Francisco, CA" in msg["content"]
         assert "https://luma.com/slug1" in msg["content"]
+
+    def test_the_time_is_converted_from_utc_to_the_events_zone(self):
+        """The 'shows at 3am, a day early' bug: an 8pm-Pacific event is stored
+        03:00Z the next day, and must render as 8pm the correct day."""
+        msg = luma._message(
+            _luma_event(start="2026-09-11T03:00:00.000Z"), "luma")
+        assert "Date: 2026-09-10" in msg["content"]
+        assert "Time: 20:00" in msg["content"]
+        assert "UTC" not in msg["content"]     # no longer labelled/left in UTC
+
+    def test_a_missing_zone_falls_back_to_pacific(self):
+        ev = _luma_event(start="2026-09-11T03:00:00.000Z")
+        del ev["event"]["timezone"]
+        msg = luma._message(ev, "luma")
+        assert "Date: 2026-09-10" in msg["content"] and "Time: 20:00" in msg["content"]
 
     def test_the_title_leads(self):
         """build_prompt keeps 400 chars; the name must not be buried."""
@@ -275,9 +294,22 @@ class TestPartifulMessages:
         assert msg["platform"] == "web"
         assert msg["id"] == "partiful:abc123"
         assert msg["channel"] == "partiful-sf"
+        # 21:00Z is 14:00 PDT the same day — local wall-clock, not the UTC slice.
         assert "Date: 2026-08-16" in msg["content"]
+        assert "Time: 14:00" in msg["content"]
+        assert "UTC" not in msg["content"]
         assert "Robin Williams Meadow, Kezar Drive" in msg["content"]
         assert "https://partiful.com/e/abc123" in msg["content"]
+
+    def test_the_time_is_converted_to_the_configured_citys_zone(self, monkeypatch):
+        """An 8pm-Pacific SF event is stored 03:00Z the next day; the per-event
+        `timezone` field is unreliable (reads NY for SF), so the configured city
+        is the zone that gets it back to 8pm on the right day."""
+        _patch_fetch(monkeypatch, _partiful_page(SF=[_partiful_event(
+            start="2026-08-20T03:00:00.000Z", timezone="America/New_York")]))
+        msg = _run(city="SF")[0]
+        assert "Date: 2026-08-19" in msg["content"]     # 03:00Z -> 20:00 PDT prev day
+        assert "Time: 20:00" in msg["content"]
 
     def test_the_description_is_included_and_bounded(self, monkeypatch):
         _patch_fetch(monkeypatch, _partiful_page(

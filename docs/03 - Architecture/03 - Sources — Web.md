@@ -114,6 +114,8 @@ So `luma` paginates the API rather than parsing a 400 KB page, and resolves the 
 
 `partiful` has no API — Partiful is invitation-shaped — but `/explore` inlines its trending events into the Next.js props, bucketed by city. **`city` is the load-bearing field:** the live sections are `NYC`, `LA`, `SF` **in that order**, so a mode that took the first would have filled an SF calendar with New York. That is the `ma.to` trap from `10 - Blueprints/01`, and it is why a missing city logs the available ones and returns nothing rather than falling back.
 
+**Both emit local wall-clock, converted from UTC · fixed 2026-09-05.** Both APIs give `start_at`/`startDate` in **UTC** (`…Z`); an 8pm-Pacific event is stored `03:00Z` the *next* day. Both modes previously took the raw string's date/time slice and labelled it `UTC`, so the event surfaced at **3am on the wrong day** — the same defect `ics.py` had. `luma` now converts through the event's own reliable `timezone` field (falling back to Pacific); `partiful`'s per-event `timezone` is unreliable (it read `America/New_York` for SF and LA events alike), so `partiful` converts through the **configured city**'s zone (`_CITY_TZ`) instead. This is the third source of this bug class — any new structured source must convert before emitting a date/time.
+
 **Measured 2026-08-10**, end-to-end through the real pipeline:
 
 | Source | Before | After |
