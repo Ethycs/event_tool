@@ -84,6 +84,19 @@ class LLMConfig:
     # short-circuit to classification="unknown".
     vision_max_images_per_run: int = 10
 
+    # Triton behind the proxy, reached directly over the mesh. The proxy only
+    # forwards inference; it cannot load a model Triton has unloaded, and
+    # Triton unloads everything on restart (explicit model control). With
+    # both set, the harvester loads the model itself when a call fails for
+    # want of it (`llm._retry_after_triton_load`) and the `llm_status` tool
+    # can say whether it is loaded. Empty disables both.
+    triton_url: str = ""         # e.g. http://10.158.218.141:8000
+    triton_model: str = ""       # Triton repository name, e.g. qwen3-8b-gguf
+
+    @property
+    def triton_is_configured(self) -> bool:
+        return bool(self.triton_url and self.triton_model)
+
     @property
     def is_configured(self) -> bool:
         """Whether this config could actually reach a model.
@@ -521,6 +534,8 @@ def load_config() -> AppConfig:
             device=os.getenv("LLM_DEVICE", "npu"),
             vision_model=os.getenv("VLM_MODEL", ""),
             vision_max_images_per_run=vlm_max_images,
+            triton_url=os.getenv("TRITON_URL", "").strip(),
+            triton_model=os.getenv("TRITON_MODEL", "").strip(),
         ),
         ticktick=TickTickConfig(
             client_id=os.getenv("TICKTICK_CLIENT_ID", ""),

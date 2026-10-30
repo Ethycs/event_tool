@@ -11,6 +11,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from event_harvester import triton
 from event_harvester.config import LLMConfig
 from event_harvester.observability.metrics import count
 from event_harvester.observability.tracing import set_span_attrs, traced
@@ -83,12 +84,50 @@ def chat_completion(
                 messages, cfg, max_tokens=max_tokens, response_format=response_format
             )
         except Exception as primary_error:
-            out = _complete_fallback(
+            out = _retry_after_triton_load(
                 messages, cfg, max_tokens=max_tokens,
                 response_format=response_format, primary_error=primary_error,
             )
     set_span_attrs(**{"llm.response_chars": len(out), "llm.response_empty": not out})
     return out
+
+
+def _retry_after_triton_load(
+    messages: list[dict[str, str]],
+    cfg: LLMConfig,
+    *,
+    max_tokens: int,
+    response_format: dict[str, str] | None,
+    primary_error: Exception,
+) -> str:
+    """Heal a Triton "model not loaded" failure before falling back.
+
+    The proxy cannot load a model Triton has unloaded, and Triton unloads
+    everything on restart (explicit model control). From 2026-10-26 to
+    2026-10-29 that meant every primary call 500'd and every harvest ran on
+    the cloud fallback with nothing to say so. When the error reads like
+    that and `TRITON_URL` is set, ask Triton to load the model and retry the
+    primary once; only then fall back. Any other failure goes straight to
+    the fallback as before.
+    """
+    if cfg.triton_is_configured and triton.looks_unloaded(primary_error):
+        loaded = triton.ensure_loaded(cfg)
+        set_span_attrs(**{
+            "llm.triton_load.action": loaded["action"],
+            "llm.triton_load.seconds": loaded["seconds"],
+        })
+        if loaded["loaded"]:
+            try:
+                return _complete_litellm(
+                    messages, cfg, max_tokens=max_tokens,
+                    response_format=response_format,
+                )
+            except Exception as retry_error:
+                primary_error = retry_error
+    return _complete_fallback(
+        messages, cfg, max_tokens=max_tokens,
+        response_format=response_format, primary_error=primary_error,
+    )
 
 
 def _complete_fallback(

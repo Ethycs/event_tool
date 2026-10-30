@@ -13,9 +13,11 @@ environments where the server dependency has not been installed yet.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import time
 from datetime import date, datetime, timezone
 from typing import Any
 
@@ -431,6 +433,9 @@ def _summarize_config(cfg: AppConfig) -> dict[str, Any]:
         "llm": {
             "backend": cfg.llm.backend,
             "model": cfg.llm.display_name,
+            "api_base": cfg.llm.api_base,
+            "fallback_model": cfg.llm.fallback_model,
+            "triton": {"url": cfg.llm.triton_url, "model": cfg.llm.triton_model},
         },
         "ticktick_project": cfg.ticktick.project,
     }
@@ -631,6 +636,95 @@ def build_server(
             "queue": jobs.queue_summary(),
         }
         return summary
+
+    @server.tool()
+    @traced("mcp.tool.llm_status", tracer_name=_TRACER)
+    async def llm_status(load: bool = False, probe: bool = False) -> dict[str, Any]:
+        """Can the harvester reach its primary model? Optionally load it and prove it.
+
+        Checks the litellm proxy (is the model listed) and Triton (is the model
+        loaded). ``load=True`` asks Triton to load it when it is not.
+        ``probe=True`` sends a one-token completion to the primary with the
+        fallback disabled, so a cloud fallback cannot mask a dead primary; a
+        probe also heals, because the completion path loads on demand.
+        ``can_reach_model`` is the one-line answer.
+        """
+        from dataclasses import replace
+
+        from event_harvester import llm as llm_mod
+        from event_harvester import triton
+
+        cfg = load_config().llm
+        report: dict[str, Any] = {
+            "model": cfg.model,
+            "backend": cfg.backend,
+            "api_base": cfg.api_base,
+            "fallback_model": cfg.fallback_model,
+            "proxy": {"reachable": None, "model_listed": None, "error": None},
+            "triton": None,
+            "probe": None,
+            "can_reach_model": None,
+        }
+        if cfg.backend != "litellm":
+            report["note"] = "backend is not litellm; proxy and Triton checks do not apply"
+            return report
+
+        def _proxy() -> None:
+            p = report["proxy"]
+            if not cfg.api_base:
+                p["error"] = "LLM_API_BASE not set"
+                return
+            try:
+                import httpx
+
+                headers = {"Authorization": f"Bearer {cfg.api_key}"} if cfg.api_key else {}
+                r = httpx.get(f"{cfg.api_base.rstrip('/')}/models", headers=headers,
+                              timeout=8, verify=cfg.verify_ssl)
+                p["reachable"] = r.status_code == 200
+                if r.status_code == 200:
+                    ids = {m.get("id") for m in r.json().get("data", [])}
+                    p["model_listed"] = cfg.model in ids
+                else:
+                    p["error"] = f"HTTP {r.status_code}: {r.text.strip()[:160]}"
+            except Exception as e:  # network, TLS, JSON -- all mean "not reachable"
+                p["reachable"] = False
+                p["error"] = f"{type(e).__name__}: {e}"[:200]
+
+        def _triton() -> None:
+            st = triton.status(cfg)
+            if load and st["configured"] and not st["model_ready"]:
+                st["load"] = triton.ensure_loaded(cfg)
+                after = triton.status(cfg)
+                st.update({k: after[k] for k in ("server_ready", "model_ready", "error")})
+            report["triton"] = st
+
+        def _probe() -> None:
+            t0 = time.monotonic()
+            primary_only = replace(cfg, fallback_model="")
+            try:
+                reply = llm_mod.chat_completion(
+                    [{"role": "user", "content": "Reply with the single word OK."}],
+                    primary_only, max_tokens=8,
+                )
+                report["probe"] = {"ok": True, "reply": reply[:80],
+                                   "seconds": round(time.monotonic() - t0, 1)}
+            except Exception as e:
+                report["probe"] = {"ok": False, "error": f"{type(e).__name__}: {e}"[:300],
+                                   "seconds": round(time.monotonic() - t0, 1)}
+
+        await asyncio.to_thread(_proxy)
+        await asyncio.to_thread(_triton)
+        if probe:
+            await asyncio.to_thread(_probe)
+
+        tri = report["triton"]
+        if report["probe"] is not None:
+            report["can_reach_model"] = report["probe"]["ok"]
+        elif tri and tri["configured"]:
+            report["can_reach_model"] = bool(report["proxy"]["model_listed"]) and bool(tri["model_ready"])
+        else:
+            report["can_reach_model"] = bool(report["proxy"]["model_listed"])
+        return report
 
     @server.tool()
     @traced("mcp.tool.harvest_events", tracer_name=_TRACER)
