@@ -230,6 +230,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-probe", action="store_true",
         help="Skip the browser-free calendar-feed probe and go straight to Playwright",
     )
+    web_add.add_argument(
+        "--force", action="store_true",
+        help="Add the source even if diagnostics find a terminal wall "
+             "(e.g. DataDome) or nothing to extract. The attempt is logged either way",
+    )
     _add_root_flags(web_add)
 
     web_test = web_sub.add_parser(

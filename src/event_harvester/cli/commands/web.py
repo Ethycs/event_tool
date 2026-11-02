@@ -73,40 +73,115 @@ def _web_list(args, cfg) -> int:
 
 
 def _web_test(args, cfg) -> int:
-    """Run diagnostics on a URL without saving.
-
-    Tries the browser-free feed probe first: if the site publishes iCalendar,
-    that is the answer and spinning up Playwright to confirm it would only
-    cost a few seconds to reach a worse recommendation.
-    """
-    if not getattr(args, "no_probe", False):
-        feed = _probe_and_report(args.url)
-        if feed:
-            print(f"\n  {GREEN}Recommended mode: ics{RESET} — use {BOLD}{feed.url}{RESET}\n")
-            print(f"  {DIM}Re-run with --no-probe to force browser diagnostics.{RESET}\n")
-            return 0
-
-    _run_url_diagnostics(args.url)
-    return 0
+    """Diagnose a URL without saving. Logs the attempt all the same."""
+    return _diagnose_and_log(args.url, add=False,
+                             no_probe=getattr(args, "no_probe", False))
 
 
 def _web_add(args, cfg) -> int:
-    """Run diagnostics and add the URL to data/web_sources.json.
+    """Diagnose a URL and add it to data/web_sources.json.
 
     A discovered feed replaces the URL being added — adding
     ``https://example.com`` when the events live at
     ``https://example.com/events/?ical=1`` should store the feed, not the
     homepage that merely links to it.
     """
-    if not args.mode and not getattr(args, "no_probe", False):
-        feed = _probe_and_report(args.url)
-        if feed:
-            _add_source_to_config(feed.url, "ics", source_page=args.url)
-            return 0
+    return _diagnose_and_log(args.url, add=True, force=getattr(args, "force", False),
+                             mode_override=args.mode,
+                             no_probe=getattr(args, "no_probe", False))
 
-    detected_mode = _run_url_diagnostics(args.url)
-    mode = args.mode or detected_mode
-    _add_source_to_config(args.url, mode)
+
+#: Walls a real browser cannot clear, so `native_chrome` is not the fix and the
+#: source should not be added. A Cloudflare challenge is deliberately NOT here:
+#: native_chrome clears it (that is how erobay works), so a CF site stays
+#: addable, with native_chrome set.
+_TERMINAL_BLOCK_PREFIXES = ("forbidden-", "rate-limited-", "server-error-", "fetch-failed")
+_TERMINAL_BLOCKS = frozenset({"datadome", "perimeterx", "px-captcha",
+                              "incapsula", "akamai", "imperva"})
+
+
+def _is_terminal_block(reason: str | None) -> bool:
+    if not reason:
+        return False
+    return reason in _TERMINAL_BLOCKS or reason.startswith(_TERMINAL_BLOCK_PREFIXES)
+
+
+def _diagnose_and_log(
+    url: str, *, add: bool, force: bool = False,
+    mode_override: str | None = None, no_probe: bool = False,
+) -> int:
+    """Auto-diagnose a candidate URL, record the attempt, then (for ``add``)
+    save it — unless a terminal wall or an empty result argues against it.
+
+    The flow the blueprint's steps 1–6 used to be done by hand: probe for an
+    edge wall (names DataDome vs a clearable Cloudflare challenge), then the
+    ICS feed probe, then the browser pass. Every run leaves a line in
+    ``data/.source_attempts.json`` before it exits, so "why is this source
+    empty" is answered once, not re-diagnosed each time. A terminal wall or a
+    `raw`/nothing-found result is logged and **not** added unless ``--force``.
+    """
+    from event_harvester.sources.onboard import probe_block, record_attempt
+
+    name = _suggest_name(url)
+    print(f"  {BOLD}Diagnosing{RESET} {url}")
+    rec: dict = {"url": url, "name": name, "action": "add" if add else "test"}
+
+    # 1. Edge-block probe — cheap, browser-free, and it names the wall.
+    block = probe_block(url)
+    rec["status"] = block["status"]
+    rec["server"] = block["server"]
+    reason = block["reason"]
+    mode = None
+    links = feed = None
+    feed_url = None
+
+    if block["blocked"]:
+        print(f"\n  {RED}BLOCKED{RESET} — {reason} "
+              f"(HTTP {block['status']}, server {block['server'] or '?'})")
+        if reason == "datadome":
+            print(f"  {DIM}DataDome blocks automation, native_chrome included — "
+                  f"the site's own API is the only way in.{RESET}")
+        elif reason == "cloudflare-challenge":
+            print(f"  {DIM}A Cloudflare challenge — clearable with native_chrome; "
+                  f"adding it that way.{RESET}")
+            mode = mode_override or "calendar"
+    else:
+        # 2. Not walled — the ICS feed probe, then the browser pass.
+        if not mode_override and not no_probe:
+            found = _probe_and_report(url)
+            if found:
+                mode, feed_url, links = "ics", found.url, found.future_events
+        if mode is None:
+            diag = _run_url_diagnostics(url)
+            mode = mode_override or diag["mode"]
+            links, feed = diag["event_links"], diag["feed_items"]
+        if mode == "raw" and not links and not feed:
+            reason = "empty"
+            print(f"\n  {YELLOW}Nothing structured found{RESET} — a `raw` page with "
+                  f"no event links or feed items.")
+
+    needs_native = reason == "cloudflare-challenge"
+    addable = reason in (None, "cloudflare-challenge") or force
+
+    saved = False
+    if add and addable:
+        if mode == "ics" and feed_url:
+            _add_source_to_config(feed_url, "ics", source_page=url)
+        else:
+            _add_source_to_config(url, mode or mode_override or ("calendar" if needs_native else "raw"),
+                                  native_chrome=needs_native)
+        saved = True
+    elif add:
+        print(f"\n  {YELLOW}Not added{RESET} — {reason}. Re-run with "
+              f"{BOLD}--force{RESET} to add it anyway.")
+
+    rec.update(blocked=block["blocked"], reason=reason, mode=mode,
+               event_links=links, feed_items=feed, saved=saved)
+    if feed_url:
+        rec["feed_url"] = feed_url
+    record_attempt(rec)
+    print(f"  {DIM}Logged → data/.source_attempts.json "
+          f"({'saved' if saved else 'not saved'}).{RESET}\n")
     return 0
 
 
@@ -479,13 +554,18 @@ def _diagnose_ics(url: str) -> str | None:
     return "ics"
 
 
-def _run_url_diagnostics(url: str) -> str | None:
-    """Open a URL and run all detection modes. Returns the recommended mode string."""
+def _run_url_diagnostics(url: str) -> dict:
+    """Open a URL and run all detection modes.
+
+    Returns ``{"mode", "event_links", "feed_items"}``. The counts let the add
+    flow tell a thin page (``raw``, nothing found) from a real source and log
+    the difference; ``mode`` is None when a Cloudflare challenge blocked it.
+    """
     import concurrent.futures
 
     # iCalendar feeds are not pages -- handle before touching a browser.
     if _is_ics_url(url):
-        return _diagnose_ics(url)
+        return {"mode": _diagnose_ics(url), "event_links": 0, "feed_items": 0}
 
     from event_harvester.sources.uc_browser import UCBrowser
     from event_harvester.sources.web_fetch import (
@@ -494,7 +574,7 @@ def _run_url_diagnostics(url: str) -> str | None:
         _wait_cloudflare,
     )
 
-    detected_mode = [None]  # mutable container for thread result
+    result = {"mode": None, "event_links": 0, "feed_items": 0}
 
     def _do_diagnostics():
         with UCBrowser() as uc:
@@ -559,7 +639,9 @@ def _run_url_diagnostics(url: str) -> str | None:
                 mode = "raw"
                 print("  mode: raw — no structured content detected")
 
-            detected_mode[0] = mode
+            result["mode"] = mode
+            result["event_links"] = len(event_links)
+            result["feed_items"] = len(feed_items)
 
             print(f"\n  {BOLD}Sample events:{RESET}")
             if event_links:
@@ -591,20 +673,35 @@ def _run_url_diagnostics(url: str) -> str | None:
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         pool.submit(_do_diagnostics).result()
 
-    return detected_mode[0]
+    return result
+
+
+def _suggest_name(url: str) -> str:
+    """House-style name for a URL: the venue, not the platform host."""
+    from urllib.parse import urlparse
+
+    netloc = urlparse(url if "://" in url else "https://" + url).netloc
+    name = netloc.split(".")[0]
+    if name in ("www", "business", "cdn", "calendar", "tockify"):
+        parts = netloc.split(".")
+        name = parts[-2] if len(parts) >= 2 else name
+    return name
 
 
 def _add_source_to_config(
-    url: str, detected_mode: str | None = None, *, source_page: str | None = None
+    url: str, detected_mode: str | None = None, *, source_page: str | None = None,
+    native_chrome: bool = False,
 ) -> None:
     """Add a web source to data/web_sources.json using the detected mode.
 
     ``source_page`` is the human-facing page a feed URL was discovered from.
     It is stored so the entry still says which venue it belongs to when the
     feed URL is an opaque CDN path (``cdn.dnalounge.com/calendar/...``).
-    """
-    from urllib.parse import urlparse
 
+    ``native_chrome`` marks a source whose wall only a real browser clears (a
+    Cloudflare challenge, like erobay); it also gets a cooldown, since the
+    native-Chrome path is serial and slow.
+    """
     from event_harvester.sources.web_fetch import _WEB_SOURCES_FILE, _load_web_sources
     from event_harvester.utils import save_json
 
@@ -614,17 +711,11 @@ def _add_source_to_config(
         print(f"\n  {BOLD}Already configured{RESET} — {url} is already in web_sources.json")
         return
 
-    # Name from the page the user actually typed, not the feed host: a feed on
-    # tockify.com or calendar.google.com would otherwise name every venue
-    # after the platform.
-    name_source = source_page or url
-    name = urlparse(name_source).netloc.split(".")[0]
-    if name in ("www", "business", "cdn", "calendar", "tockify"):
-        parts = urlparse(name_source).netloc.split(".")
-        name = parts[-2] if len(parts) >= 2 else name
+    # Name from the page the user actually typed, not the feed host.
+    name = _suggest_name(source_page or url)
 
     mode = detected_mode or "calendar"
-    source = {"url": url, "name": name, "mode": mode}
+    source: dict = {"url": url, "name": name, "mode": mode}
     if source_page and source_page != url:
         source["source_page"] = source_page
     if mode == "feed":
@@ -633,7 +724,11 @@ def _add_source_to_config(
     elif mode == "search":
         source["query"] = "events"
         source["scroll_seconds"] = 10
+    if native_chrome:
+        source["native_chrome"] = True
+        source["cooldown_hours"] = 6
 
     sources.append(source)
     save_json(_WEB_SOURCES_FILE, sources)
-    print(f"\n  {GREEN}{BOLD}Added{RESET} {name} (mode={mode}) -> {_WEB_SOURCES_FILE}")
+    extra = " native_chrome" if native_chrome else ""
+    print(f"\n  {GREEN}{BOLD}Added{RESET} {name} (mode={mode}{extra}) -> {_WEB_SOURCES_FILE}")

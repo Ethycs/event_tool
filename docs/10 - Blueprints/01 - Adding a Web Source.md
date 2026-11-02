@@ -22,6 +22,32 @@ Neither would have thrown an error.
 
 ---
 
+## What `web add` / `web test` now do for you (2026-11-01)
+
+The seven manual steps below are still the model, but the command runs the first
+pass itself and **leaves a record**:
+
+1. **Edge-wall probe first** (`onboard.probe_block`, browser-free). It names the
+   wall rather than failing silently: `datadome` (terminal — a real browser,
+   `native_chrome` included, does not clear it; the site's API is the only way
+   in), `cloudflare-challenge` (clearable — added *with* `native_chrome`, the
+   erobay path), or `forbidden-403`/`rate-limited-429`/`server-error-5xx`.
+2. **Then** the ICS feed probe and the browser diagnostic, as before.
+3. **It logs the attempt** to `data/.source_attempts.json` before it exits —
+   mode, link/feed counts, block reason, whether it saved — so "why is this
+   source empty" is answered once, not re-diagnosed by hand. The `/sources` page
+   reads the same log.
+4. **`web add` refuses to save a terminal-walled or empty (`raw`, nothing found)
+   source**, so a dead source never lands in config silently. `--force` overrides
+   and still logs. A Cloudflare site is *not* refused — it is saved with
+   `native_chrome`.
+
+So for a hostile site the loop is now one command: `web test <url>` names the
+wall and logs it. tixr, for instance, logs `datadome` and stops — the finding is
+durable instead of a terminal scrollback you lose.
+
+---
+
 ## 1 — Is it already there?
 
 ```powershell

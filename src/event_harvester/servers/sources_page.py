@@ -31,36 +31,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
 from typing import Any
-
-from event_harvester.utils import data_path, load_json, save_json
 
 logger = logging.getLogger("event_harvester.servers.sources_page")
 
-ATTEMPTS_FILE = data_path(".source_attempts.json")
-
-#: Keep the log bounded. This is a working record, not an audit trail, and an
-#: unbounded JSON file read on every page load is a slow leak.
-MAX_ATTEMPTS = 200
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def load_attempts() -> list[dict]:
-    data = load_json(ATTEMPTS_FILE, default={"attempts": []}) or {}
-    items = data.get("attempts") if isinstance(data, dict) else data
-    return list(items or [])
-
-
-def record_attempt(entry: dict) -> list[dict]:
-    """Append an attempt, newest first, and return the trimmed log."""
-    attempts = [entry] + load_attempts()
-    attempts = attempts[:MAX_ATTEMPTS]
-    save_json(ATTEMPTS_FILE, {"attempts": attempts})
-    return attempts
+# The attempt log moved to `sources.onboard` — it is written by the CLI add
+# flow as well as this page now, and belongs with the diagnosis that produces
+# it. Re-exported here so the page and its callers keep their import.
+from event_harvester.sources.onboard import (  # noqa: E402
+    ATTEMPTS_FILE,
+    MAX_ATTEMPTS,
+    _now,
+    load_attempts,
+    record_attempt,
+)
 
 
 def configured_sources() -> list[dict]:

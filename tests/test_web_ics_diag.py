@@ -67,7 +67,7 @@ def test_diagnostics_short_circuits_without_a_browser(monkeypatch):
     )
 
     url = "webcal://cdn.dnalounge.com/calendar/dnalounge.ics"
-    assert _run_url_diagnostics(url) == "ics"
+    assert _run_url_diagnostics(url)["mode"] == "ics"
     assert calls["src"]["url"] == url
 
 

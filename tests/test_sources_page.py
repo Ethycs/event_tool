@@ -18,14 +18,16 @@ import pytest
 from starlette.applications import Starlette
 from starlette.testclient import TestClient
 
+import event_harvester.sources.onboard as onboard
 from event_harvester.servers import sources_page
 from event_harvester.sources.onboard import SOURCE_KINDS, classify_kind
 
 
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
-    """No test may touch the real attempt log."""
-    monkeypatch.setattr(sources_page, "ATTEMPTS_FILE", tmp_path / "attempts.json")
+    """No test may touch the real attempt log. The log lives in `onboard` now
+    (the CLI add flow writes it too); patch it there, where the write happens."""
+    monkeypatch.setattr(onboard, "ATTEMPTS_FILE", tmp_path / "attempts.json")
 
 
 @pytest.fixture
@@ -129,7 +131,7 @@ class TestAttempts:
 
     def test_the_log_is_bounded(self, monkeypatch):
         """An unbounded JSON file read on every page load is a slow leak."""
-        monkeypatch.setattr(sources_page, "MAX_ATTEMPTS", 3)
+        monkeypatch.setattr(onboard, "MAX_ATTEMPTS", 3)
         for i in range(6):
             sources_page.record_attempt({"at": f"t{i}", "url": str(i)})
         assert len(sources_page.load_attempts()) == 3
@@ -159,7 +161,10 @@ class TestItProposesButNeverConfigures:
     def test_the_only_write_target_is_the_attempt_log(self):
         import inspect
         src = inspect.getsource(sources_page)
-        assert src.count("save_json(") == 1
+        # The write itself moved to `onboard.record_attempt`; the page no longer
+        # calls save_json directly. Its single persistence path is that helper.
+        assert "save_json(" not in src
+        assert "record_attempt(" in src
 
     def test_the_page_says_so_to_the_reader(self):
         assert "does not configure anything" in sources_page.render_page()

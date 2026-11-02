@@ -11,6 +11,7 @@ calls, because a test that depends on a venue's live homepage tests the venue.
 
 from __future__ import annotations
 
+import event_harvester.sources.onboard as onboard
 from event_harvester.sources.onboard import (
     RAW_DENSE_DATES,
     OnboardReport,
@@ -23,6 +24,75 @@ from event_harvester.sources.onboard import (
 )
 
 BASE = "https://venue.test"
+
+
+class _Resp:
+    def __init__(self, status=200, headers=None, text=""):
+        self.status_code = status
+        self.headers = headers or {}
+        self.text = text
+
+
+class TestProbeBlock:
+    """Naming the wall is the point — DataDome (terminal) vs a clearable
+    Cloudflare challenge vs a plain page."""
+
+    def test_datadome_is_named_from_the_header(self, monkeypatch):
+        import requests
+        monkeypatch.setattr(requests, "get", lambda *a, **k: _Resp(
+            403, {"X-DataDome": "protected", "Server": "nginx"}, "Please enable JS"))
+        out = onboard.probe_block("https://tixr.test/")
+        assert out["blocked"] and out["reason"] == "datadome" and out["status"] == 403
+
+    def test_datadome_is_named_from_the_cookie(self, monkeypatch):
+        import requests
+        monkeypatch.setattr(requests, "get", lambda *a, **k: _Resp(
+            200, {"Set-Cookie": "datadome=abc; Domain=.x.test"}, "<html></html>"))
+        assert onboard.probe_block("https://x.test/")["reason"] == "datadome"
+
+    def test_cloudflare_challenge_from_body(self, monkeypatch):
+        import requests
+        monkeypatch.setattr(requests, "get", lambda *a, **k: _Resp(
+            403, {"Server": "cloudflare"}, "Just a moment..."))
+        assert onboard.probe_block("https://x.test/")["reason"] == "cloudflare-challenge"
+
+    def test_a_plain_403_is_forbidden(self, monkeypatch):
+        import requests
+        monkeypatch.setattr(requests, "get", lambda *a, **k: _Resp(
+            403, {"Server": "nginx"}, "no"))
+        assert onboard.probe_block("https://x.test/")["reason"] == "forbidden-403"
+
+    def test_a_200_page_is_not_blocked(self, monkeypatch):
+        import requests
+        monkeypatch.setattr(requests, "get", lambda *a, **k: _Resp(
+            200, {"Server": "nginx"}, "<html>events</html>"))
+        out = onboard.probe_block("https://x.test/")
+        assert out["blocked"] is False and out["reason"] is None
+
+    def test_a_fetch_error_is_a_block(self, monkeypatch):
+        import requests
+        def boom(*a, **k):
+            raise requests.ConnectionError("no route")
+        monkeypatch.setattr(requests, "get", boom)
+        out = onboard.probe_block("https://x.test/")
+        assert out["blocked"] and out["reason"].startswith("fetch-failed")
+
+
+class TestAttemptLog:
+    def test_record_and_load_newest_first_and_stamped(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(onboard, "ATTEMPTS_FILE", tmp_path / ".source_attempts.json")
+        onboard.record_attempt({"url": "https://a.test", "name": "a", "saved": True})
+        onboard.record_attempt({"url": "https://b.test", "name": "b", "saved": False})
+        items = onboard.load_attempts()
+        assert [i["name"] for i in items] == ["b", "a"]     # newest first
+        assert all(i.get("when") for i in items)            # stamped on the way in
+
+    def test_the_log_is_bounded(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(onboard, "ATTEMPTS_FILE", tmp_path / ".source_attempts.json")
+        monkeypatch.setattr(onboard, "MAX_ATTEMPTS", 3)
+        for i in range(5):
+            onboard.record_attempt({"name": str(i)})
+        assert [i["name"] for i in onboard.load_attempts()] == ["4", "3", "2"]
 
 
 def _page(*, links: str = "", text: str = "", head: str = "") -> str:

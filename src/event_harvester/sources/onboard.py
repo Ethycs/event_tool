@@ -47,6 +47,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
 
 from event_harvester.observability.tracing import get_tracer
@@ -55,6 +56,7 @@ from event_harvester.sources.web_utils import (
     _DECIMATE_TIME_RE,
     _extract_text,
 )
+from event_harvester.utils import data_path, load_json, save_json
 
 logger = logging.getLogger("event_harvester.sources.onboard")
 tracer = get_tracer("event_harvester.sources.onboard")
@@ -878,3 +880,101 @@ def explore(
             span.set_attribute("onboard.candidates", len(report.candidates))
 
         return report
+
+
+# ── edge-block probe ────────────────────────────────────────────────────────
+#
+# `fetch`/`explore` reach the page over `requests`, which is fine until the site
+# runs a bot wall. The wall answers before any content and discards the body, so
+# the browser-free path just sees "could not fetch, 403" and a scrape falls back
+# to `raw`/empty with no reason recorded. Naming the wall is the difference
+# between "tixr returns nothing" and "tixr is DataDome, which blocks automation
+# including native_chrome — the API is the only way in" (measured 2026-11-01).
+
+#: Walls we can name from the response alone. DataDome is called out because a
+#: real headful Chrome does not clear it — recording "datadome" tells the
+#: operator native_chrome is not the fix, unlike a Cloudflare challenge.
+_BLOCK_MARKERS = ("datadome", "captcha-delivery.com", "perimeterx", "px-captcha",
+                  "incapsula", "akamai", "imperva")
+
+
+def probe_block(url: str, timeout_s: int = 12) -> dict:
+    """Browser-free: GET a URL and classify an edge block, without a page.
+
+    Returns ``{status, blocked, reason, server}``. ``reason`` is ``None`` when
+    the page loaded; otherwise a short tag — ``datadome``, ``cloudflare-
+    challenge``, ``perimeterx``, ``forbidden-403``, ``rate-limited-429``,
+    ``server-error-5xx`` or ``fetch-failed: <err>``. It inspects headers, the
+    ``Set-Cookie``, and the first few KB of body, because a wall announces
+    itself in all three and not always in the status.
+    """
+    import requests
+
+    try:
+        r = requests.get(
+            url if "://" in url else "https://" + url,
+            timeout=timeout_s, allow_redirects=True,
+            headers={"User-Agent": USER_AGENT, "Accept": "text/html,*/*"},
+        )
+    except Exception as e:  # noqa: BLE001 - any failure is a block for our purposes
+        return {"status": None, "blocked": True,
+                "reason": f"fetch-failed: {type(e).__name__}", "server": ""}
+
+    hdrs = {k.lower(): str(v) for k, v in r.headers.items()}
+    blob = " ".join([
+        " ".join(f"{k}:{v}" for k, v in hdrs.items()),
+        (r.text or "")[:4000],
+    ]).lower()
+    server = hdrs.get("server", "")
+    status = r.status_code
+
+    if "x-datadome" in hdrs or "datadome=" in hdrs.get("set-cookie", "").lower() \
+            or "datadome" in blob or "captcha-delivery.com" in blob:
+        return {"status": status, "blocked": True, "reason": "datadome", "server": server}
+    if "just a moment" in blob or "cf-chl" in blob or "cf-mitigated" in hdrs:
+        return {"status": status, "blocked": True,
+                "reason": "cloudflare-challenge", "server": server}
+    for marker in _BLOCK_MARKERS:
+        if marker in blob:
+            return {"status": status, "blocked": True, "reason": marker, "server": server}
+    if status in (401, 403):
+        return {"status": status, "blocked": True,
+                "reason": f"forbidden-{status}", "server": server}
+    if status == 429:
+        return {"status": status, "blocked": True, "reason": "rate-limited-429", "server": server}
+    if status >= 500:
+        return {"status": status, "blocked": True,
+                "reason": f"server-error-{status}", "server": server}
+    return {"status": status, "blocked": False, "reason": None, "server": server}
+
+
+# ── attempt log ──────────────────────────────────────────────────────────────
+#
+# Adding a source is a sequence of judgements; the log keeps them so a dead
+# source (tixr/DataDome) is explained once rather than re-diagnosed by hand
+# every time someone wonders why it is empty. Lives here, with the diagnosis
+# that writes it; `servers/sources_page.py` re-exports these for the web view.
+
+ATTEMPTS_FILE = data_path(".source_attempts.json")
+#: Bounded: a working record, not an audit trail, and it is read on every
+#: `/sources` page load.
+MAX_ATTEMPTS = 200
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def load_attempts() -> list[dict]:
+    data = load_json(ATTEMPTS_FILE, default={"attempts": []}) or {}
+    items = data.get("attempts") if isinstance(data, dict) else data
+    return list(items or [])
+
+
+def record_attempt(entry: dict) -> list[dict]:
+    """Append an attempt, newest first, and return the trimmed log."""
+    entry.setdefault("when", _now())
+    attempts = [entry] + load_attempts()
+    attempts = attempts[:MAX_ATTEMPTS]
+    save_json(ATTEMPTS_FILE, {"attempts": attempts})
+    return attempts

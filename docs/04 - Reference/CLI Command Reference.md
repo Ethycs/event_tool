@@ -82,8 +82,8 @@ Entry point: `commands/web.py:web_cmd`. Manages `data/web_sources.json`.
 | Subcommand | Purpose | Positional / flags |
 |---|---|---|
 | `web list` | List configured web sources | none |
-| `web add URL` | Probe for a feed, else diagnose `URL`, then append to `data/web_sources.json` | `url` (required); `--mode`, `--no-probe` |
-| `web test URL` | Same diagnosis without saving | `url` (required); `--no-probe` |
+| `web add URL` | Auto-diagnose `URL` (edge-wall probe → feed probe → browser), **log the attempt** to `data/.source_attempts.json`, then append to `data/web_sources.json` — **unless** diagnosis found a terminal wall (DataDome/403) or nothing to extract, which it logs and refuses without `--force`. A Cloudflare site is saved with `native_chrome`. | `url` (required); `--mode`, `--no-probe`, `--force` |
+| `web test URL` | Same diagnosis, logged the same way, without saving | `url` (required); `--no-probe` |
 | `web probe [URL…]` | **Added 2026-07-30.** Find iCalendar feeds without a browser. With no arguments, probes every configured source not already in `ics` mode | `urls` (optional, repeatable); `--apply`, `--timeout` |
 | `web replay NAME` | **Added 2026-07-30.** Replay a configured source's recorded route, printing every step with its result and timing. Exits `1` if the route fails. The debugging surface for `mode: steps` — a harvest says "0 messages", this says which step stopped producing | `name` (required); `--diagnose` |
 | `web login` | Open a browser to log into web sites and save session state | none |
@@ -92,11 +92,14 @@ Entry point: `commands/web.py:web_cmd`. Manages `data/web_sources.json`.
 |---|---|---|---|
 | `--mode` (`add`) | `calendar`, `feed`, `search`, `raw`, `ics` | `None` (auto-detected) | Overrides the detected fetch mode. Passing it also **skips the feed probe** — an explicit mode is taken as the answer. |
 | `--no-probe` (`add`, `test`) | flag | `False` | Skip the browser-free feed probe and go straight to Playwright. |
+| `--force` (`add`) | flag | `False` | Add the source even when diagnosis found a terminal wall (e.g. DataDome) or nothing to extract. The attempt is logged either way. |
 | `--apply` (`probe`) | flag | `False` | Rewrite configured sources that have a feed to `ics` mode. Only valid with no URL arguments — there is nothing to rewrite for an unconfigured URL. |
 | `--timeout` (`probe`) | int (seconds) | `10` | Per-request timeout. |
 | `-v`, `--verbose` / `-q`, `--quiet` | flag | `False` | |
 
 **Probe-first ordering.** `web add`/`web test` now run `feed_probe.probe_feeds` before launching a browser. If the site publishes iCalendar, that is the answer, and starting Playwright to reach a worse recommendation is wasted time. On a hit, `web add` stores the **feed** URL rather than the page it was found on, plus a `source_page` field recording where it came from — otherwise a venue whose feed lives on a CDN or on `tockify.com` would be named after the platform.
+
+**Edge-wall probe + attempt log (2026-11-01).** Before any of that, both commands run `onboard.probe_block` — a browser-free GET that names a bot wall from the response alone: `datadome` (terminal; even `native_chrome` cannot clear it, so the source is refused and the site's API is the only route), `cloudflare-challenge` (clearable — the source is saved with `native_chrome`, the erobay path), or `forbidden-403`/`rate-limited-429`/`server-error-5xx`. Every run then records one line to `data/.source_attempts.json` (`onboard.record_attempt`, newest-first, capped at 200) — URL, mode, link/feed counts, block reason, saved-or-not — so a dead source is explained once rather than re-diagnosed by hand. The `/sources` page reads the same log.
 
 `.ics`/`webcal://` URLs skip discovery entirely and are validated directly.
 
