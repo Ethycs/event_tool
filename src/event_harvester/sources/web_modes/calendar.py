@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import date, datetime, timezone
+from html import unescape
 
 from event_harvester.observability.tracing import get_tracer
 from event_harvester.sources import web_checkpoint
@@ -33,11 +34,46 @@ logger = logging.getLogger("event_harvester.web_fetch")
 
 _CALCIUM_VENUE_RE = re.compile(r'<table[^>]*class="c_([^"]*)"')
 _CALCIUM_TIME_RE = re.compile(r'class="TimeLabel">([^<]+)<')
-_CALCIUM_NOSCRIPT_RE = re.compile(r'<noscript><a href="([^"]+)">([^<]+)</a>')
+# An anchor's title may carry inline markup -- `Tangle! <br>Mission Control
+# Weekday<br>Peer Rope Jam`, `<strong>AURA</strong><br/>...` -- so it is any run
+# of text and tags short of a nested anchor. As `[^<]+` those rows had no title
+# and were dropped: 4 of erobay's upcoming rows on 2026-11-02.
+_CALCIUM_TITLE = r'((?:[^<]|<(?!/?a\b)[^>]*>)+)'
+_CALCIUM_NOSCRIPT_RE = re.compile(r'<noscript><a href="([^"]+)">' + _CALCIUM_TITLE + '</a>')
 # Events that link straight to an external ticket site (e.g. buytickets.at)
 # have no <noscript> fallback -- only the visible anchor. Matches that anchor.
-_CALCIUM_EXTLINK_RE = re.compile(r'<a href="(https?://[^"]+)"[^>]*>([^<]+)</a>')
+_CALCIUM_EXTLINK_RE = re.compile(r'<a href="(https?://[^"]+)"[^>]*>' + _CALCIUM_TITLE + '</a>')
 _CALCIUM_DATE_RE = re.compile(r'Date=(\d{4})%2F(\d{1,2})%2F(\d{1,2})')
+
+
+def _anchor_text(raw: str) -> str:
+    """An anchor's visible text: tags become spaces (a `<br>` separates words),
+    entities are decoded, whitespace collapses."""
+    return " ".join(unescape(re.sub(r"<[^>]+>", " ", raw)).split())
+
+
+def _first_link(regex: re.Pattern, block: str) -> tuple[str, str] | None:
+    """``(url, title)`` of the first anchor `regex` finds whose title has text."""
+    for m in regex.finditer(block):
+        title = _anchor_text(m.group(2))
+        if title:
+            return unescape(m.group(1)), title
+    return None
+
+
+def _calcium_row_key(url: str, day: str) -> str:
+    """One occurrence: its Calcium event ID on one day, or for an external
+    ticket link (which has no ID) the URL on one day.
+
+    Neither half is enough alone. The same ID and day arrive from both month
+    grids under different URLs, because the query carries the grid it came
+    from (`DoneURL=`). And one ticket URL can serve every date of a series —
+    Vox Body sells each monthly rope jam from one buytickets.at page — so a
+    URL-only key kept the first date and dropped the rest: 8 of erobay's
+    upcoming rows on 2026-11-02.
+    """
+    id_m = re.search(r"ID=(\d+)", url)
+    return f"{id_m.group(1) if id_m else url}:{day}"
 
 
 def _hint_header(lnk: dict) -> str:
@@ -81,8 +117,6 @@ def _parse_calcium_links(html: str) -> list[dict]:
     Extracts from <noscript> fallback links (server-generated URLs).
     Pulls time from .TimeLabel and venue from the parent table class.
     """
-    from html import unescape
-
     seen_ids: set[str] = set()
     links: list[dict] = []
 
@@ -119,26 +153,18 @@ def _parse_calcium_links(html: str) -> list[dict]:
         # Link + title. Internal events expose a <noscript> fallback (server-
         # generated Calcium URL); external-ticket events expose only the visible
         # anchor. Prefer noscript; fall back to the external link.
-        ns_m = _CALCIUM_NOSCRIPT_RE.search(block)
-        if ns_m:
-            event_url = unescape(ns_m.group(1))
-            title = unescape(ns_m.group(2)).strip()
-        else:
-            ext_m = _CALCIUM_EXTLINK_RE.search(block)
-            if not ext_m:
-                continue
-            event_url = unescape(ext_m.group(1))
-            title = unescape(ext_m.group(2)).strip()
+        found = (_first_link(_CALCIUM_NOSCRIPT_RE, block)
+                 or _first_link(_CALCIUM_EXTLINK_RE, block))
+        if not found:
+            continue
+        event_url, title = found
 
         date_str = current_date
         if not date_str:
             continue
 
-        # Extract event ID for dedup (appears twice per event in HTML). External
-        # links have no ID= — key them by URL so distinct tickets don't collide.
-        id_m = re.search(r"ID=(\d+)", event_url)
-        event_id = id_m.group(1) if id_m else event_url
-        dedup_key = f"{event_id}:{date_str}"
+        # The same occurrence can appear twice in one grid.
+        dedup_key = _calcium_row_key(event_url, date_str)
         if dedup_key in seen_ids:
             continue
         seen_ids.add(dedup_key)
@@ -155,8 +181,19 @@ def _parse_calcium_links(html: str) -> list[dict]:
     return links
 
 
-def _next_month_url(url: str, today: date | None = None) -> str:
-    """The same Calcium grid, one month on.
+#: How many months of a Calcium grid to walk, counting the current one. The
+#: default view is one month and mostly the past; one next-month grid (the old
+#: behavior) still dropped everything from the third month on. Measured on
+#: erobay 2026-11-05: current + next = 198 upcoming, but 314+ unique events span
+#: the next six months (and more beyond) — over a third missed, worse later in
+#: the month as the current grid collapses. The forward months share the first
+#: month's Cloudflare clearance, so walking several is cheap. Per-source
+#: override: ``calendar_months``.
+DEFAULT_CALENDAR_MONTHS = 6
+
+
+def _month_url(url: str, offset: int, today: date | None = None) -> str:
+    """The same Calcium grid, ``offset`` months on (0 = the given month's URL).
 
     Calcium takes the month from `Date=YYYY/M/D`, the same param its own event
     links carry. Absent it, the CGI serves **the current month**, and a month
@@ -164,39 +201,56 @@ def _next_month_url(url: str, today: date | None = None) -> str:
     spanning `2026-07-26 -> 2026-09-05` of which **8 days were still ahead**.
     The same URL with `Date=2026/9/1` returned `2026-08-30 -> 2026-10-03` — 35
     forward days. So the default view collapses as a month ends, and on the
-    28th of any month a week of coverage is all that is left.
+    28th of any month a week of coverage is all that is left — which is why the
+    fetch walks several months forward rather than trusting one grid.
     """
     today = today or date.today()
-    y, m = (today.year + 1, 1) if today.month == 12 else (today.year, today.month + 1)
+    base = today.month - 1 + offset
+    y, m = today.year + base // 12, base % 12 + 1
     sep = "&" if "?" in url else "?"
     return f"{url}{sep}Date={y}%2F{m}%2F1"
 
 
-def _calcium_next_month(uc, src: dict, url: str, name: str, tracer, capture) -> list[dict]:
-    """Links from next month's grid. Never raises — a second page is a bonus."""
-    try:
-        nm_url = _next_month_url(url)
-        # Replay from an MHTML checkpoint when one exists (EH_WEB_CHECKPOINT),
-        # else fetch live and snapshot it. Keyed by the next-month URL, so this
-        # grid is checkpointed independently of the current-month one.
-        replayed = web_checkpoint.replay(uc, nm_url, source_name=name,
-                                         tracer=tracer, capture=capture)
-        if replayed is not None:
-            page, html = replayed
-        else:
-            page = uc.open(nm_url, source_name=name, tracer=tracer, capture=capture)
-            html = _wait_cloudflare(page, headless=False)
-            web_checkpoint.record(page, nm_url)
-        page.close()
-        if "just a moment" in html.lower():
-            logger.warning("%s: next-month grid blocked, using this month only", name)
-            return []
-        links = _parse_calcium_links(html)
-        logger.info("%s: +%d link(s) from next month's grid.", name, len(links))
-        return links
-    except Exception as e:  # noqa: BLE001 -- the current month still stands
-        logger.warning("%s: next-month grid failed (%s)", name, e)
-        return []
+def _next_month_url(url: str, today: date | None = None) -> str:
+    """The grid one month on. Thin wrapper over :func:`_month_url`."""
+    return _month_url(url, 1, today)
+
+
+def _calcium_forward_months(uc, src: dict, url: str, name: str, tracer, capture) -> list[dict]:
+    """Links from the next several months' grids. Never raises — each extra
+    month is a bonus, and the current month already stands on its own.
+
+    Walks ``calendar_months - 1`` months forward (default
+    :data:`DEFAULT_CALENDAR_MONTHS`). Each grid is checkpointed under its own
+    month URL. A Cloudflare block stops the walk (the session is challenged, so
+    later months would block too); any other per-month error is skipped.
+    """
+    months = max(1, int(src.get("calendar_months", DEFAULT_CALENDAR_MONTHS)))
+    links: list[dict] = []
+    for offset in range(1, months):
+        try:
+            m_url = _month_url(url, offset)
+            # Replay from an MHTML checkpoint when one exists (EH_WEB_CHECKPOINT),
+            # else fetch live and snapshot it. Keyed per month URL.
+            replayed = web_checkpoint.replay(uc, m_url, source_name=name,
+                                             tracer=tracer, capture=capture)
+            if replayed is not None:
+                page, html = replayed
+            else:
+                page = uc.open(m_url, source_name=name, tracer=tracer, capture=capture)
+                html = _wait_cloudflare(page, headless=False)
+                web_checkpoint.record(page, m_url)
+            page.close()
+            if "just a moment" in html.lower():
+                logger.warning("%s: month +%d grid blocked, stopping the walk", name, offset)
+                break
+            m_links = _parse_calcium_links(html)
+            logger.info("%s: +%d link(s) from month +%d.", name, len(m_links), offset)
+            links += m_links
+        except Exception as e:  # noqa: BLE001 -- the months already in hand still stand
+            logger.warning("%s: month +%d grid failed (%s)", name, offset, e)
+            continue
+    return links
 
 
 def _calcium_messages(uc, src: dict, event_links: list[dict], domain: str,
@@ -230,12 +284,13 @@ def _calcium_messages(uc, src: dict, event_links: list[dict], domain: str,
         return []
 
     # Dedupe across the two grids: they overlap by design (a month view spills
-    # into its neighbours), so the same event arrives twice.
+    # into its neighbours), so the same occurrence arrives twice. Keyed by
+    # occurrence, not URL -- see `_calcium_row_key`.
     seen: set[str] = set()
     merged = []
     for lnk in event_links:
-        key = lnk.get("url", "")
-        if key and key not in seen:
+        key = _calcium_row_key(lnk.get("url", ""), lnk.get("date_hint") or "")
+        if lnk.get("url") and key not in seen:
             seen.add(key)
             merged.append(lnk)
 
@@ -271,7 +326,8 @@ def _calcium_messages(uc, src: dict, event_links: list[dict], domain: str,
         content = (head + "\n" if head else "") + _hint_header(lnk) + body
         messages.append({
             "platform": "web",
-            "id": f"web:{hash(lnk['url'])}",
+            # Per occurrence: a series URL is shared by several rows.
+            "id": f"web:{hash((lnk['url'], lnk['date_hint']))}",
             # The event's own date, not the scrape's clock. Relative phrases
             # downstream ("tonight") then resolve against the day the event is
             # on, and the message sorts where it belongs.
@@ -341,7 +397,7 @@ def _do_calendar_inner(uc, src: dict, timeout_ms: int, max_events: int, page=Non
     if "function PopupWindow" in html:
         event_links = _parse_calcium_links(html)
         page.close()
-        event_links += _calcium_next_month(uc, src, url, name, tracer, capture)
+        event_links += _calcium_forward_months(uc, src, url, name, tracer, capture)
         return _calcium_messages(uc, src, event_links, domain, timeout_ms)
 
     # UC obstacle clearing

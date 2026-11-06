@@ -75,7 +75,8 @@ $env:EH_WEB_CHECKPOINT = ""     # back to live
 
 - Snapshots live in `data/.web_checkpoints/<stem>.html` (the raw DOM the parsers
   read) plus a `.mhtml` archive. **Keyed by URL**, so a source that opens several
-  pages (the Calcium month grid *and* its next-month grid) snapshots each. Delete
+  pages (the Calcium month grids — current plus `calendar_months - 1` forward)
+  snapshots each. Delete
   the file to force a re-record; re-record whenever the site's content should
   have changed.
 - `replay` **falls through to a live fetch** for any URL with no snapshot, so a

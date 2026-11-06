@@ -171,6 +171,24 @@ def test_filter_known_links_drops_exact_url_match(monkeypatch):
     assert result[0]["url"] == "https://x/2"
 
 
+def test_filter_known_links_a_decision_on_one_date_of_a_series_keeps_the_rest(monkeypatch):
+    """One ticket URL can serve every date of a series (Vox Body's monthly
+    jams), so the URL alone must not hide the other dates."""
+    url = "https://buytickets.at/voxbodystudio/2347339"
+    monkeypatch.setattr(
+        "event_harvester.pipeline.event_match.load_fingerprints",
+        lambda: [{
+            "link": url, "title": "Self-Tie Rope Jam",
+            "date": "2026-11-18", "status": "declined",
+        }],
+    )
+    links = [
+        {"url": url, "text": "Self-Tie Rope Jam", "date_hint": "2026-11-18"},
+        {"url": url, "text": "Self-Tie Rope Jam", "date_hint": "2026-12-16"},
+    ]
+    assert [lnk["date_hint"] for lnk in _filter_known_links(links)] == ["2026-12-16"]
+
+
 def test_filter_known_links_ignores_auto_fingerprints(monkeypatch):
     """A prior *sighting* must NOT hide an event the user never decided on.
 
@@ -288,6 +306,39 @@ def test_parse_calcium_links_external_ticket_event_inherits_the_day():
     assert ext["date_hint"] == "2026-09-01"        # carried from the day cell
     assert ext["time"] == "7:00pm - 10:00pm"
     assert ext["venue"] == "Vox Body"
+
+
+# Regression for erobay, 2026-11-02: a title carrying inline markup read as no
+# title (`[^<]+` stops at the first tag), so the row was dropped -- 4 upcoming
+# rows, among them "Tangle! Mission Control" and "AURA".
+def test_parse_calcium_links_reads_a_title_with_markup():
+    html = """
+<table class="c_Tangle">
+  <noscript><a href="/x?Op=PopupWindow&amp;Date=2026%2F11%2F9&amp;ID=14346">Tangle! <br>Mission
+Control Weekday<br>Peer Rope Jam</a></noscript>
+</table>
+"""
+    links = _parse_calcium_links(html)
+    assert [lnk["text"] for lnk in links] == ["Tangle! Mission Control Weekday Peer Rope Jam"]
+    assert "ID=14346" in links[0]["url"]
+
+
+def test_parse_calcium_links_reads_a_ticket_link_nested_in_the_noscript():
+    # The noscript wraps the external ticket anchor; like its plain-titled
+    # siblings, the row takes the ticket URL.
+    html = """
+<table class="c_FeederCalendar">
+  <noscript><a href="/x?Op=PopupWindow&amp;Date=2026%2F12%2F11&amp;ID=3080">
+    <a href="https://forbiddentickets.com/events/afterdark/9bce6fadde"
+       onclick="window.open(this.href); return false;"><strong>AURA</strong><br/>
+The Bay Area&#39;s Premier Event</a></a></noscript>
+</table>
+"""
+    links = _parse_calcium_links(html)
+    assert len(links) == 1
+    assert links[0]["url"] == "https://forbiddentickets.com/events/afterdark/9bce6fadde"
+    assert links[0]["text"] == "AURA The Bay Area's Premier Event"
+    assert links[0]["date_hint"] == "2026-12-11"
 
 
 # ── _hint_header (what the listing knew, handed to the detail page) ──
@@ -725,6 +776,75 @@ class TestTheForwardWindow:
             "http://x/c.pl?Date=2026%2F9%2F1"
 
 
+class TestCalciumWalksSeveralMonths:
+    """One next-month grid still dropped everything from the third month on;
+    erobay lists events 6+ months out. The walk covers `calendar_months`."""
+
+    def test_month_url_offsets_including_the_current_month(self):
+        from datetime import date as _date
+
+        from event_harvester.sources.web_modes.calendar import _month_url
+        u = "http://x/c.pl"
+        assert _month_url(u, 0, _date(2026, 11, 5)).endswith("Date=2026%2F11%2F1")
+        assert _month_url(u, 1, _date(2026, 11, 5)).endswith("Date=2026%2F12%2F1")
+        assert _month_url(u, 2, _date(2026, 11, 5)).endswith("Date=2027%2F1%2F1")
+
+    def test_december_offsets_roll_the_year(self):
+        from datetime import date as _date
+
+        from event_harvester.sources.web_modes.calendar import _month_url
+        assert _month_url("http://x/c.pl", 3, _date(2026, 12, 1)).endswith(
+            "Date=2027%2F3%2F1")
+
+    def test_the_walk_visits_calendar_months_minus_one_grids(self, monkeypatch):
+        """Default is DEFAULT_CALENDAR_MONTHS; the walk fetches the months after
+        the current one, aggregating every grid's links."""
+        from event_harvester.sources.web_modes import calendar as cal
+
+        visited: list[str] = []
+
+        class _Page:
+            def close(self):
+                pass
+
+        class _UC:
+            def open(self, url, **kw):
+                visited.append(url)
+                return _Page()
+
+        monkeypatch.setattr(cal.web_checkpoint, "replay", lambda *a, **k: None)
+        monkeypatch.setattr(cal.web_checkpoint, "record", lambda *a, **k: None)
+        monkeypatch.setattr(cal, "_wait_cloudflare", lambda page, headless=False: "<cal>")
+        monkeypatch.setattr(cal, "_parse_calcium_links",
+                            lambda html: [{"url": "u", "date_hint": "2026-12-01"}])
+
+        src = {"calendar_months": 4}
+        links = cal._calcium_forward_months(_UC(), src, "http://x/c.pl", "erobay", None, None)
+        assert len(visited) == 3                 # offsets 1,2,3 (current already fetched)
+        assert len(links) == 3                   # one per visited grid
+
+    def test_a_cloudflare_block_stops_the_walk(self, monkeypatch):
+        from event_harvester.sources.web_modes import calendar as cal
+
+        class _Page:
+            def close(self):
+                pass
+
+        monkeypatch.setattr(cal.web_checkpoint, "replay", lambda *a, **k: None)
+        monkeypatch.setattr(cal.web_checkpoint, "record", lambda *a, **k: None)
+        monkeypatch.setattr(cal, "_wait_cloudflare",
+                            lambda page, headless=False: "Just a moment...")
+        monkeypatch.setattr(cal, "_parse_calcium_links", lambda html: [{"url": "u"}])
+
+        class _UC:
+            def open(self, url, **kw):
+                return _Page()
+
+        links = cal._calcium_forward_months(_UC(), {"calendar_months": 6},
+                                            "http://x/c.pl", "erobay", None, None)
+        assert links == []                       # blocked on the first extra month
+
+
 class TestCalciumRowsBecomeMessages:
     @pytest.fixture(autouse=True)
     def _no_side_effects(self, monkeypatch):
@@ -770,12 +890,24 @@ class TestCalciumRowsBecomeMessages:
         day = (datetime.now().date() + timedelta(days=5)).isoformat()
         assert self._run([self._row(day)])[0]["timestamp"].startswith(day)
 
-    def test_the_two_grids_overlap_and_are_deduped_by_url(self):
+    def test_the_two_grids_overlap_and_are_deduped_by_occurrence(self):
         """A month view spills into its neighbours, so the same row arrives
-        from both grids."""
+        from both grids -- often under a different URL, because the query
+        names the grid it came from (`DoneURL=`)."""
         day = (datetime.now().date() + timedelta(days=2)).isoformat()
         row = self._row(day)
-        assert len(self._run([row, dict(row)])) == 1
+        other_grid = {**row, "url": row["url"] + "&DoneURL=next-month"}
+        assert len(self._run([row, dict(row), other_grid])) == 1
+
+    def test_one_ticket_url_on_several_dates_is_several_rows(self):
+        """Vox Body sells every monthly jam from one buytickets.at page; a
+        URL-only key kept the first date and dropped the rest."""
+        today = datetime.now().date()
+        url = "https://buytickets.at/voxbodystudio/2347339"
+        days = [(today + timedelta(days=n)).isoformat() for n in (3, 31)]
+        msgs = self._run([{**self._row(d), "url": url} for d in days])
+        assert sorted(m["timestamp"][:10] for m in msgs) == days
+        assert len({m["id"] for m in msgs}) == 2
 
     def test_the_url_survives_as_the_events_page(self):
         """With no detail fetch the link *is* the detail."""
