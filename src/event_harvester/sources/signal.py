@@ -47,7 +47,7 @@ def _find_signal_dir(override_path: Optional[str] = None) -> Optional[Path]:
 
 
 def _connect_db(signal_dir: Path):
-    """Connect to Signal's encrypted SQLite database."""
+    """Connect read-only to Signal's encrypted SQLite database."""
     from sigexport import crypto
     from sqlcipher3 import dbapi2
 
@@ -57,7 +57,7 @@ def _connect_db(signal_dir: Path):
     if not key:
         raise RuntimeError("Failed to extract Signal Desktop encryption key")
 
-    db = dbapi2.connect(str(db_file))
+    db = dbapi2.connect(db_file.resolve().as_uri() + "?mode=ro", uri=True)
     c = db.cursor()
     c.execute(f"PRAGMA KEY = \"x'{key}'\"")
     c.execute("PRAGMA cipher_page_size = 4096")

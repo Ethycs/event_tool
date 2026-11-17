@@ -51,3 +51,40 @@ class TestParseMessageBlobs:
         body = json.dumps([{"id": "1", "content": "cafe"}]).encode()
         result = _parse_message_blobs(body)
         assert result[0]["content"] == "cafe"
+
+
+class TestSimpleFileCache:
+    def test_reads_simple_file_cache(self, tmp_path, monkeypatch):
+        """A SimpleFile-format cache (Linux default) must be detected and read."""
+        from datetime import datetime, timezone
+
+        from ccl_chromium_reader import ccl_chromium_cache as ccc
+        from event_harvester.sources.discord import _read_cache_messages
+
+        cache_dir = tmp_path / "Cache_Data"
+        cache_dir.mkdir()
+        (cache_dir / "0123456789abcdef_0").write_bytes(b"")  # simple-cache entry name
+
+        body = json.dumps(
+            [{"id": "7", "content": "hi", "timestamp": "2026-03-15T10:00:00+00:00",
+              "author": {"username": "u"}, "channel_id": "9"}]
+        ).encode()
+
+        class FakeSimple:
+            def __init__(self, path):
+                pass
+
+            def cache_keys(self):
+                return ["https://discord.com/api/v9/channels/9/messages?limit=50"]
+
+            def get_cachefile(self, key):
+                return [body]
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(ccc, "ChromiumSimpleFileCache", FakeSimple)
+        out = _read_cache_messages(
+            datetime(2026, 1, 1, tzinfo=timezone.utc), cache_path=cache_dir
+        )
+        assert [m["id"] for m in out] == ["7"]

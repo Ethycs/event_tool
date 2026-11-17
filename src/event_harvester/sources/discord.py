@@ -1,4 +1,4 @@
-"""Discord cache reader - parses Chromium BlockFile cache for message JSON."""
+"""Discord cache reader - parses Chromium block-file and simple-file caches."""
 
 import gzip
 import json
@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from ccl_chromium_reader.ccl_chromium_cache import ChromiumBlockFileCache
+from ccl_chromium_reader.ccl_chromium_cache import guess_cache_class
 
 from event_harvester.observability.tracing import set_span_attrs, traced
 
@@ -147,7 +147,7 @@ def _read_cache_messages(
     cache_path: Optional[Path] = None,
     override_path: Optional[str] = None,
 ) -> list[dict]:
-    """Parse Discord's Chromium block-file cache. Empty on any failure.
+    """Parse Discord's Chromium cache, detecting its format. Empty on failure.
 
     Kept as its own function so a missing or unreadable cache is a *quiet
     empty*, not an early return from the caller -- the scheduled-events merge
@@ -175,8 +175,13 @@ def _read_cache_messages(
     messages: list[dict] = []
     seen_ids: set[str] = set()
 
+    cache = None
     try:
-        cache = ChromiumBlockFileCache(dst)
+        cache_class = guess_cache_class(dst)
+        if cache_class is None:
+            logger.warning("Discord cache format not recognized: %s", cache_path)
+            return []
+        cache = cache_class(dst)
         for key in cache.cache_keys():
             url = key.url if hasattr(key, "url") else str(key)
             if not _MSG_URL_RE.search(url):
@@ -225,10 +230,11 @@ def _read_cache_messages(
                     except Exception:
                         continue
 
-        cache.close()
     except Exception as e:
         logger.error("Failed to parse Discord cache: %s", e)
     finally:
+        if cache is not None:
+            cache.close()
         shutil.rmtree(tmp, ignore_errors=True)
 
     return messages

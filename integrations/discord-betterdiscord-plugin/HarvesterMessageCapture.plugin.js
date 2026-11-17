@@ -23,10 +23,12 @@
 
 const fs = require("fs");
 const path = require("path");
-const os = require("os");
+// No require("os"): BetterDiscord's addon loader resolves that bare name as a
+// file path and the plugin fails to load (ENOENT …/os).
 
 const BASE = path.join(
-    process.env.APPDATA || path.join(os.homedir(), ".config"),
+    process.env.APPDATA ||
+        path.join(process.env.HOME || process.env.USERPROFILE || "", ".config"),
     "discord-harvester", "messages"
 );
 

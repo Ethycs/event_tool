@@ -1,5 +1,7 @@
 # HarvesterScheduledEvents — a BetterDiscord plugin
 
+**Status:** Living Document · **Date:** 2026-11-17 · **Applies to:** local BetterDiscord exports and harvester ingestion
+
 Exports the guild **scheduled events** your Discord client already knows about
 to a local JSON file, so the event harvester can pick them up. This is the
 member-side path: it works on any guild you are in, no *Manage Server* needed.
@@ -64,12 +66,56 @@ for guilds where you are only a member.
 - The harvester reads `%APPDATA%\discord-harvester\...` by default. If you moved
   it, set `DISCORD_EVENTS_EXPORT` to the full file path on the harvester side.
 
+### Linux desktop cache versus plugin setup
+
+The harvester detects both Chromium block-file and simple-file HTTP caches.
+A readable cache does **not** imply that message history is available: the Linux
+desktop probe on 2026-11-17 found 1,118 simple-cache entries and **zero** message
+endpoints. This is a cache limitation, not evidence that Discord is signed out.
+
+If `~/.config/BetterDiscord` and
+`~/.config/discord-harvester/scheduled-events.json` are absent, the local export
+integration is not installed. Installing BetterDiscord modifies the Discord
+client and restarts it, so do it only with the owner's go-ahead. An existing
+Discord login is sufficient; this plugin does not need an exported account
+token or a separate login.
+
+Manual Linux install, as performed 2026-11-17 on smallblackbox (Discord
+1.0.169, BetterDiscord 1.14.6) — equivalent to the official installer:
+
+```bash
+BD=~/.config/BetterDiscord
+mkdir -p "$BD/data/stable" "$BD/plugins"
+curl -fsSL -o "$BD/data/betterdiscord.asar" \
+  https://github.com/BetterDiscord/BetterDiscord/releases/latest/download/betterdiscord.asar
+cp integrations/discord-betterdiscord-plugin/HarvesterScheduledEvents.plugin.js "$BD/plugins/"
+printf '{\n  "HarvesterScheduledEvents": true\n}\n' > "$BD/data/stable/plugins.json"
+# then prepend this line to
+# ~/.config/discord/app-<ver>/modules/discord_desktop_core-1/discord_desktop_core/index.js
+#   require("<home>/.config/BetterDiscord/data/betterdiscord.asar");
+# and restart Discord.
+```
+
+**A Discord update replaces `app-<ver>/`** and silently drops the injected
+line: re-add it to the new `index.js` and restart.
+
+Linux verification, without printing event contents:
+
+```bash
+pixi run --frozen python -c "from event_harvester.sources.discord_events import default_export_path, read_scheduled_events; print('export exists:', default_export_path().is_file()); print('upcoming events:', len(read_scheduled_events()))"
+```
+
+An absent export means setup is incomplete; an existing export with zero
+upcoming events can be valid.
+
 ## Status
 
-**Untested in a live client at time of writing** — authored against Discord's
-documented Flux store and event names, defensively (it tries several store
-method shapes). The harvester-side reader *is* covered by offline tests. If the
-store shape differs on your build, the console line and the toast will say so.
+**Verified in a live client 2026-11-17** (Linux, Discord 1.0.169, BetterDiscord
+1.14.6): loaded, enabled, wrote the export at start without help, 66 upcoming
+events read by the harvester. It first failed silently because
+`require("os")` does not resolve under BetterDiscord's addon loader; both
+plugins now take the home directory from the environment instead. If the store
+shape differs on your build, the console line and the toast will say so.
 
 ---
 
@@ -79,6 +125,11 @@ A second plugin in this folder. It records the messages **you load by browsing**
 — as you open channels and scroll, it writes what your client already fetched to
 local JSONL, one file per channel, under
 `%APPDATA%\discord-harvester\messages\`.
+
+These JSONL files are an archive for the zip script below, **not** an input to
+the current Discord harvest adapter. Enabling message capture alone therefore
+does not populate a harvest; only the scheduled-events export is ingested.
+On Linux, the capture directory is `~/.config/discord-harvester/messages/`.
 
 ## Why this is safe where bulk export is not
 
