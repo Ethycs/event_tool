@@ -47,6 +47,14 @@ pixi run playwright install chromium
 
 Needed for the web-harvest path (`sources/uc_browser.py`, `sources/web_session.py`) regardless of which web sources are enabled.
 
+The web path also loads the Universal Controller Chrome extension from `ext/universal_controller/extension/`. Its bundle `dist/uc-extension.js` is gitignored, so a fresh checkout must build it once (Node ships in the pixi env):
+
+```bash
+pixi run bash -c 'cd ext/universal_controller/extension && npm ci && npx rollup -c'
+```
+
+Without it Chromium shows `Could not load javascript 'dist/uc-extension.js'` and the extension does not load (found 2026-11-17 on a fresh Linux setup).
+
 ## 5. First-run credentials scaffold
 
 ```powershell
@@ -89,6 +97,28 @@ pixi shell                                           # or: drop into an activate
 - `sources/discord.py` (`find_discord_cache`) auto-detects two layouts: native Windows (`%APPDATA%/discord/Cache/Cache_Data`) and WSL (`Path("/mnt/c/Users").exists()` → scans `/mnt/c/Users/<you>/AppData/Roaming/discord/Cache/Cache_Data`). Override with `DISCORD_CACHE_PATH` if auto-detection picks the wrong user profile.
 - **Windows-only sources:** `discord` (reads the Electron LevelDB cache directly, no bot token — see Doc 2) and `signal` (SQLCipher key extraction via DPAPI, Windows-specific in this codebase's current form) only work where the pixi env itself can run, i.e. **not** inside a WSL-only pixi install unless you're pointing at the Windows-side cache paths as above. `telegram`, `gmail`, and `web` are fully cross-platform.
 - **WSL note:** running `pixi` itself inside WSL against this repo requires adding a `linux-64` platform to `[tool.pixi.workspace]` (not present today) — the simpler path on Windows is to run pixi natively in PowerShell and use the `/mnt/c` auto-detection above only for the Discord-cache edge case, not as a general WSL deployment strategy. Full cross-OS deployment tradeoffs are in `docs/02 - Implementation/02 - Deploy Playbook.md` §1.
+
+## 9. Labelled data (DVC + lakeFS)
+
+The classifier label sets — `data/labels.json`, `data/labels_all.json`, `data/labels_events.json` — are not in git. Git holds only their `data/*.dvc` pointers (md5 + size, no content; `.gitignore` re-includes them past the blanket `data/*`). The data lives in lakeFS on central-dev, reached as S3.
+
+1. Install DVC as a host tool, outside the project env (it is not in `pyproject.toml`):
+   ```bash
+   pixi global install dvc --with dvc-s3     # exposes ~/.pixi/bin/dvc
+   ln -s ~/.pixi/bin/dvc ~/.local/bin/dvc    # only if ~/.pixi/bin is not on PATH
+   ```
+2. Remote config is per-machine and holds the lakeFS key, so it goes in the gitignored `.dvc/config.local` (`.dvc/config` stays empty):
+   ```bash
+   dvc remote add -d --local lakefs s3://event-harvester/main/
+   dvc remote modify --local lakefs endpointurl https://central-dev.lan:8000
+   dvc remote modify --local lakefs ssl_verify /usr/local/share/ca-certificates/caddy-root.crt
+   dvc remote modify --local lakefs access_key_id <lakeFS access key>
+   dvc remote modify --local lakefs secret_access_key <lakeFS secret>
+   ```
+   `ssl_verify` points at central-dev's Caddy root CA; install that cert first.
+3. Pull the data: `dvc pull`. After relabelling: `dvc add data/labels_all.json`, then `dvc push`, then commit the changed `.dvc` pointer.
+
+Verify with `dvc status -c` → `Cache and remote 'lakefs' are in sync.` (Set up on smallblackbox on 2026-11-17: dvc 3.67.1 with dvc-s3 3.3.0.)
 
 ## Verification
 

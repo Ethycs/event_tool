@@ -49,7 +49,7 @@ Copy-Item .env.example .env
 
 ### 2.3 Discord
 
-No token, no OAuth. `sources/discord.py` reads directly from the Electron client's on-disk LevelDB cache (Chromium BlockFile format via `ccl_chromium_reader`).
+No token, no OAuth. `sources/discord.py` reads directly from the Electron client's on-disk HTTP cache via `ccl_chromium_reader`, detecting BlockFile (Windows) or SimpleFile (Linux) format. Current clients cache no message JSON, so live Discord data comes from the scheduled-events plugin in `integrations/discord-betterdiscord-plugin/`.
 
 1. Prerequisite outside this tool: have the Discord desktop app installed, logged in, and have actually opened the channels you want harvested (the cache only contains what the client has fetched — gaps are possible).
 2. `find_discord_cache()` auto-detects `%APPDATA%/discord/Cache/Cache_Data` on native Windows, or the WSL-mounted equivalent under `/mnt/c/Users/<you>/...` when running from WSL. Override with `DISCORD_CACHE_PATH` if it picks the wrong profile or you're on a nonstandard install.

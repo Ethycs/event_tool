@@ -129,7 +129,11 @@ pixi run event-harvester mcp
 pixi run event-harvester mcp --transport streamable-http --port 8765
 ```
 
-Project-local registration for Claude Code lives in [.mcp.json](.mcp.json):
+Project-local registration for Claude Code and OMP lives in [.mcp.json](.mcp.json). It includes the local `event-harvester` and `collector` servers plus `central-dev-gateway` at `http://central-dev.zt:8888/mcp`.
+
+The shared gateway requires ZeroTier membership, but no API key or CA setup: ZeroTier encrypts the transport. It exposes `pbx_*` and any configured optional upstreams. See the [central-dev MCP setup guide](https://central-dev.zt:9000/#setup/mcp-claude-install.md). For access from every project in OMP, add the same gateway entry to `~/.omp/agent/mcp.json`. After changing configuration, run `/mcp reload`, then `/mcp test central-dev-gateway`; the test should connect and list tools.
+
+Minimal local-server registration:
 
 ```json
 {
