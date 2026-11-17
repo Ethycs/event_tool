@@ -100,7 +100,7 @@ pixi shell                                           # or: drop into an activate
 
 ## 9. Labelled data (DVC + lakeFS)
 
-The classifier label sets — `data/labels.json`, `data/labels_all.json`, `data/labels_events.json` — are not in git. Git holds only their `data/*.dvc` pointers (md5 + size, no content; `.gitignore` re-includes them past the blanket `data/*`). The data lives in lakeFS on central-dev, reached as S3.
+The classifier label sets — `data/labels.json`, `data/labels_all.json`, `data/labels_events.json` — and the Grok chat-history export `data/grok-export/` are not in git. Git holds only their `data/*.dvc` pointers (md5 + size, no content; `.gitignore` re-includes them past the blanket `data/*`). The data lives in lakeFS on central-dev, reached as S3, in the `event-harvester` repo on `main` (the label sets and the export share it; anyone holding that key can read the export's personal chats).
 
 1. Install DVC as a host tool, outside the project env (it is not in `pyproject.toml`):
    ```bash
@@ -117,6 +117,7 @@ The classifier label sets — `data/labels.json`, `data/labels_all.json`, `data/
    ```
    `ssl_verify` points at central-dev's Caddy root CA; install that cert first.
 3. Pull the data: `dvc pull`. After relabelling: `dvc add data/labels_all.json`, then `dvc push`, then commit the changed `.dvc` pointer.
+4. Refresh the Grok export: run `scripts/export_grok_history.py` (writes to `~/grok-export`), then `rm -rf data/grok-export && cp -a ~/grok-export data/grok-export`, `dvc add data/grok-export`, `dvc push data/grok-export.dvc`, and commit the pointer. Name the target in `dvc push`: before its pointer is committed, a bare `dvc push` / `dvc status -c` skipped the new `.dvc` file and reported "up to date" (seen 2026-11-17).
 
 Verify with `dvc status -c` → `Cache and remote 'lakefs' are in sync.` (Set up on smallblackbox on 2026-11-17: dvc 3.67.1 with dvc-s3 3.3.0.)
 
