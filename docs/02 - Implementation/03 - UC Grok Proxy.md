@@ -1,5 +1,5 @@
 # Calling `uc-grok` via the litellm proxy
-**Status:** CURRENT · **Date:** 2026-07-29 · **Applies to:** `litellm.config.yaml`, `uc_provider_loader.py` · **Depends on:** `docs/03 - Architecture/10 - LLM Layer & Interlock.md`
+**Status:** CURRENT · **Date:** 2026-11-17 · **Applies to:** `litellm.config.yaml`, `uc_provider_loader.py`, `ext/universal_controller/uc_browser/sites/grok_fast.py` · **Depends on:** `docs/03 - Architecture/10 - LLM Layer & Interlock.md`
 
 The litellm proxy fronts our browser-driven Grok client as an OpenAI-compatible
 endpoint. Any OpenAI SDK, curl, Cline/Continue plugin, etc. that can point at a
@@ -11,8 +11,8 @@ The pathway is:
 client → POST /v1/chat/completions  (model: "uc-grok")
        → litellm proxy router       (resolves uc-grok → uc/grok)
        → UCBrowserCustomLLM         (strips uc/, hits site="grok")
-       → GrokFastClient.send        (React-onSubmit + page.expect_response)
-       → on RuntimeError, GrokClient.send fallback (DOM-driven)
+       → GrokFastClient.send        (Grok's own submit; reply read back over Grok's REST API)
+       → only if nothing was sent: GrokClient.send fallback (DOM-driven)
 ```
 
 There is **no OpenAI hop**. The `openai/` prefix is irrelevant here.
@@ -20,6 +20,25 @@ There is **no OpenAI hop**. The `openai/` prefix is irrelevant here.
 ---
 
 ## 1. Start the proxy
+
+### Linux: user service (smallblackbox)
+
+`~/.config/systemd/user/uc-grok-proxy.service` runs the proxy on `127.0.0.1:4000`, enabled at login:
+
+```bash
+systemctl --user status uc-grok-proxy
+systemctl --user restart uc-grok-proxy      # after code or cookie changes
+journalctl --user -u uc-grok-proxy -f
+```
+
+The unit sets `DISPLAY=:0` (the browser is headed) and its own browser state:
+
+- `UC_CHROME_PROFILE=data/.grok/.chrome_profile`. The browser profile actually used is the sibling `data/.grok/.uc_chromium_profile` (`browser.py` derives it from that path's parent). It is separate from the harvest's `data/.uc_chromium_profile`: a long-lived proxy holding the harvest's profile would make every web harvest fail to launch.
+- `UC_STATE_FILE=data/.grok/state.json`: the Grok session cookies, injected at browser start (see "Signing in").
+
+Anything else that needs the Grok session at the same time (e.g. `scripts/export_grok_history.py`) must use a different `UC_CHROME_PROFILE`; Chromium refuses a profile another process holds.
+
+### Windows: by hand
 
 From the repo root:
 
@@ -33,21 +52,32 @@ The UTF-8 env vars stop the proxy's startup banner from crashing on
 Windows `cp1252`. `--num_workers 1` is mandatory: the handler owns a
 single Chrome profile and competing workers will corrupt it.
 
-Sanity check the proxy is up:
+### Sanity check
 
-```powershell
+```bash
 curl http://localhost:4000/v1/models
 ```
 
 You should see `uc-grok` and `grok-browser` in the response.
 
-If you haven't logged into Grok in the persistent profile yet, the
-first real call will raise `GrokAuthRequired`. Run this once
-beforehand (a Chrome window opens — sign in, then close it):
+### Signing in
 
-```powershell
-pixi run event-harvester web-login --urls https://grok.com
+Grok (and the Google / X sign-in behind it) refuses to sign in inside the automated browser, and there is no `event-harvester web-login` subcommand. Sign in to grok.com in your normal Chrome, then copy its cookies into the state file:
+
+```bash
+pixi run python - <<'PY'
+import json, os, rookiepy
+from uc_browser.chrome_cookies import cookies_to_playwright
+path = "data/.grok/state.json"
+cookies = cookies_to_playwright(rookiepy.chrome(["grok.com", "x.ai"]))
+with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+    json.dump({"cookies": cookies, "origins": []}, f)
+print(len(cookies), "cookies; sso present:", any(c["name"] == "sso" for c in cookies))
+PY
+systemctl --user restart uc-grok-proxy
 ```
+
+The `sso` cookie is the session; without it Grok serves a signed-out page ("Sign up to continue"). The client's login-wall check does not recognise that page, so a signed-out proxy hangs instead of raising `GrokAuthRequired`.
 
 ---
 
@@ -176,45 +206,38 @@ some Cursor flows); otherwise plain blocking is simpler.
 | `timeout` (per request) | client SDK / curl `--max-time` | Per-call ceiling. Bump to 300+ for long-form prompts. |
 | `timeout` (per model) | `litellm.config.yaml` `litellm_params.timeout` | Default ceiling if client doesn't pass one. Currently 180s. |
 | `request_timeout` | `litellm.config.yaml` `general_settings.request_timeout` | Proxy-wide HTTP request ceiling. Raise above 180 if long-form prompts hit a 182-ish wall. |
+| `UC_GROK_TIMEOUT_S` | proxy environment (default 300) | Floor on how long the browser waits for Grok's reply; a lower request timeout is raised to it. |
 | `session_id` | `extra_body` | Continue the same Grok chat. Each id owns its own tab. |
 | `conversation_url` | `extra_body` | Pin to a specific Grok `/c/<uuid>` directly. |
 | `wait_for_response: false` | `extra_body` | Fire-and-forget (~1.3 s, empty `content`). |
 
 ---
 
-## 6. Latency you should expect
+## 6. How the reply is read, and latency
+
+Grok sends chats over a WebSocket (`wss://grok.com/ws/mgw/`, seen 2026-11-17), so there is no HTTP chat response to capture. After the submit is confirmed, `GrokFastClient` polls the REST read endpoints the page itself uses, every 0.5 s: `GET /rest/app-chat/conversations/<id>/response-node` for the new assistant response id, then `POST .../load-responses` until that response has `partial: false`. The reply comes back as Grok stored it, Markdown intact.
+
+If the REST read fails 5 times running, it reads the reply from the page instead. That text is the rendered page text: Markdown formatting is lost, and the leading `Grok` label is stripped. It never re-sends a message that was already submitted.
 
 | Scenario | Wall time |
 | --- | --- |
-| Cold start (first call in process) | ~6 s |
-| Warm continue (same session) | ~1.8–3 s + Grok generation time |
+| New chat, cold proxy (browser launch included) | 13 s for a one-word reply (measured 2026-11-17) |
 | Blind (`wait_for_response: false`) | ~1.3 s |
-| New chat from `grok.com/` root | ~6 s (navigation + chat creation) |
 
-The fast path (React `onSubmit` + `page.expect_response`) is tried
-first. On `RuntimeError` it falls back transparently to the DOM-driven
-client (`GrokClient.send`), so callers always get an answer — but the
-fallback adds ~60 s in the worst case.
+Before 2026-11-17 the fast path waited for an HTTP chat response that no longer exists, so every request sat out the full `UC_GROK_TIMEOUT_S` (300 s) before reading the page. Clients with shorter timeouts saw a hang.
 
 ---
 
-## 7. Concurrency: hard limit of 1 in flight
+## 7. Concurrency: one request at a time
 
 The underlying Playwright client uses the sync API, whose greenlet is
-**thread-bound to the first OS thread that touched it**. Concurrent
-requests from the proxy can land on different `asyncio.to_thread`
-workers and crash with:
-
-```
-greenlet.error: Cannot switch to a different thread
-```
-
-Until the dedicated-PW-thread pin lands, treat the proxy as
-single-flight: send one request, wait for it, send the next. Don't
-fan out 5 concurrent `acompletion` calls.
+bound to the OS thread that first touched it. The provider runs every
+browser call on one pinned worker thread (`uc-grok-pw`), so concurrent
+requests queue behind each other rather than crash; they still run one
+at a time.
 
 True parallelism (N sessions in real flight) needs a migration to
-`playwright.async_api` — separate work item.
+`playwright.async_api`, which is separate work.
 
 ---
 
@@ -225,19 +248,14 @@ True parallelism (N sessions in real flight) needs a migration to
 You're on an older build of the provider. Fake-streaming was added
 when the `streaming()`/`astreaming()` methods landed. Pull latest.
 
-### `GrokAuthRequired` on every call
+### `GrokAuthRequired` on every call, or every call hangs
 
-The persistent profile at `data/.uc_chromium_profile/` isn't logged
-into Grok. Run:
-
-```powershell
-pixi run event-harvester web-login --urls https://grok.com
-```
+The proxy's browser isn't signed in to Grok. Refresh `data/.grok/state.json` from your normal Chrome as in "Signing in", then restart the service. To see what the browser sees, stop the service and open the Grok page with the same `UC_CHROME_PROFILE` / `UC_STATE_FILE`.
 
 ### Long prompt times out at ~182 s
 
-Hitting the proxy's `request_timeout` (currently 180 s) or the
-default 60 s `expect_response` window in the fast path. Two fixes:
+Hitting the per-model `timeout` (180 s in `litellm.config.yaml`;
+`general_settings.request_timeout` is not set there). Two fixes:
 
 1. Pass `timeout=300` (or higher) from the client.
 2. Raise the per-model `timeout` in `litellm.config.yaml`.
@@ -245,6 +263,10 @@ default 60 s `expect_response` window in the fast path. Two fixes:
 Worth checking the Grok tab too — if the stop button is still showing
 when the request returns, generation was still in progress and the
 client cut you off, not Grok.
+
+### `[grok_fast] REST read ...` warnings in the log
+
+The reply was read from the page instead of the REST API (see section 6). If it happens on every call, Grok has probably changed its read endpoints again: run a send with a request listener on the page and compare what the page calls with the paths in `grok_fast.py`.
 
 ### `ImportError: Could not import uc_handler ...`
 
@@ -257,8 +279,9 @@ it is.
 
 ### `Cannot switch to a different thread`
 
-See section 7 — fire one request at a time until the thread pin
-lands.
+A browser call ran outside the pinned `uc-grok-pw` worker (section 7);
+call the handler through the proxy or `litellm.completion`, not from
+your own threads.
 
 ---
 
@@ -268,7 +291,7 @@ If you want to skip the proxy and call the handler in-process:
 
 ```python
 import litellm
-from event_harvester.llm_providers.uc import register_uc_provider
+from uc_browser.llm_providers.uc import register_uc_provider
 
 register_uc_provider()  # wires "uc" into litellm.custom_provider_map
 
