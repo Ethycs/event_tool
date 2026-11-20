@@ -100,7 +100,7 @@ pixi shell                                           # or: drop into an activate
 
 ## 9. Labelled data (DVC + lakeFS)
 
-The classifier label sets — `data/labels.json`, `data/labels_all.json`, `data/labels_events.json` — and the Grok chat-history export `data/grok-export/` are not in git. Git holds only their `data/*.dvc` pointers (md5 + size, no content; `.gitignore` re-includes them past the blanket `data/*`). The data lives in lakeFS on central-dev, reached as S3, in the `event-harvester` repo on `main` (the label sets and the export share it; anyone holding that key can read the export's personal chats).
+The classifier label sets — `data/labels.json`, `data/labels_all.json`, `data/labels_events.json` — are not in git. Git holds only their `data/*.dvc` pointers (md5 + size, no content; `.gitignore` re-includes them past the blanket `data/*`). The data lives in lakeFS on central-dev, reached as S3, in the `event-harvester` repo on `main`.
 
 1. Install DVC as a host tool, outside the project env (it is not in `pyproject.toml`):
    ```bash
@@ -117,7 +117,16 @@ The classifier label sets — `data/labels.json`, `data/labels_all.json`, `data/
    ```
    `ssl_verify` points at central-dev's Caddy root CA; install that cert first.
 3. Pull the data: `dvc pull`. After relabelling: `dvc add data/labels_all.json`, then `dvc push`, then commit the changed `.dvc` pointer.
-4. Refresh the Grok export: run `scripts/export_grok_history.py` (writes to `~/grok-export`), then `rm -rf data/grok-export && cp -a ~/grok-export data/grok-export`, `dvc add data/grok-export`, `dvc push data/grok-export.dvc`, and commit the pointer. Name the target in `dvc push`: before its pointer is committed, a bare `dvc push` / `dvc status -c` skipped the new `.dvc` file and reported "up to date" (seen 2026-11-17).
+
+### Grok export: standalone repository
+
+The export belongs to the private [Ethycs/grok-export](https://github.com/Ethycs/grok-export) repository, checked out at `~/grok-export`, not to event_tool. Its Git repository holds only DVC metadata; the personal chat contents live at `s3://servants-runtime/grok-export/dvc`. The dedicated lakeFS branch isolates export commits from unrelated pending changes on `servants-runtime/main`. Anyone with read access to that lakeFS repository can read the chats.
+
+Clone the repository, install DVC with S3 support and the Caddy CA as above, then configure `access_key_id` and `secret_access_key` for its `lakefs` remote using `dvc remote modify --local`. Credentials stay in ignored `.dvc/config.local`; endpoint and storage location are committed in `.dvc/config`. Run `dvc pull json.dvc md.dvc index.json.dvc` inside the standalone checkout.
+
+To refresh, run `scripts/export_grok_history.py` from event_tool's environment as before (its default output is `~/grok-export`). In `~/grok-export`, run `dvc add json md index.json`, then `dvc push json.dvc md.dvc index.json.dvc`. Commit the uploaded objects on the **lakeFS `grok-export` branch**, then commit and push the three Git pointers. Do not copy the export back into event_tool.
+
+Migration verified on 2026-11-20: a fresh Git clone and DVC pull recovered all 215 files byte-for-byte from servants-runtime. The old event-harvester objects and Git history are retained for recovery; this migration does not erase historical copies.
 
 Verify with `dvc status -c` → `Cache and remote 'lakefs' are in sync.` (Set up on smallblackbox on 2026-11-17: dvc 3.67.1 with dvc-s3 3.3.0.)
 
