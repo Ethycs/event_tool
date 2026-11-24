@@ -65,6 +65,21 @@ def _isolate_web_access_log(tmp_path, monkeypatch):
     monkeypatch.setattr(web_access_log, "STATE_FILE", tmp_path / ".web_access_state.json")
 
 
+@pytest.fixture(autouse=True)
+def _no_real_native_browser(monkeypatch):
+    """No test may reach the Chrome a person keeps open on the native port,
+    nor the UC service's native window named in this machine's ``.env``.
+
+    On 2026-11-24 a test that named the open-browser route without stubbing
+    the page preparation opened a tab in the owner's live browser and held it
+    for fifteen seconds. Tests that want either route say so themselves.
+    """
+    from event_harvester.sources import uc_browser
+
+    monkeypatch.setattr(uc_browser, "_port_open", lambda port: False)
+    monkeypatch.setenv("WEB_UC_NATIVE_WINDOW", "")
+
+
 @pytest.fixture
 def sample_messages():
     """A set of sample messages from both platforms."""

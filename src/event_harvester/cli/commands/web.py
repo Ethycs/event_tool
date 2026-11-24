@@ -443,9 +443,10 @@ def _web_replay(args, cfg) -> int:
     messages"; this reports which step stopped producing and what the page
     looked like when it did.
     """
-    from event_harvester.sources.uc_browser import WebBrowser, native_route
+    from event_harvester.sources.uc_browser import WebBrowser, native_browser
     from event_harvester.sources.web_fetch import _load_web_sources
     from event_harvester.sources.web_steps import replay, validate_steps
+    from event_harvester.sources.web_utils import BOT_CHECK_WAIT_S
 
     src = next((s for s in _load_web_sources() if s.get("name") == args.name), None)
     if src is None:
@@ -468,7 +469,11 @@ def _web_replay(args, cfg) -> int:
     print(f"\n{BOLD}Replaying {args.name}{RESET} {DIM}({len(steps)} steps){RESET}\n")
     cfg_llm = cfg.llm if getattr(args, "diagnose", False) else None
 
-    with WebBrowser(**(native_route()[1] if src.get("native_chrome") else {})) as uc:
+    browser = (
+        native_browser(src["url"], int(src.get("bot_check_wait_s", BOT_CHECK_WAIT_S)))
+        if src.get("native_chrome") else WebBrowser()
+    )
+    with browser as uc:
         page = uc.open(src["url"], source_name=args.name)
         result = replay(uc, page, steps, cfg_llm=cfg_llm)
         for step_result in result.results:

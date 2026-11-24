@@ -34,7 +34,10 @@ from uc_browser import BrowserMode, UCBrowser
 
 logger = logging.getLogger("event_harvester.uc_browser")
 
-__all__ = ["BrowserMode", "NATIVE_CDP_PORT", "WebBrowser", "native_route"]
+__all__ = [
+    "BrowserMode", "NATIVE_CDP_PORT", "WebBrowser", "native_browser", "native_route",
+    "prepare_native",
+]
 
 #: The debugging port of the Chrome a person keeps open for sources whose bot
 #: check only a person can clear (the ``uc-native-window`` user unit).
@@ -145,6 +148,39 @@ def pass_check_unattached(endpoint: str, url: str, wait_s: int) -> tuple[bool, s
             _devtools(endpoint, f"/json/close/{tab_id}")
         except Exception as e:  # noqa: BLE001 — the tab may already be gone
             logger.debug("closing the unattached tab failed: %s", e)
+
+
+def prepare_native(uc_kwargs: dict, url: str, wait_s: int) -> tuple[bool, str]:
+    """Let ``url`` load in the native browser with nothing attached, before any attach.
+
+    ``(through, last title)``. For the open browser this is
+    :func:`pass_check_unattached`. A Chrome this run launches has no
+    unattached state to load a page in, so there is nothing to prepare.
+    """
+    if "cdp_endpoint" in uc_kwargs:
+        return pass_check_unattached(uc_kwargs["cdp_endpoint"], url, wait_s)
+    return True, ""
+
+
+def native_browser(url: str, wait_s: int) -> "WebBrowser":
+    """A not-yet-started browser for native work on ``url``, its page prepared.
+
+    For callers that hold one browser on one address (the explore tool, the
+    CLI replay). Attaching first can itself stop a bot check from finishing,
+    so the address is loaded unattached before the browser is handed out, and
+    a page that does not get through raises ``SourceBlocked``.
+    """
+    from event_harvester.sources.web_utils import SourceBlocked
+
+    _method, uc_kwargs = native_route()
+    through, title = prepare_native(uc_kwargs, url, wait_s)
+    if not through:
+        raise SourceBlocked(
+            "the page", "cloudflare_challenge",
+            f"not through after {wait_s}s in the native browser with nothing attached "
+            f"(title {title[:60]!r})",
+        )
+    return WebBrowser(**uc_kwargs)
 
 
 class WebBrowser:

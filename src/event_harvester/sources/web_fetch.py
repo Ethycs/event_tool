@@ -652,10 +652,10 @@ def fetch_web_sources(
         that does not finish unattached is `blocked` without attaching: an
         attached attempt cleared one once in seven measured runs.
         """
-        from event_harvester.sources.uc_browser import WebBrowser, pass_check_unattached
+        from event_harvester.sources.uc_browser import WebBrowser, prepare_native
 
         wait_s = int(src.get("bot_check_wait_s", BOT_CHECK_WAIT_S))
-        through, title = pass_check_unattached(uc_kwargs["cdp_endpoint"], src["url"], wait_s)
+        through, title = prepare_native(uc_kwargs, src["url"], wait_s)
         if not through:
             raise SourceBlocked(
                 "the source's page", "cloudflare_challenge",

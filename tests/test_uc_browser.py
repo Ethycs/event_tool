@@ -243,3 +243,23 @@ def test_without_a_service_window_the_open_browser_is_named_else_chrome_is_launc
     )
     monkeypatch.setattr(uc_browser, "_port_open", lambda port: False)
     assert uc_browser.native_route("", "") == ("native", {"native_chrome": True})
+
+
+def test_no_browser_is_handed_out_for_a_page_that_did_not_get_through(controller, monkeypatch):
+    """The explore tool and the CLI hold one browser on one address. Attaching
+    to a page whose check is still running is what keeps it from finishing."""
+    from event_harvester.sources.web_utils import SourceBlocked
+
+    monkeypatch.setattr(uc_browser, "_port_open", lambda port: True)
+    monkeypatch.setattr(
+        uc_browser, "pass_check_unattached", lambda endpoint, url, wait_s: (False, "Just a moment..."),
+    )
+    with pytest.raises(SourceBlocked):
+        uc_browser.native_browser("https://venue.example/", 5)
+    assert controller.launched == 0
+
+    monkeypatch.setattr(
+        uc_browser, "pass_check_unattached", lambda endpoint, url, wait_s: (True, "Venue"),
+    )
+    with uc_browser.native_browser("https://venue.example/", 5) as uc:
+        assert uc._uc.kwargs == {"cdp_endpoint": "http://127.0.0.1:9222", "label": "event_tool"}
