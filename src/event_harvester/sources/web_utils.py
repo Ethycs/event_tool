@@ -278,22 +278,64 @@ def is_bot_check(html: str) -> bool:
     return any(marker in lowered for marker in _BOT_CHECK_MARKERS)
 
 
+def _page_title(page) -> str:
+    try:
+        return str(page.title())[:80]
+    except Exception as e:  # noqa: BLE001 — mid-navigation is itself an answer
+        return f"<unreadable: {type(e).__name__}>"
+
+
 def _poll_bot_check(page, html: str, *, seconds: int, settle_ms: int) -> str:
     """Re-read ``page`` once a second until its bot check is gone.
 
     Returns the settled HTML, or the last HTML read if the check never clears;
-    the caller tells the two apart with :func:`is_bot_check`.
+    the caller tells the two apart with :func:`is_bot_check`. Every change of
+    the page's title during the wait is logged, and so is the number of
+    reads that failed: a check that a person passes and that then comes back
+    looks, from the return value alone, exactly like one nobody touched.
     """
-    for _ in range(seconds):
+    title = _page_title(page)
+    unread = 0
+    for second in range(1, seconds + 1):
         page.wait_for_timeout(1000)
+        now = _page_title(page)
+        if now != title:
+            logger.info("Bot check, %ds in: page title %r -> %r", second, title, now)
+            title = now
         try:
             html = page.content()
         except Exception:
+            unread += 1
             continue
         if not is_bot_check(html):
             page.wait_for_timeout(settle_ms)
             return page.content()
+    if unread:
+        logger.warning("Bot check: the page could not be read on %d of %d tries.", unread, seconds)
     return html
+
+
+def _log_blocked_page(page) -> None:
+    """Leave a record of what a page looked like when its bot check was given up on."""
+    try:
+        text = page.evaluate("document.body ? document.body.innerText.slice(0, 200) : ''") or ""
+    except Exception as e:  # noqa: BLE001
+        text = f"<unreadable: {type(e).__name__}>"
+    shot = ""
+    try:
+        from urllib.parse import urlparse
+
+        host = urlparse(getattr(page, "url", "") or "").netloc or "page"
+        path = _DATA_DIR / ".web_hints" / f"blocked-{host}-{datetime.now(timezone.utc):%Y%m%dT%H%M%S}.png"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        page.screenshot(path=str(path))
+        shot = f"; screenshot {path.name}"
+    except Exception as e:  # noqa: BLE001 — the record is best effort
+        logger.debug("blocked-page screenshot failed: %s", e)
+    logger.warning(
+        "Bot check page at give-up: title %r, text %r%s",
+        _page_title(page), " ".join(str(text).split())[:160], shot,
+    )
 
 
 #: Seconds a headed browser waits on a bot check for it to clear. Override
@@ -336,6 +378,7 @@ def _wait_cloudflare(page, headless: bool = True, wait_s: int = BOT_CHECK_WAIT_S
     html = _poll_bot_check(page, html, seconds=wait_s, settle_ms=3000)
     if is_bot_check(html):
         logger.warning("Bot check did not clear in %ds.", wait_s)
+        _log_blocked_page(page)
     return html
 
 
