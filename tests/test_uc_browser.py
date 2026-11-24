@@ -263,3 +263,82 @@ def test_no_browser_is_handed_out_for_a_page_that_did_not_get_through(controller
     )
     with uc_browser.native_browser("https://venue.example/", 5) as uc:
         assert uc._uc.kwargs == {"cdp_endpoint": "http://127.0.0.1:9222", "label": "event_tool"}
+
+
+class FakeServiceClient:
+    """The UC service's quiet-window calls, recorded in order."""
+
+    calls: list[tuple] = []
+    titles: list[str] = []
+    busy = False
+
+    def __init__(self, url):
+        self.url = url
+
+    def register_client(self, window, label=None, pid=None, *, unattached=False):
+        type(self).calls.append(("register", window, label, unattached))
+        if type(self).busy:
+            from uc_browser.service.errors import ServiceError
+
+            raise ServiceError("busy", "window native is held by explore:1", 409)
+        return "C1"
+
+    def start_window(self, window):
+        type(self).calls.append(("start", window))
+        return {}
+
+    def new_page(self, window, client_id=None, url=None, wait_ms=None):
+        type(self).calls.append(("new_page", window, client_id, url))
+        return "T1"
+
+    def page_info(self, window, target_id):
+        titles = type(self).titles
+        return {"target_id": target_id, "title": titles.pop(0) if len(titles) > 1 else titles[0]}
+
+    def close_page(self, window, target_id):
+        type(self).calls.append(("close_page", target_id))
+
+    def close_client(self, client_id):
+        type(self).calls.append(("close_client", client_id))
+
+
+@pytest.fixture
+def service(monkeypatch):
+    import uc_browser.service.client as real
+
+    FakeServiceClient.calls, FakeServiceClient.busy = [], False
+    monkeypatch.setattr(real, "ServiceClient", FakeServiceClient)
+    monkeypatch.setattr(uc_browser.time, "sleep", lambda _s: None)
+    return FakeServiceClient
+
+
+SERVICE_ROUTE = {"service": "http://svc", "window": "native", "label": "event_tool:1:2"}
+
+
+def test_a_service_window_loads_the_page_in_a_quiet_reservation_and_releases_it(service):
+    service.titles = ["", "Just a moment...", "Venue calendar"]
+
+    assert uc_browser.prepare_native(SERVICE_ROUTE, URL, 30) == (True, "Venue calendar")
+    assert service.calls == [
+        ("register", "native", "event_tool:1:2", True),
+        ("start", "native"),
+        ("new_page", "native", "C1", URL),
+        ("close_page", "T1"),
+        ("close_client", "C1"),
+    ]
+
+
+def test_a_page_not_through_in_the_service_window_still_releases_the_reservation(service):
+    service.titles = ["Just a moment..."]
+
+    assert uc_browser.prepare_native(SERVICE_ROUTE, URL, 5) == (False, "Just a moment...")
+    assert service.calls[-2:] == [("close_page", "T1"), ("close_client", "C1")]
+
+
+def test_a_busy_service_window_is_an_error_not_a_reason_to_attach(service):
+    from uc_browser.service.errors import ServiceError
+
+    service.busy = True
+    with pytest.raises(ServiceError, match="held by explore:1"):
+        uc_browser.prepare_native(SERVICE_ROUTE, URL, 5)
+    assert service.calls == [("register", "native", "event_tool:1:2", True)]

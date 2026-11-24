@@ -614,9 +614,10 @@ def fetch_web_sources(
         from event_harvester.sources.uc_browser import WebBrowser
 
         native = final
-        if "cdp_endpoint" in uc_kwargs:
-            # A person's open browser: attach per source, after its page has
-            # loaded there with nothing attached. See `_open_browser_source`.
+        if "cdp_endpoint" in uc_kwargs or "service" in uc_kwargs:
+            # A browser that outlives this run (a person's open Chrome, or the
+            # UC service's native window): attach per source, after its page
+            # has loaded there with nothing attached. See `_open_browser_source`.
             for src in group.sources:
                 if group.abandoned:
                     break
@@ -644,9 +645,10 @@ def fetch_web_sources(
                         )
 
     def _open_browser_source(uc_kwargs: dict, src: dict, cf_retries: list, *, tracer, capture):
-        """One source through a person's open browser (``native:open-browser``).
+        """One source through a browser that outlives the run.
 
-        Its page is first loaded there with no client attached, because a bot
+        That is ``native:open-browser`` or ``service:<window>``. The source's
+        page is first loaded there with no client attached, because a bot
         check does not finish while one is. Only once that page is through
         does this attach, for this source alone, and detach again. A check
         that does not finish unattached is `blocked` without attaching: an
@@ -659,7 +661,7 @@ def fetch_web_sources(
         if not through:
             raise SourceBlocked(
                 "the source's page", "cloudflare_challenge",
-                f"not through after {wait_s}s in the open browser with nothing attached "
+                f"not through after {wait_s}s in the native browser with nothing attached "
                 f"(title {title[:60]!r})",
             )
         with WebBrowser(**uc_kwargs) as uc:

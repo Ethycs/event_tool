@@ -107,6 +107,31 @@ def _devtools(endpoint: str, path: str, method: str = "GET"):
         return body
 
 
+def _wait_through(read_title, url: str, wait_s: int) -> tuple[bool, str]:
+    """Read a page's title once a second until it is past its bot check.
+
+    ``(through, last title)``. This is event_tool's readiness rule, the same
+    for every way of loading a page unattached: through when, on two
+    consecutive reads, the title is not empty, is not still the address (the
+    page has not rendered yet) and is not a bot-check title.
+    """
+    from event_harvester.sources.web_utils import is_bot_check
+
+    bare = url.split("://", 1)[-1]
+    title, settled = "", 0
+    for second in range(1, wait_s + 1):
+        time.sleep(1)
+        now = read_title()
+        if now != title:
+            logger.info("Unattached page, %ds in: title %r -> %r", second, title[:80], now[:80])
+            title = now
+        loading = not title or title in url or bare.startswith(title)
+        settled = 0 if loading or is_bot_check(title) else settled + 1
+        if settled >= 2:
+            return True, title
+    return False, title
+
+
 def pass_check_unattached(endpoint: str, url: str, wait_s: int) -> tuple[bool, str]:
     """Load ``url`` in the open browser with no client attached; wait for it.
 
@@ -117,32 +142,19 @@ def pass_check_unattached(endpoint: str, url: str, wait_s: int) -> tuple[bool, s
     itself within 8 s and the harvest, attaching afterwards, was not
     challenged; with a client attached from the start the same check span for
     120 s. It did not finish this way while the X screen was blanked.
-
-    A title that is still the address means the page has not rendered yet.
     """
     from urllib.parse import quote
 
-    from event_harvester.sources.web_utils import is_bot_check
+    tab_id = _devtools(endpoint, "/json/new?" + quote(url, safe=":/?="), method="PUT")["id"]
 
-    tab = _devtools(endpoint, "/json/new?" + quote(url, safe=":/?="), method="PUT")
-    tab_id = tab["id"]
-    bare = url.split("://", 1)[-1]
-    title, settled = "", 0
+    def title() -> str:
+        return next(
+            (str(t.get("title", "")) for t in _devtools(endpoint, "/json/list")
+             if t.get("id") == tab_id), "",
+        )
+
     try:
-        for second in range(1, wait_s + 1):
-            time.sleep(1)
-            now = next(
-                (str(t.get("title", "")) for t in _devtools(endpoint, "/json/list")
-                 if t.get("id") == tab_id), "",
-            )
-            if now != title:
-                logger.info("Unattached page, %ds in: title %r -> %r", second, title[:80], now[:80])
-                title = now
-            loading = not title or title in url or bare.startswith(title)
-            settled = 0 if loading or is_bot_check(title) else settled + 1
-            if settled >= 2:
-                return True, title
-        return False, title
+        return _wait_through(title, url, wait_s)
     finally:
         try:
             _devtools(endpoint, f"/json/close/{tab_id}")
@@ -150,13 +162,54 @@ def pass_check_unattached(endpoint: str, url: str, wait_s: int) -> tuple[bool, s
             logger.debug("closing the unattached tab failed: %s", e)
 
 
+def pass_check_in_service(
+    service: str, window: str, label: str | None, url: str, wait_s: int,
+) -> tuple[bool, str]:
+    """Load ``url`` in a quiet window of the UC service; wait for it.
+
+    Returns ``(through, last title)``. A quiet reservation
+    (``register_client(unattached=True)``) is refused while anything else is
+    registered on or connected to the window, and while it is held the service
+    attaches nothing: the page is created and its title read over HTTP only.
+    The service reports; whether the page is through is decided here.
+
+    A refused reservation (``busy``, naming who holds the window) is raised,
+    not waited on: it is not permission to attach or to launch another browser.
+    """
+    from uc_browser.service.client import ServiceClient
+
+    client = ServiceClient(service)
+    client_id = client.register_client(window, label, unattached=True)
+    target_id = None
+    try:
+        client.start_window(window)
+        target_id = client.new_page(window, client_id, url=url)
+        return _wait_through(
+            lambda: str(client.page_info(window, target_id).get("title", "")), url, wait_s,
+        )
+    finally:
+        for what, close in (
+            ("page", lambda: target_id and client.close_page(window, target_id)),
+            ("reservation", lambda: client.close_client(client_id)),
+        ):
+            try:
+                close()
+            except Exception as e:  # noqa: BLE001 — the lease expires at the service
+                logger.warning("closing the quiet %s at the UC service failed: %s", what, e)
+
+
 def prepare_native(uc_kwargs: dict, url: str, wait_s: int) -> tuple[bool, str]:
     """Let ``url`` load in the native browser with nothing attached, before any attach.
 
-    ``(through, last title)``. For the open browser this is
-    :func:`pass_check_unattached`. A Chrome this run launches has no
-    unattached state to load a page in, so there is nothing to prepare.
+    ``(through, last title)``, by whichever way the route offers: a quiet
+    reservation in the UC service's window, or the open browser's own HTTP
+    endpoints. A Chrome this run launches has no unattached state to load a
+    page in, so there is nothing to prepare.
     """
+    if "service" in uc_kwargs:
+        return pass_check_in_service(
+            uc_kwargs["service"], uc_kwargs["window"], uc_kwargs.get("label"), url, wait_s,
+        )
     if "cdp_endpoint" in uc_kwargs:
         return pass_check_unattached(uc_kwargs["cdp_endpoint"], url, wait_s)
     return True, ""
