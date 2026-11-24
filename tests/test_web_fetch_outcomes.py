@@ -96,11 +96,27 @@ def harness(monkeypatch):
 
     saved.waits = waits
     monkeypatch.setattr(web_fetch, "_wait_cloudflare", wait)
+    monkeypatch.setattr(web_fetch, "_port_open", lambda port: False)
     monkeypatch.setattr(
         web_fetch, "_do_raw",
         lambda uc, src, page=None, **_kw: [{"id": src["name"], "channel": src["name"]}],
     )
     return saved
+
+
+def test_attaching_to_an_open_browser_is_logged_as_its_own_method(harness, monkeypatch):
+    """A check a person cleared in an open browser held for pages opened after
+    it; the same check never completed in a browser launched with the
+    automation attached. They must not share a line in the log."""
+    from event_harvester.sources import web_access_log
+
+    web_fetch.fetch_web_sources([_raw("erobay", native_chrome=True)])
+    monkeypatch.setattr(web_fetch, "_port_open", lambda port: True)
+    web_fetch.fetch_web_sources([_raw("erobay", native_chrome=True)])
+
+    lines = [json.loads(line) for line in web_access_log.LOG_FILE.read_text().splitlines()]
+    assert [line["method"] for line in lines] == ["native", "native:open-browser"]
+    assert all(line["was"] is None for line in lines)  # two methods, two first sights
 
 
 def _states() -> dict[str, str]:
