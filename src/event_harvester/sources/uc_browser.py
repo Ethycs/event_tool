@@ -27,6 +27,7 @@ store, ``timeout_ms``.
 from __future__ import annotations
 
 import logging
+import os
 import time
 
 from uc_browser import BrowserMode, UCBrowser
@@ -48,22 +49,40 @@ def _port_open(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-def native_route() -> tuple[str, dict]:
+def native_route(service: str | None = None, window: str | None = None) -> tuple[str, dict]:
     """How native-Chrome work gets its browser now: ``(method, WebBrowser arguments)``.
 
-    A Chrome open on the native port is attached to by naming its endpoint:
-    the controller launches nothing, and on exit closes only the pages this
-    client opened. With nothing listening there, the controller launches
-    Chrome itself and closes it. They are different access methods and are
-    logged as such. Measured 2026-11-24 on erobay: a check a person cleared in
-    an open, unattached Chrome held for the pages opened after it; the same
-    check never completed in a Chrome launched with the automation attached
-    (two attended runs of 120 s, two unattended of 60 s).
+    The one decision, for every caller (harvest, its native retry, the explore
+    tool, the CLI). In order:
 
-    The endpoint is named here, by event_tool. The controller does not look
-    for an open browser on its own (it did until ``04b200f``), and it refuses
-    to launch on a profile another browser holds.
+    1. A native window of the Universal Controller service, when event_tool's
+       config names both the service and the window (``EH_UC_SERVICE_URL``,
+       ``WEB_UC_NATIVE_WINDOW``). The service owns that browser and its
+       profile, so nothing below is tried: launching locally would be a second
+       browser on a held profile.
+    2. A Chrome open on the native port, attached to by naming its endpoint:
+       the controller launches nothing, and on exit closes only the pages
+       this client opened.
+    3. Otherwise the controller launches Chrome itself and closes it.
+
+    They are different access methods and are logged as such. Measured
+    2026-11-24 on erobay: a check finished when its page loaded in an open,
+    unattached Chrome; it never completed in a Chrome launched with the
+    automation attached (two attended runs of 120 s, two unattended of 60 s).
+
+    ``service`` and ``window`` default to event_tool's config. The controller
+    does not look for a browser on its own (it did until ``04b200f``).
     """
+    if service is None or window is None:
+        from event_harvester.config import load_config
+
+        web = load_config().web
+        service, window = web.uc_service, web.uc_native_window
+    if service and window:
+        return f"service:{window}", {
+            "service": service, "window": window,
+            "label": f"event_tool:{os.getpid()}:{int(time.time())}",
+        }
     if _port_open(NATIVE_CDP_PORT):
         return "native:open-browser", {
             "cdp_endpoint": f"http://127.0.0.1:{NATIVE_CDP_PORT}", "label": "event_tool",

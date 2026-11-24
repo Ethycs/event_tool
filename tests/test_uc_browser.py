@@ -220,3 +220,26 @@ def test_a_page_still_showing_its_address_has_not_loaded(devtools):
     devtools(["venue.example/cal.pl?Op=ShowIt&Name=Community"])
 
     assert uc_browser.pass_check_unattached("http://b", URL, 4)[0] is False
+
+
+def test_a_configured_service_window_wins_and_nothing_else_is_tried(monkeypatch):
+    """Once the service owns the native profile, a caller that fell back to
+    the open port or to launching would start a second browser on it."""
+    probed: list[int] = []
+    monkeypatch.setattr(uc_browser, "_port_open", lambda port: probed.append(port) or True)
+
+    method, kwargs = uc_browser.native_route("http://127.0.0.1:4010", "native")
+
+    assert method == "service:native"
+    assert (kwargs["service"], kwargs["window"]) == ("http://127.0.0.1:4010", "native")
+    assert kwargs["label"].startswith("event_tool:")
+    assert probed == []
+
+
+def test_without_a_service_window_the_open_browser_is_named_else_chrome_is_launched(monkeypatch):
+    monkeypatch.setattr(uc_browser, "_port_open", lambda port: True)
+    assert uc_browser.native_route("http://127.0.0.1:4010", "") == (
+        "native:open-browser", {"cdp_endpoint": "http://127.0.0.1:9222", "label": "event_tool"},
+    )
+    monkeypatch.setattr(uc_browser, "_port_open", lambda port: False)
+    assert uc_browser.native_route("", "") == ("native", {"native_chrome": True})

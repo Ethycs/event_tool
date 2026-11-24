@@ -20,7 +20,6 @@ locations (``web_utils`` / ``web_modes.*``).
 from __future__ import annotations
 
 import logging
-import os
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -669,21 +668,16 @@ def fetch_web_sources(
             finally:
                 uc.close_pages()
 
-    # How the native route gets its browser. Named here, by the client: a
-    # window of the UC service when one is configured, else whatever
-    # ``native_route`` finds (a person's open Chrome, or one this run
-    # launches). They are different methods and are logged as such: a check
-    # cleared by one does not carry to the other.
+    # How the native route gets its browser: `native_route` decides, for this
+    # and every other native caller. The methods it can name are different
+    # and are logged as such: a check cleared by one does not carry to another.
     from event_harvester.sources.uc_browser import native_route
 
-    on_abandon = None
-    if uc_service and uc_native_window:
-        label = f"event_tool:{os.getpid()}:{int(time.time())}"
-        native_method = f"service:{uc_native_window}"
-        native_browser = {"service": uc_service, "window": uc_native_window, "label": label}
-        on_abandon = partial(_revoke, uc_service, label)
-    else:
-        native_method, native_browser = native_route()
+    native_method, native_browser = native_route(uc_service, uc_native_window)
+    on_abandon = (
+        partial(_revoke, native_browser["service"], native_browser["label"])
+        if "service" in native_browser else None
+    )
 
     # One worker for the plain-HTTP sources; standard browser sources split
     # across ``parallel`` browsers; native_chrome stays in one bucket. Each
