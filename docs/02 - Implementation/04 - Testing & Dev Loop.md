@@ -56,7 +56,7 @@ pixi run event-harvester --load data/snap.json --dry-run --no-sync --show-reject
 
 `--dry-run` shows what TickTick tasks *would* be created without creating them; `--no-sync` skips TickTick entirely (no client construction, no OAuth prompt); `--show-rejects` prints per-stage reject counts and writes the full detail to `data/rejects.ini` (classifier / reranker / caps / LLM-past / LLM-no-events).
 
-There's also an in-pipeline 4-hour message cache (`data/.message_cache.json`, keyed on the active source set) that kicks in automatically on plain `harvest` runs with no `--load`/`--save` — if you're iterating fast and don't see fresh messages, that cache (not staleness of your changes) is often why; the CLI prints `Using cached messages (...). Delete <path> to force refresh.` when it's serving from it.
+There's also an in-pipeline 4-hour message cache (`data/.message_cache.json`, keyed on the active source set and, from 2026-11-24, on the web-source filter) that kicks in automatically on plain `harvest` runs with no `--load`/`--save` — if you're iterating fast and don't see fresh messages, that cache (not staleness of your changes) is often why; the CLI prints `Using cached messages (...). Delete <path> to force refresh.` when it's serving from it. Repeating a run of the *same* single source inside four hours is still served from it, `no_cooldown` or not.
 
 ## 4. Web fetch debug flags
 

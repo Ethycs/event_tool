@@ -93,7 +93,7 @@ Message order is deterministic regardless of completion order: results are re-as
 
 | Path | Written by | Lifetime |
 |---|---|---|
-| `data/.message_cache.json` | `pipeline/harvest.py` | 4h TTL; invalidated when the active source set changes |
+| `data/.message_cache.json` | `pipeline/harvest.py` | 4h TTL; invalidated when the active source set changes, or (from 2026-11-24) when the web-source filter does. Before that a web-only run of one source was served another's cached messages |
 | `data/.web_traces/<source>/<run-id>*` | `observability/` | **No cleanup policy** — grows unbounded (`TODO.md`) |
 | `data/web_sources.json` | hand-edited + `web add` | Permanent config |
 | `data/profiles.json` | hand-edited | Permanent config |
