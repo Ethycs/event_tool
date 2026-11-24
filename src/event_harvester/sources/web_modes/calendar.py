@@ -19,13 +19,13 @@ from event_harvester.sources import web_checkpoint
 from event_harvester.sources.web_utils import (
     DEFAULT_SCROLL_SECONDS,
     _extract_event_links,
-    _extract_text,
     _fetch_event_details_parallel,
     _filter_known_links,
     _save_link_fingerprint,
     _scroll_for_seconds,
     _wait_cloudflare,
     is_bot_check,
+    page_deviation,
 )
 
 logger = logging.getLogger("event_harvester.web_fetch")
@@ -495,16 +495,13 @@ def _do_calendar_inner(uc, src: dict, timeout_ms: int, max_events: int, page=Non
         page.close()
         return messages
 
-    # Fallback: raw text
-    text = _extract_text(html)
+    # Not a listing. This handler is a program for a page of dated event
+    # links, and a page without them is not that page. The raw-text fallback
+    # that stood here emitted whatever was on it as one message. On every
+    # night measured (2026-11-17..23) that was a Cloudflare challenge
+    # (erobay), a no-JavaScript shell (midway) or navigation text (makerfaire).
+    deviation = page_deviation(
+        page, f"a calendar listing with at least 3 dated links (found {len(event_links)})",
+    )
     page.close()
-    if len(text) < 50:
-        return []
-    return [{
-        "platform": "web",
-        "id": f"web:{hash(url)}",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "author": domain,
-        "channel": url[:120],
-        "content": text[:8000],
-    }]
+    raise deviation

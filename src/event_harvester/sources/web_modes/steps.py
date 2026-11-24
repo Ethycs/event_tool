@@ -23,6 +23,7 @@ from event_harvester.sources.web_utils import (
     _fetch_event_details_parallel,
     _filter_known_links,
     _save_link_fingerprint,
+    make_deviation,
 )
 
 logger = logging.getLogger("event_harvester.web_fetch")
@@ -127,6 +128,18 @@ def _do_steps_inner(uc, src: dict, timeout_ms: int, max_events: int,
         page.close()
     except Exception as e:  # noqa: BLE001
         logger.debug("%s: page close failed: %s", name, e)
+
+    if not result.ok and not messages:
+        # The route broke and left nothing. Its diagnosis already says what
+        # the page looked like where it stopped.
+        diagnosis = result.diagnosis or {}
+        top = (diagnosis.get("hints") or [{}])[0]
+        failed = result.failed_step
+        raise make_deviation(
+            f"the route to complete (stopped at step {failed.index}, {failed.verb})"
+            if failed else "the route to complete",
+            diagnosis.get("kind") or "unknown", top.get("evidence", ""),
+        )
 
     expected = src.get("expect_min_events")
     if expected is not None and len(messages) < int(expected):

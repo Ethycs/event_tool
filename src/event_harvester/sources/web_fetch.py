@@ -50,6 +50,8 @@ from event_harvester.sources.web_utils import (  # noqa: F401
     _JUNK_LINK_TITLES,
     _WEB_SOURCES_FILE,
     DEFAULT_SCROLL_SECONDS,
+    SourceBlocked,
+    SourceDeviated,
     _decimate_text,
     _detect_mode,
     _extract_event_links,
@@ -100,19 +102,11 @@ _REPORT_RUNS_KEPT = 30
 #: ``low``      fewer messages than the source's ``expect_min_events``
 #: ``empty``    ran cleanly and found nothing
 #: ``blocked``  a bot check stood where the page should be; needs a person
+#: ``deviated`` the page is not the page the source's handler was written for
 #: ``failed``   raised
 #: ``hung``     ran past its deadline; its thread and browser were abandoned
 #: ``skipped``  queued behind a hung source in the same browser, so never ran
-STATES = ("ok", "low", "empty", "blocked", "failed", "hung", "skipped")
-
-
-class SourceBlocked(Exception):
-    """A bot check stood where the page should be and did not clear.
-
-    The page is not content. Scraping it produced one message of challenge
-    text per night that looked like a source working (erobay, measured
-    2026-11-17 to 2026-11-23).
-    """
+STATES = ("ok", "low", "empty", "blocked", "deviated", "failed", "hung", "skipped")
 
 
 @dataclass
@@ -222,7 +216,8 @@ def _report(outcomes: dict[str, SourceOutcome], total_messages: int) -> None:
 
     attention = "; ".join(
         f"{state}: {', '.join(sorted(by_state[state]))}"
-        for state in ("blocked", "hung", "skipped", "failed", "low") if state in by_state
+        for state in ("blocked", "deviated", "hung", "skipped", "failed", "low")
+        if state in by_state
     )
     if attention:
         logger.warning("Web sources needing attention — %s", attention)
@@ -393,6 +388,10 @@ def fetch_web_sources(
                 logger.warning(
                     "%s: blocked by a bot check — it needs a person at the browser.", name,
                 )
+            except SourceDeviated as e:
+                state, detail = "deviated", str(e)[:300]
+                logger.warning("%s: not the page this source was written for — %s", name, e)
+                src_span.set_attribute("source.deviation", e.kind)
             except Exception as e:
                 state, detail = "failed", str(e)[:200]
                 logger.error("Failed %s (%s): %s", name, mode, e)
@@ -475,7 +474,10 @@ def fetch_web_sources(
         if is_bot_check(html):
             page.close()
             if native:
-                raise SourceBlocked("bot check did not clear in native Chrome")
+                raise SourceBlocked(
+                    "the source's page", "cloudflare_challenge",
+                    "bot check did not clear in native Chrome",
+                )
             logger.info("%s: Cloudflare — queuing for native Chrome retry.", name)
             cf_retries.append(src)
             return None

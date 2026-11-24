@@ -516,8 +516,10 @@ def test_do_instagram_walks_every_account_and_interleaves(monkeypatch):
 
 
 def test_do_instagram_stops_the_whole_source_at_a_login_wall(monkeypatch):
-    """One dead session should cost one profile load, not twenty."""
+    """One dead session should cost one profile load, not twenty — and it is
+    reported as the page deviating, not as a night with no posts."""
     from event_harvester.sources.web_modes import instagram as mode
+    from event_harvester.sources.web_utils import SourceDeviated
 
     monkeypatch.setattr(mode.time, "sleep", lambda _s: None)
     opened: list[str] = []
@@ -532,8 +534,22 @@ def test_do_instagram_stops_the_whole_source_at_a_login_wall(monkeypatch):
 
     page = WalledPage()
     src = {"url": "https://www.instagram.com/", "accounts": ["a1", "a2", "a3"]}
-    assert mode._do_instagram_inner(FakeUC(page), src, max_events=10) == []
+    with pytest.raises(SourceDeviated) as raised:
+        mode._do_instagram_inner(FakeUC(page), src, max_events=10)
+    assert raised.value.kind == "login_wall"
     assert len(opened) == 1
+
+
+def test_do_instagram_reports_silent_profiles_as_a_deviation(monkeypatch):
+    """Every account loading and none of them issuing a query is not a quiet
+    night. It ran that way for four nights logged as sixteen warnings each."""
+    from event_harvester.sources.web_modes import instagram as mode
+    from event_harvester.sources.web_utils import SourceDeviated
+
+    monkeypatch.setattr(mode.time, "sleep", lambda _s: None)
+    src = {"url": "https://www.instagram.com/", "accounts": ["a1", "a2"], "max_pages": 0}
+    with pytest.raises(SourceDeviated, match="2 account"):
+        mode._do_instagram_inner(FakeUC(ResponsePage({})), src, max_events=10)
 
 
 def test_fetch_web_sources_routes_instagram_before_the_page_open(monkeypatch):

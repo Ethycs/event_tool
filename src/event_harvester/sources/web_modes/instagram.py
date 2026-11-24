@@ -28,6 +28,7 @@ from event_harvester.sources.instagram import (
     harvest_account,
     harvest_home_feed,
 )
+from event_harvester.sources.web_utils import SourceDeviated
 
 logger = logging.getLogger("event_harvester.web_fetch")
 
@@ -150,6 +151,7 @@ def _do_instagram_inner(
 
     per_account: list[list[dict]] = []
     walked = 0
+    login_wall: InstagramLoginRequired | None = None
 
     if accounts:
         logger.info("Instagram: %d account(s), %d extra page(s) each.", len(accounts), max_pages)
@@ -172,6 +174,7 @@ def _do_instagram_inner(
                 "Instagram: %s Skipping %d remaining account(s).",
                 e, len(accounts) - walked,
             )
+            login_wall = e
             break
         except Exception as e:  # noqa: BLE001 — one bad account must not end the run
             logger.warning("Instagram: @%s failed: %s", account["handle"], e)
@@ -200,8 +203,24 @@ def _do_instagram_inner(
             )
         except InstagramLoginRequired as e:
             logger.error("Instagram: %s", e)
+            login_wall = login_wall or e
         except Exception as e:  # noqa: BLE001 — the account walk still counts
             logger.warning("Instagram: home feed failed: %s", e)
+
+    if not messages:
+        # This handler is a program for signed-in profile pages that issue
+        # GraphQL as they load. With nothing at all to show for the walk, the
+        # pages were not those pages. Sixteen accounts returning nothing was
+        # logged as sixteen warnings and reported as a quiet night (2026-11-20
+        # onward); it is one deviation.
+        if login_wall is not None:
+            raise SourceDeviated("signed-in Instagram pages", "login_wall", str(login_wall))
+        if walked:
+            raise SourceDeviated(
+                f"posts from {walked} account(s)", "unknown",
+                "no account returned a post or issued a query: signed out without "
+                "a login redirect, or the pages changed",
+            )
 
     harvested = sum(len(p) for p in per_account)
     if harvested > len(messages):

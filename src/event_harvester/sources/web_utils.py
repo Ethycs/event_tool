@@ -216,6 +216,55 @@ def _detect_mode(uc, page, src: dict) -> str:
     return "raw"
 
 
+# ── Deviation: the page is not the page a source was written for ─────
+
+class SourceDeviated(Exception):
+    """A source's page is not what its handler was written for.
+
+    Every handler here is a program for a known page: a Calcium grid, a
+    listing of dated links, a profile that issues GraphQL, a recorded route.
+    When the page stops being that, the handler is the one placed to notice,
+    at the point where its own expectation fails. It raises this and emits
+    nothing; it does not fall back to scraping whatever is there.
+
+    ``kind`` and ``evidence`` say what the page looks like instead. They come
+    from the rule layer of ``observability.hints`` (one ``page.evaluate``, no
+    vision call), which already names login walls, bot checks, error pages
+    and empty results.
+    """
+
+    def __init__(self, expected: str, kind: str = "unknown", evidence: str = ""):
+        self.expected = expected
+        self.kind = kind
+        self.evidence = evidence
+        looks = f"{kind} ({evidence})" if evidence else kind
+        super().__init__(f"expected {expected}; the page looks like: {looks}")
+
+
+class SourceBlocked(SourceDeviated):
+    """The deviation is a bot check: it needs a person at the browser."""
+
+
+def make_deviation(expected: str, kind: str = "unknown", evidence: str = "") -> SourceDeviated:
+    """A :class:`SourceDeviated`, or :class:`SourceBlocked` for a bot check."""
+    cls = SourceBlocked if kind == "cloudflare_challenge" else SourceDeviated
+    return cls(expected, kind, evidence)
+
+
+def page_deviation(page, expected: str) -> SourceDeviated:
+    """The deviation to raise for ``page``. Call it while the page is open."""
+    from event_harvester.observability.hints import diagnose
+
+    kind, evidence = "unknown", ""
+    try:
+        top = diagnose(page, use_vlm=False).top
+        if top is not None:
+            kind, evidence = top.kind, top.evidence
+    except Exception as e:  # noqa: BLE001 — a page that cannot be read still deviated
+        logger.debug("deviation diagnosis failed: %s", e)
+    return make_deviation(expected, kind, evidence)
+
+
 # ── Bot-check pages + scrolling ──────────────────────────────────────
 
 #: Text that marks a bot-check interstitial (Cloudflare's, in practice) served

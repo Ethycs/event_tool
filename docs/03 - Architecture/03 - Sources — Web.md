@@ -185,13 +185,29 @@ Every source ends a run in exactly one state, recorded as a `SourceOutcome`:
 | `low` | fewer messages than `expect_min_events` (any mode; it was a `steps`-only tripwire before) |
 | `empty` | ran cleanly and found nothing |
 | `blocked` | a bot check stood where the page should be and did not clear; it needs a person at the browser |
+| `deviated` | the page is not the page the source's handler was written for; `detail` says what was expected and what the page looks like instead |
 | `failed` | raised |
 | `hung` | ran past its deadline; its thread and browser were abandoned |
 | `skipped` | queued behind a hung source in the same browser, so it never ran |
 
 **The deadline.** Each group is a daemon thread (`_Group`), and `_await_groups` watches the source each one is on. A source that runs longer than `SOURCE_DEADLINE_S` (20 minutes; per source: `deadline_s`) is declared `hung`. The run stops waiting for that group, keeps every message the group had already produced, marks the sources behind it `skipped`, and returns. A thread cannot be killed, so the hung thread and its browser are left behind; if its call ever returns, the result is discarded and the thread closes its browser. The longest honest source measured took eleven minutes (about 350 detail pages).
 
-**The report.** `data/.web_source_report.json` holds the last 30 runs: per source its state, message count, seconds and a detail string. One `WARNING` line per run lists the sources that are `blocked`, `hung`, `skipped`, `failed` or `low`; one `INFO` line lists the `empty` ones. The run total (`Web sources: N messages from M sources.`) is unchanged, and is not a health signal: see `docs/08 - Analysis/03 - Nightly Harvest Health 2026-11.md`.
+**The report.** `data/.web_source_report.json` holds the last 30 runs: per source its state, message count, seconds and a detail string. One `WARNING` line per run lists the sources that are `blocked`, `deviated`, `hung`, `skipped`, `failed` or `low`; one `INFO` line lists the `empty` ones. The run total (`Web sources: N messages from M sources.`) is unchanged, and is not a health signal: see `docs/08 - Analysis/03 - Nightly Harvest Health 2026-11.md`.
+
+**Deviation is detected by the handler.** Every source here is a program for a known page, so the handler is the thing that knows what the page should be, and it checks at the point where its own expectation fails. It raises `SourceDeviated` (`web_utils.py`) and emits nothing; it does not fall back to scraping whatever is there. `page_deviation(page, expected)` fills in what the page looks like instead from the rule layer of `observability/hints.py` (one `page.evaluate`, no vision call), which already named login walls, bot checks, cookie banners, error pages and empty results but was reached only by step routes and explore sessions. A deviation whose diagnosis is a bot check is a `SourceBlocked`, reported as `blocked`.
+
+| Handler | What it was written for | When that fails |
+|---|---|---|
+| `calendar` | a Calcium grid, or a listing with at least 3 dated links | deviation, with the count found. *Before 2026-11-24:* one message of the page's raw text |
+| `instagram` | signed-in profile pages that issue GraphQL as they load | deviation of kind `login_wall` if a login wall was met, else a deviation saying no account returned a post. *Before:* `[]`, indistinguishable from a quiet night |
+| `search` | a page that answers a query with event links | deviation when the page showed no links at all, unless the page itself says the search matched nothing (`empty`). Links already held are not a deviation |
+| `steps` | its recorded route | deviation when the route broke and left nothing, carrying the route's own diagnosis. A partial walk that produced messages still returns them |
+| `chat` | a reply of at least 50 characters | deviation |
+| `raw`, `feed` | any text; any captured responses | no expectation, so nothing to deviate from. `badlands` (`raw`) has returned an expired-domain page every night and is still reported `ok` |
+
+Nothing here uses Universal Controller's `has_login_wall`: it tests a `blocking` key the engine never emits, so it has always returned false (`ext/universal_controller`, Engine Gaps roadmap). The two calls to it, in `search` and `chat`, were removed.
+
+*Measured 2026-11-24 against the live sites, in a fresh native Chrome:* `erobay` → `blocked`; `midway` → `deviated`, 2 dated links found, page looks like `cookie_banner`; `makerfaire` → `deviated`, 0 dated links, page looks like ordinary `content` (its URL is the site's home page, which lists no events); `stud` → `ok`, 44 messages. Those three were the only calendar sources to reach the raw-text fallback on any night from 2026-11-17 to 2026-11-23.
 
 `not implemented`: nothing tells a person that a source is `blocked`. A state that needs a human should park the tab in a long-lived, visible browser and notify; today the browser closes with its group. That is the Universal Controller service's job (`ext/universal_controller`, design in its own `docs/`).
 
@@ -337,15 +353,17 @@ Injected ads (`ad_id`/`is_ad`/`injected`) are dropped, and a `seen` set spans ev
 | `web_utils.py` `_fetch_event_details_parallel` | A detail page still shows a bot check after its 10 s wait | `None` for that link, and one warning with the count; the challenge text is not emitted as the event's detail |
 | `web_fetch.py` | Exception anywhere inside one source's processing | Caught per-source in `_run_source`; logged, OTel span records the exception, state `failed`, and the group continues to its next source — one bad source never aborts the whole run |
 | `web_modes/calendar.py` | Cloudflare still blocking after `_wait_cloudflare` | Page closed, `[]` returned (no retry queued from inside a mode handler — retry only happens for the *initial* page-open Cloudflare check in `fetch_web_sources` itself) |
+| `web_modes/calendar.py` | Fewer than 3 dated links and not a Calcium grid | `SourceDeviated` (or `SourceBlocked` if the page diagnoses as a bot check), no message. *Before 2026-11-24:* the page's raw text as one message |
 | `web_modes/feed.py` | `page` param passed in but feed needs interception from first load | Pre-opened page is closed and a fresh one opened via `open_with_intercept` — documented in the module docstring as "interface consistency" overhead |
 | `web_modes/feed.py` | Captured response body isn't valid JSON | Tried as one object, then line-by-line (`loads_multi`); a body that parses as neither yields no posts and is skipped |
-| `web_modes/instagram.py` | Login wall on any account | `InstagramLoginRequired` raised by `harvest_account`, caught by the mode, **whole source stops** — remaining accounts are not visited, and the log names the fix (`web login`) |
+| `web_modes/instagram.py` | Login wall on any account | `InstagramLoginRequired` raised by `harvest_account`, caught by the mode, **whole source stops** — remaining accounts are not visited, and the log names the fix (`web login`). If nothing was harvested, the mode then raises `SourceDeviated` of kind `login_wall` |
+| `web_modes/instagram.py` | Every account walked returned nothing | `SourceDeviated`: signed out without a login redirect, or the pages changed. *Measured:* this was the state on 2026-11-20, 21 and 23, logged as sixteen per-account warnings |
 | `web_modes/instagram.py` | One account fails (private, renamed, timeout) | Caught per-account, logged, the walk continues — a renamed venue must not cost the other sixteen |
 | `sources/instagram.py` | Replay returns non-200, non-JSON, or no cursor | Cursor is cleared *before* the request, so the loop ends rather than re-asking; the recorded first page is still returned. `paginate` returns the count of pages that actually landed |
 | `sources/instagram.py` | No GraphQL recorded at all for an account | Warns that the profile may be private, renamed, or served from cache — distinguishes "asked and got nothing" from "never asked" |
-| `web_modes/search.py` | Login wall detected (`uc.has_login_wall`) | Logged warning, page closed, `[]` returned immediately — no partial scrape attempted |
+| `web_modes/search.py` | The page showed no event links at all | `SourceDeviated` with the page's diagnosis, or `[]` when the page itself reports no results |
 | `web_modes/ics.py` | HTTP fetch fails (non-2xx, network error) or `Calendar.from_ical` raises | Logged, `[]` returned; **`anti-bot dependent`: N/A** — plain HTTP, no browser, so this mode is immune to Cloudflare/bot-detection failures that affect every other mode |
-| `web_modes/chat.py` | Login wall, or response `< 50` chars | `[]` returned with a warning; a *short but real* answer under 50 chars (e.g. "no events found") is indistinguishable from a failed/empty response — `fragile` |
+| `web_modes/chat.py` | Response `< 50` chars | `SourceDeviated` with the page's diagnosis; a *short but real* answer under 50 chars (e.g. "no events found") is still indistinguishable from a failed one — `fragile` |
 | `web_modes/steps.py` | `mode: "steps"` with no `steps` array | Warning, `[]` returned — never falls back to another mode, since guessing at a route is worse than declining to run one |
 | `web_modes/steps.py` | A step fails mid-route | Walk stops, partial links are still fetched and returned, and the failure is logged *with* a page diagnosis. `expect_min_events` (if set) warns separately when the yield drops |
 | `sources/web_explore.py` | Session cap reached | `RuntimeError` naming the open sessions — raised *before* a browser is launched |

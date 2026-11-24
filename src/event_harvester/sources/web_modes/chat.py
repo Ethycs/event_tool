@@ -11,6 +11,7 @@ import logging
 from datetime import datetime, timezone
 
 from event_harvester.observability.tracing import get_tracer
+from event_harvester.sources.web_utils import page_deviation
 
 logger = logging.getLogger("event_harvester.web_fetch")
 
@@ -47,17 +48,17 @@ def _do_chat_inner(uc, src: dict, tracer=None, capture=None) -> list[dict]:
     uc.dismiss_cookies(page)
     uc.close_modal(page)
 
-    if uc.has_login_wall(page):
-        logger.warning("%s: login wall — run --web-login first", name)
-        page.close()
-        return []
-
     response = uc.chat(page, query, timeout_s=timeout_s)
-    page.close()
 
     if not response or len(response) < 50:
-        logger.warning("%s: no usable response (%d chars)", name, len(response or ""))
-        return []
+        # A program for a page that answers a question. It did not: say what
+        # the page looks like instead (a sign-in, typically).
+        deviation = page_deviation(
+            page, f"a chat reply (got {len(response or '')} characters)",
+        )
+        page.close()
+        raise deviation
+    page.close()
 
     logger.info("%s: got %d chars response", name, len(response))
 

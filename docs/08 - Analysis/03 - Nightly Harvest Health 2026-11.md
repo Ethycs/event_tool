@@ -8,7 +8,7 @@
 2. `erobay` returned a Cloudflare challenge page as its only message on every night that finished.
 3. `instagram` went from 30 messages to 0 and stayed there, with no error.
 4. The nightly total did not move: 912 to 1021 messages on every night that finished. The total is not a health signal.
-5. Fixed on 2026-11-24 in `web_fetch.py`: a hung source now costs only its own browser group, and a challenge page is never emitted. Not fixed: `instagram`, the thin `raw` sources, and telling a person that a source needs them.
+5. Fixed on 2026-11-24: a hung source now costs only its own browser group; a challenge page is never emitted; and a handler whose page is not the page it was written for reports a deviation and emits nothing. Not fixed: the `raw` sources, which have no expectation to deviate from, and telling a person that a source needs them.
 
 ## 1. Conditions
 
@@ -66,14 +66,23 @@ The whole run was lost because `fetch_web_sources` waited on every group with no
 | One hung call discarded 49 finished sources | The unit of loss must be the source, or at worst its browser, never the run |
 | A challenge page became a message | A bot check is a state of the source, not content |
 | The challenge needs a click, and the wait is 15 seconds at about 06:00 UTC | The browser is meant to be reached by a person over KVM. A check that needs a person has to wait for one, in a browser that outlives the run, and the person has to be told |
+| Every junk message came out of a fallback | The handlers already knew what page they were written for: `calendar` looks for a Calcium marker or dated links, `instagram` for recorded queries. When that failed they fell back to scraping what was there. The knowledge to detect the deviation was already in the client; only the fallback hid it |
 
 ## 4. What changed on 2026-11-24
 
-`fetch_web_sources` now records one outcome per source, enforces a per-source deadline, and never emits a challenge page. Detail in `docs/03 - Architecture/03 - Sources — Web.md`, "Per-source outcomes and the deadline".
+`fetch_web_sources` now records one outcome per source, enforces a per-source deadline, and never emits a challenge page. Handlers raise `SourceDeviated` where their own expectation fails, with a diagnosis of what the page looks like instead. Detail in `docs/03 - Architecture/03 - Sources — Web.md`, "Per-source outcomes and the deadline".
 
-*Measured 2026-11-24 against the live sites, on the changed code run by hand:* `erobay` → `blocked` after 17 s, no message; `dnalounge` → `ok`, 65; `the-mix` → `ok`, 1. The hung case is covered by a test with a fake browser (`tests/test_web_fetch_outcomes.py`); it has not been observed live on the new code.
+*Measured 2026-11-24 against the live sites, on the changed code run by hand in a fresh native Chrome:*
 
-The service process still runs the old code until `event-harvester-mcp` is restarted.
+| Source | State | What the report said |
+|---|---|---|
+| `erobay` | `blocked` | bot check did not clear (17 s) |
+| `midway` | `deviated` | 2 dated links found; page looks like `cookie_banner`: a consent dialog is on top. Native Chrome loads no engine, so nothing dismisses it there |
+| `makerfaire` | `deviated` | 0 dated links; page looks like ordinary `content`. The source's URL is the site's home page |
+| `stud` | `ok` | 44 messages |
+| `dnalounge`, `the-mix` | `ok` | 65 and 1 |
+
+The hung case and the `instagram` deviation are covered by tests with fake pages (`tests/test_web_fetch_outcomes.py`, `tests/test_instagram.py`); neither has been observed live on the new code.
 
 ## 5. What was not measured
 

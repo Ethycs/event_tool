@@ -13,6 +13,7 @@ from event_harvester.sources.web_utils import (
     _filter_known_links,
     _save_link_fingerprint,
     _scroll_for_seconds,
+    page_deviation,
 )
 
 logger = logging.getLogger("event_harvester.web_fetch")
@@ -100,11 +101,6 @@ def _do_search_inner(uc, src: dict, timeout_ms: int, max_events: int, page=None,
     uc.detect_all(page)
     uc.dismiss_cookies(page)
     uc.close_modal(page)
-
-    if uc.has_login_wall(page):
-        logger.warning("%s: login wall — skipping", name)
-        page.close()
-        return []
 
     def _run_one_search(query: str) -> bool:
         """Type `query` into the page's search box and submit. Returns success."""
@@ -227,5 +223,15 @@ def _do_search_inner(uc, src: dict, timeout_ms: int, max_events: int, page=None,
                     "content": item_text[:5000],
                 })
 
+    if not messages and not collected:
+        # This handler is a program for a page that answers a query with
+        # event links. The page showed none at all (as opposed to links we
+        # already hold): say what it looks like instead, unless the page
+        # itself reports that the search matched nothing.
+        deviation = page_deviation(page, "search results with event links")
+        page.close()
+        if deviation.kind == "empty":
+            return []
+        raise deviation
     page.close()
     return messages

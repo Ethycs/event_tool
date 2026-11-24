@@ -202,3 +202,81 @@ def test_a_detail_page_still_showing_a_bot_check_yields_nothing(harness):
         results = _fetch_event_details_parallel(uc, [link], timeout_ms=1000)
 
     assert results == [(link, None)]
+
+
+# ── Deviation: the handler knows what page it was written for ─────────
+
+
+class SignalPage(FakePage):
+    """A page whose one diagnostic ``evaluate`` returns ``signals``."""
+
+    def __init__(self, signals: dict):
+        super().__init__("<html><body>not a listing</body></html>")
+        self.signals = signals
+
+    def evaluate(self, *_a, **_kw):
+        return self.signals
+
+    def wait_for_load_state(self, *_a, **_kw):
+        pass
+
+
+class Controls:
+    def detect_all(self, page):
+        return {}
+
+    def dismiss_cookies(self, page):
+        return False
+
+    def close_modal(self, page):
+        return False
+
+
+def _calendar(page, monkeypatch):
+    from event_harvester.sources.web_modes import calendar
+
+    monkeypatch.setattr(calendar, "_scroll_for_seconds", lambda *a, **k: None)
+    monkeypatch.setattr(calendar, "_extract_event_links", lambda page: [])
+    src = {"url": "https://venue.example/events", "name": "venue", "mode": "calendar"}
+    return calendar._do_calendar_inner(Controls(), src, 1000, 5, page=page)
+
+
+def test_a_calendar_page_without_a_listing_deviates_and_says_what_it_is(monkeypatch):
+    """It used to be scraped as raw text: one message, every night, of whatever
+    stood where the calendar should be."""
+    from event_harvester.sources.web_utils import SourceBlocked, SourceDeviated
+
+    page = SignalPage({"text_sample": "Welcome back", "text_len": 40, "links": 2,
+                       "password_inputs": 1})
+    with pytest.raises(SourceDeviated) as raised:
+        _calendar(page, monkeypatch)
+
+    assert not isinstance(raised.value, SourceBlocked)
+    assert raised.value.kind == "login_wall"
+    assert "found 0" in str(raised.value)
+    assert page.closed
+
+
+def test_a_calendar_page_showing_a_bot_check_is_blocked(monkeypatch):
+    from event_harvester.sources.web_utils import SourceBlocked
+
+    page = SignalPage({"text_sample": "Just a moment... verify you are human",
+                       "text_len": 60, "links": 0})
+    with pytest.raises(SourceBlocked):
+        _calendar(page, monkeypatch)
+
+
+def test_a_deviated_source_is_reported_and_emits_nothing(harness, monkeypatch):
+    from event_harvester.sources.web_utils import SourceDeviated
+
+    def calendar(uc, src, *a, **k):
+        raise SourceDeviated("a calendar listing", "login_wall", "a password input is present")
+
+    monkeypatch.setattr(web_fetch, "_do_calendar", calendar)
+    src = {"url": "https://venue.example/events", "name": "venue", "mode": "calendar"}
+
+    assert web_fetch.fetch_web_sources([src]) == []
+    run = json.loads(web_fetch._REPORT_FILE.read_text())["runs"][-1]
+    assert run["sources"]["venue"]["state"] == "deviated"
+    assert "login_wall" in run["sources"]["venue"]["detail"]
+    assert harness == []
