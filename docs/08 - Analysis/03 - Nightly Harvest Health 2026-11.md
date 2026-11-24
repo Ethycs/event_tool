@@ -90,14 +90,16 @@ The hung case and the `instagram` deviation are covered by tests with fake pages
 2. **Why `instagram` records nothing.** Signed out without a login redirect, a changed page, or a cached response would all log the same lines.
 3. **Nights before 2026-11-17.** The journal for this unit starts there.
 4. **Which call hangs.** See §2.
-5. **Whether `erobay` passes its check when a person clicks it.** No one was at the browser.
+5. ~~**Whether `erobay` passes its check when a person clicks it.**~~ It does. The owner cleared it over KVM at 2026-11-24 02:15:30 UTC (the `cf_clearance` cookie's creation time), and a run of the harvest path one minute later, attached to that browser, returned 273 upcoming events dated to 2027-04-28.
+6. **How long that clearance lasts.** The cookie expires in a year; the site decides when to challenge again. It is now being measured: see the access log in Verification.
 
 ## Verification
 
 ```bash
 journalctl -u event-harvester-mcp --since "-8 days" --no-pager \
-  | grep -E 'Web sources: [0-9]+ messages|-> failed|needing attention'
+  | grep -E 'Web sources: [0-9]+ messages|-> failed|needing attention|access state changed'
 jq '.runs[-1].sources | to_entries | map(select(.value.state != "ok")) | from_entries' data/.web_source_report.json
+jq -c 'select(.event == "change") | {at, source, was, state, held_min_h: ((.held_min_s // 0) / 3600 | floor), held_max_h: ((.held_max_s // 0) / 3600 | floor)}' data/.web_access_log.jsonl
 ```
 
-The first shows which nights finished and, once the service runs the new code, a `needing attention` line on any night a source was blocked, hung, skipped, failed or low. The second lists the sources of the last run that were not `ok`. A night with `-> failed` and no `needing attention` line before it means a hang somewhere the per-source deadline does not reach; start with the stage that logged last.
+The first shows which nights finished and, once the service runs the new code, a `needing attention` line on any night a source was blocked, deviated, hung, skipped, failed or low. The second lists the sources of the last run that were not `ok`. The third lists every change of state with how long the previous state held: the line where `erobay` goes from `ok` back to `blocked` bounds the lifetime of the clearance given at 02:15:30 on 2026-11-24. A night with `-> failed` and no `needing attention` line before it means a hang somewhere the per-source deadline does not reach; start with the stage that logged last.

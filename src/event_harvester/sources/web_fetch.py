@@ -27,7 +27,7 @@ from datetime import datetime, timedelta, timezone
 from functools import partial
 
 from event_harvester.observability.tracing import get_tracer
-from event_harvester.sources import web_checkpoint
+from event_harvester.sources import web_access_log, web_checkpoint
 from event_harvester.sources.web_modes.calendar import _do_calendar
 from event_harvester.sources.web_modes.chat import _do_chat
 from event_harvester.sources.web_modes.feed import _do_feed
@@ -149,6 +149,23 @@ class _Group:
             self.done.set()
 
 
+def _note(outcomes: dict[str, SourceOutcome], outcome: SourceOutcome) -> None:
+    """Keep ``outcome`` for the run report and put it in the access log.
+
+    Logged as it happens, not at the end of the run, so a run that is cut
+    short still leaves what it learned. A skipped source was not accessed, so
+    it is logged as a failure of the run without moving the source's state.
+    """
+    outcomes[outcome.name] = outcome
+    try:
+        web_access_log.record(
+            outcome.name, outcome.state, outcome.detail,
+            messages=outcome.messages, observed=outcome.state != "skipped",
+        )
+    except Exception as e:  # noqa: BLE001 — the log must not cost the harvest
+        logger.warning("Could not write the access log for %s: %s", outcome.name, e)
+
+
 def _await_groups(groups: list[_Group], outcomes: dict[str, SourceOutcome],
                   poll_s: float = 1.0) -> None:
     """Run ``groups`` to the end, giving up on one whose source has hung.
@@ -183,16 +200,17 @@ def _await_groups(groups: list[_Group], outcomes: dict[str, SourceOutcome],
             logger.error(
                 "%s: no result after %.0fs — giving up on it and on its browser.", name, ran,
             )
-            outcomes[name] = SourceOutcome(
+            _note(outcomes, SourceOutcome(
                 name, src.get("mode") or "auto", "hung", seconds=round(ran, 1),
                 detail=f"exceeded its {ran:.0f}s deadline",
-            )
+            ))
             for later in group.sources[group.sources.index(src) + 1:]:
                 later_name = later.get("name", later["url"])
-                outcomes.setdefault(later_name, SourceOutcome(
-                    later_name, later.get("mode") or "auto", "skipped",
-                    detail=f"queued behind {name}, which hung",
-                ))
+                if later_name not in outcomes:
+                    _note(outcomes, SourceOutcome(
+                        later_name, later.get("mode") or "auto", "skipped",
+                        detail=f"queued behind {name}, which hung",
+                    ))
         if pending:
             pending[0].done.wait(poll_s)
 
@@ -203,9 +221,10 @@ def _await_groups(groups: list[_Group], outcomes: dict[str, SourceOutcome],
         logger.error("Web group %s failed: %s", group.label, group.error)
         for src in group.sources:
             name = src.get("name", src["url"])
-            outcomes.setdefault(name, SourceOutcome(
-                name, src.get("mode") or "auto", "failed", detail=str(group.error)[:200],
-            ))
+            if name not in outcomes:
+                _note(outcomes, SourceOutcome(
+                    name, src.get("mode") or "auto", "failed", detail=str(group.error)[:200],
+                ))
 
 
 def _report(outcomes: dict[str, SourceOutcome], total_messages: int) -> None:
@@ -420,10 +439,10 @@ def fetch_web_sources(
                 # report and the messages cannot disagree about it.
                 return
             group.messages.extend(msgs)
-            if state != "deferred":
-                outcomes[name] = SourceOutcome(
-                    name, mode, state, len(msgs), round(time.monotonic() - started, 1), detail,
-                )
+        if state != "deferred":
+            _note(outcomes, SourceOutcome(
+                name, mode, state, len(msgs), round(time.monotonic() - started, 1), detail,
+            ))
         if msgs:
             _save_cooldown(src["url"])
         if state in ("ok", "low", "empty"):

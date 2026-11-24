@@ -109,6 +109,21 @@ def test_a_bot_check_in_native_chrome_is_blocked_not_scraped(harness):
     assert harness == []  # a blocked source must not start its cooldown
 
 
+def test_a_harvest_logs_the_change_in_a_sources_access_state(harness):
+    """Blocked one night, cleared by the next run: both changes are on record,
+    and the second says how long the block had held."""
+    from event_harvester.sources import web_access_log
+
+    FakeController.html_for = staticmethod(lambda kwargs: CHALLENGE)
+    web_fetch.fetch_web_sources([_raw("erobay", native_chrome=True)])
+    FakeController.html_for = staticmethod(lambda kwargs: CONTENT)
+    web_fetch.fetch_web_sources([_raw("erobay", native_chrome=True)])
+
+    lines = [json.loads(line) for line in web_access_log.LOG_FILE.read_text().splitlines()]
+    assert [(line["was"], line["state"]) for line in lines] == [(None, "blocked"), ("blocked", "ok")]
+    assert lines[1]["held_max_s"] is not None
+
+
 def test_a_standard_bot_check_goes_to_native_and_its_final_state_is_reported(harness):
     """Cleared on the retry: one message, state ok, and two launches to get it."""
     FakeController.html_for = staticmethod(

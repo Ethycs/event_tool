@@ -194,6 +194,15 @@ Every source ends a run in exactly one state, recorded as a `SourceOutcome`:
 
 **The report.** `data/.web_source_report.json` holds the last 30 runs: per source its state, message count, seconds and a detail string. One `WARNING` line per run lists the sources that are `blocked`, `deviated`, `hung`, `skipped`, `failed` or `low`; one `INFO` line lists the `empty` ones. The run total (`Web sources: N messages from M sources.`) is unchanged, and is not a health signal: see `docs/08 - Analysis/03 - Nightly Harvest Health 2026-11.md`.
 
+**The access log** (`sources/web_access_log.py`, 2026-11-24). Some things about a source cannot be read off it and can only be observed: how long a passed bot check lasts is the case that prompted this (the clearance cookie says a year; the site decides). So every outcome is compared with that source's last one as it happens, in the client, and appended to `data/.web_access_log.jsonl`:
+
+| Line | Written when | Carries |
+|---|---|---|
+| `change` | the state differs from last time | `was`, `was_since`, and how long the old state held as two bounds: `held_min_s` (it was last *seen* in the old state that long after it began) and `held_max_s` (it had changed by now). The gap between them is how often we looked |
+| `fail` | the state is a failing one and has not changed | `since`, `detail`. One line per access, so a source that fails nightly leaves a line nightly |
+
+`data/.web_access_state.json` holds each source's current state, when it began and when it was last seen. A `skipped` source is logged as a `fail` without moving its state: nothing was learned about the site. A change also logs one `WARNING` (`access state changed ok → blocked (was ok for between 4h50m and 28h50m)`). Observations made outside a harvest (a check a person cleared at the browser) are entered with `web_access_log.record(..., at=...)`; the first entries, for `erobay` and `instagram`, were read back from the service journal and say so in `detail`. With one harvest a night the bounds are a day apart; nothing probes between runs.
+
 **Deviation is detected by the handler.** Every source here is a program for a known page, so the handler is the thing that knows what the page should be, and it checks at the point where its own expectation fails. It raises `SourceDeviated` (`web_utils.py`) and emits nothing; it does not fall back to scraping whatever is there. `page_deviation(page, expected)` fills in what the page looks like instead from the rule layer of `observability/hints.py` (one `page.evaluate`, no vision call), which already named login walls, bot checks, cookie banners, error pages and empty results but was reached only by step routes and explore sessions. A deviation whose diagnosis is a bot check is a `SourceBlocked`, reported as `blocked`.
 
 | Handler | What it was written for | When that fails |

@@ -51,6 +51,20 @@ def _isolate_web_source_report(tmp_path, monkeypatch):
     monkeypatch.setattr(web_fetch, "_REPORT_FILE", tmp_path / ".web_source_report.json")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_web_access_log(tmp_path, monkeypatch):
+    """No test may write the real access log or move a source's recorded state.
+
+    The log is how the length of a passed bot check gets measured; a test run
+    that flipped `erobay` to `blocked` and back would be read as an
+    observation of the site.
+    """
+    from event_harvester.sources import web_access_log
+
+    monkeypatch.setattr(web_access_log, "LOG_FILE", tmp_path / ".web_access_log.jsonl")
+    monkeypatch.setattr(web_access_log, "STATE_FILE", tmp_path / ".web_access_state.json")
+
+
 @pytest.fixture
 def sample_messages():
     """A set of sample messages from both platforms."""
