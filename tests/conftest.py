@@ -38,6 +38,19 @@ def _isolate_extraction_cache(tmp_path, monkeypatch):
                         tmp_path / ".extraction_cache.json")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_web_source_report(tmp_path, monkeypatch):
+    """No test may append to the real per-source run report.
+
+    `fetch_web_sources` writes `data/.web_source_report.json` at the end of
+    every run, and several tests call it with fakes. Left alone, a test run
+    would land in the history a person reads to see which sources are failing.
+    """
+    from event_harvester.sources import web_fetch
+
+    monkeypatch.setattr(web_fetch, "_REPORT_FILE", tmp_path / ".web_source_report.json")
+
+
 @pytest.fixture
 def sample_messages():
     """A set of sample messages from both platforms."""

@@ -1,11 +1,7 @@
 """ICS mode: fetch an iCalendar feed over HTTP(S) and emit one message per VEVENT.
 
-Contract-compatible with the other ``web_modes`` handlers (accepts
-``uc``, ``page``, ``tracer``, ``capture``) even though it doesn't need
-a browser -- ``uc`` and ``page`` are unused.  The outer dispatch in
-``web_fetch.py`` still spawns a browser for the source; treat that as
-~1s of wasted setup per ICS source until we refactor to skip browser
-allocation for browser-free modes.
+Read over plain HTTP: no browser is involved, and the handler takes none.
+``web_fetch.HTTP_MODES`` routes it, outside every browser group.
 
 Accepted schemes: ``webcal://``, ``webcals://``, ``http://``, ``https://``.
 The ``webcal(s)://`` prefixes are normalized to ``https://`` (RFC 5545
@@ -43,7 +39,7 @@ _NOISE_SUMMARIES = frozenset({
 _DEFAULT_FORWARD_DAYS = 90
 
 
-def _do_ics(uc, src: dict, page=None, tracer=None, capture=None) -> list[dict]:
+def _do_ics(src: dict, tracer=None, capture=None) -> list[dict]:
     """ICS mode (OTel-wrapped).  Body in :func:`_do_ics_inner`."""
     name = src.get("name", "ics")
     mode = "ics"

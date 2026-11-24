@@ -216,7 +216,36 @@ def _detect_mode(uc, page, src: dict) -> str:
     return "raw"
 
 
-# ── Cloudflare wait + scrolling ──────────────────────────────────────
+# ── Bot-check pages + scrolling ──────────────────────────────────────
+
+#: Text that marks a bot-check interstitial (Cloudflare's, in practice) served
+#: in place of the page that was asked for.
+_BOT_CHECK_MARKERS = ("just a moment", "security verification")
+
+
+def is_bot_check(html: str) -> bool:
+    """True when ``html`` is a bot-check interstitial, not the requested page."""
+    lowered = html.lower()
+    return any(marker in lowered for marker in _BOT_CHECK_MARKERS)
+
+
+def _poll_bot_check(page, html: str, *, seconds: int, settle_ms: int) -> str:
+    """Re-read ``page`` once a second until its bot check is gone.
+
+    Returns the settled HTML, or the last HTML read if the check never clears;
+    the caller tells the two apart with :func:`is_bot_check`.
+    """
+    for _ in range(seconds):
+        page.wait_for_timeout(1000)
+        try:
+            html = page.content()
+        except Exception:
+            continue
+        if not is_bot_check(html):
+            page.wait_for_timeout(settle_ms)
+            return page.content()
+    return html
+
 
 def _wait_cloudflare(page, headless: bool = True) -> str:
     """Wait for Cloudflare challenge to resolve. Returns page HTML."""
@@ -234,22 +263,15 @@ def _wait_cloudflare(page, headless: bool = True) -> str:
             page.wait_for_timeout(1000)
     if html is None:
         html = page.content()  # final attempt, let it raise
-    if "just a moment" not in html.lower() and "security verification" not in html.lower():
+    if not is_bot_check(html):
         return html
     if headless:
         logger.warning("Cloudflare challenge (headless can't solve). Skipping.")
         return html
     print("  Cloudflare captcha — click it in the browser window (15s timeout)...")
-    for _ in range(15):
-        page.wait_for_timeout(1000)
-        try:
-            html = page.content()
-        except Exception:
-            continue
-        if "just a moment" not in html.lower():
-            page.wait_for_timeout(3000)
-            return page.content()
-    logger.warning("Cloudflare did not resolve in 15s. Skipping.")
+    html = _poll_bot_check(page, html, seconds=15, settle_ms=3000)
+    if is_bot_check(html):
+        logger.warning("Cloudflare did not resolve in 15s. Skipping.")
     return html
 
 
@@ -570,73 +592,50 @@ def _is_dead_page(html: str) -> bool:
     return bool(_DEAD_PAGE_RE.search(text[:3000]))
 
 
-# ── Detail page fetch (one + parallel) ───────────────────────────────
+# ── Detail page fetch ────────────────────────────────────────────────
 
-def _fetch_event_detail(context, stealth, url: str, timeout_ms: int) -> str | None:
-    """Fetch a single event detail page.
+def _detail_text(html: str) -> str | None:
+    """What a detail page says about its event.
 
     Tries schema.org JSON-LD first (structured, no LLM needed).
     Falls back to text extraction.
     """
+    structured = _extract_structured_data(html)
+    if structured:
+        parts = [structured["title"]]
+        if structured["date"]:
+            parts.append(f"date: {structured['date']}")
+        if structured["time"]:
+            parts.append(f"time: {structured['time']}")
+        if structured["location"]:
+            parts.append(f"location: {structured['location']}")
+        if structured["link"]:
+            parts.append(f"link: {structured['link']}")
+        if structured["details"]:
+            parts.append(structured["details"])
+        return "\n".join(parts)
+    text = _extract_text(html)
+    return text if len(text) > 50 else None
+
+
+def _close_quietly(page) -> None:
     try:
-        page = context.new_page()
-        if stealth:
-            stealth.apply_stealth_sync(page)
-        page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
-        page.wait_for_timeout(1500)
-
-        # Wait for Cloudflare challenge if present
-        html = page.content()
-        if "just a moment" in html.lower():
-            for _ in range(15):
-                page.wait_for_timeout(1000)
-                try:
-                    html = page.content()
-                except Exception:
-                    continue
-                if "just a moment" not in html.lower():
-                    page.wait_for_timeout(1000)
-                    html = page.content()
-                    break
-
         page.close()
-
-        # Detect dead/deleted/cancelled pages
-        if _is_dead_page(html):
-            logger.info("Dead page (deleted/cancelled/not found): %s", url[:80])
-            return None
-
-        # Try structured data first
-        structured = _extract_structured_data(html)
-        if structured:
-            parts = [structured["title"]]
-            if structured["date"]:
-                parts.append(f"date: {structured['date']}")
-            if structured["time"]:
-                parts.append(f"time: {structured['time']}")
-            if structured["location"]:
-                parts.append(f"location: {structured['location']}")
-            if structured["link"]:
-                parts.append(f"link: {structured['link']}")
-            if structured["details"]:
-                parts.append(structured["details"])
-            return "\n".join(parts)
-
-        # Fallback to text extraction
-        text = _extract_text(html)
-        return text if len(text) > 50 else None
     except Exception:
-        return None
+        pass
 
 
 def _fetch_event_details_parallel(
-    context, stealth, links: list[dict], timeout_ms: int, max_workers: int = 5,
+    uc, links: list[dict], timeout_ms: int, max_workers: int = 5,
 ) -> list[tuple[dict, str | None]]:
     """Fetch multiple event detail pages in parallel.
 
-    Opens up to max_workers tabs simultaneously. Returns list of
-    (link_dict, text_or_none) tuples.
+    Opens up to max_workers tabs simultaneously through ``uc.new_page()``.
+    Returns list of (link_dict, text_or_none) tuples. Every tab opened here is
+    closed here, whether or not its page loaded. A page still showing a bot
+    check after its wait yields ``None``: the challenge text is not the event.
     """
+    blocked = 0
     results: list[tuple[dict, str | None]] = []
 
     # Process in batches to avoid too many open tabs
@@ -646,14 +645,15 @@ def _fetch_event_details_parallel(
 
         # Open all tabs in this batch
         for lnk in batch:
+            page = None
             try:
-                page = context.new_page()
-                if stealth:
-                    stealth.apply_stealth_sync(page)
+                page = uc.new_page()
                 page.goto(lnk["url"], timeout=timeout_ms, wait_until="domcontentloaded")
-                pages.append((lnk, page))
             except Exception:
-                pages.append((lnk, None))
+                if page is not None:
+                    _close_quietly(page)
+                page = None
+            pages.append((lnk, page))
 
         # Wait for all to settle, then collect
         for lnk, page in pages:
@@ -662,46 +662,19 @@ def _fetch_event_details_parallel(
                 continue
             try:
                 page.wait_for_timeout(1500)
-
                 html = page.content()
-                # Cloudflare wait
-                if "just a moment" in html.lower():
-                    for _ in range(10):
-                        page.wait_for_timeout(1000)
-                        try:
-                            html = page.content()
-                        except Exception:
-                            continue
-                        if "just a moment" not in html.lower():
-                            page.wait_for_timeout(1000)
-                            html = page.content()
-                            break
-
-                page.close()
-
-                # Try structured data first
-                structured = _extract_structured_data(html)
-                if structured:
-                    parts = [structured["title"]]
-                    if structured["date"]:
-                        parts.append(f"date: {structured['date']}")
-                    if structured["time"]:
-                        parts.append(f"time: {structured['time']}")
-                    if structured["location"]:
-                        parts.append(f"location: {structured['location']}")
-                    if structured["link"]:
-                        parts.append(f"link: {structured['link']}")
-                    if structured["details"]:
-                        parts.append(structured["details"])
-                    results.append((lnk, "\n".join(parts)))
+                if is_bot_check(html):
+                    html = _poll_bot_check(page, html, seconds=10, settle_ms=1000)
+                if is_bot_check(html):
+                    blocked += 1
+                    results.append((lnk, None))
                 else:
-                    text = _extract_text(html)
-                    results.append((lnk, text if len(text) > 50 else None))
+                    results.append((lnk, _detail_text(html)))
             except Exception:
-                try:
-                    page.close()
-                except Exception:
-                    pass
                 results.append((lnk, None))
+            finally:
+                _close_quietly(page)
 
+    if blocked:
+        logger.warning("%d of %d detail page(s) blocked by a bot check.", blocked, len(links))
     return results

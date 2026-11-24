@@ -443,7 +443,7 @@ def _web_replay(args, cfg) -> int:
     messages"; this reports which step stopped producing and what the page
     looked like when it did.
     """
-    from event_harvester.sources.uc_browser import UCBrowser
+    from event_harvester.sources.uc_browser import WebBrowser
     from event_harvester.sources.web_fetch import _load_web_sources
     from event_harvester.sources.web_steps import replay, validate_steps
 
@@ -468,7 +468,7 @@ def _web_replay(args, cfg) -> int:
     print(f"\n{BOLD}Replaying {args.name}{RESET} {DIM}({len(steps)} steps){RESET}\n")
     cfg_llm = cfg.llm if getattr(args, "diagnose", False) else None
 
-    with UCBrowser(native_chrome=bool(src.get("native_chrome"))) as uc:
+    with WebBrowser(native_chrome=bool(src.get("native_chrome"))) as uc:
         page = uc.open(src["url"], source_name=args.name)
         result = replay(uc, page, steps, cfg_llm=cfg_llm)
         for step_result in result.results:
@@ -567,22 +567,23 @@ def _run_url_diagnostics(url: str) -> dict:
     if _is_ics_url(url):
         return {"mode": _diagnose_ics(url), "event_links": 0, "feed_items": 0}
 
-    from event_harvester.sources.uc_browser import UCBrowser
-    from event_harvester.sources.web_fetch import (
+    from event_harvester.sources.uc_browser import WebBrowser
+    from event_harvester.sources.web_utils import (
         _extract_event_links,
         _extract_text,
         _wait_cloudflare,
+        is_bot_check,
     )
 
     result = {"mode": None, "event_links": 0, "feed_items": 0}
 
     def _do_diagnostics():
-        with UCBrowser() as uc:
+        with WebBrowser() as uc:
             print(f"  Testing: {url}\n")
             page = uc.open(url, wait_ms=3000)
             html = _wait_cloudflare(page, headless=False)
 
-            if "just a moment" in html.lower():
+            if is_bot_check(html):
                 print(f"  {RED}BLOCKED{RESET} — Cloudflare challenge not resolved.")
                 print("  Recommendation: use native_chrome=True\n")
                 page.close()

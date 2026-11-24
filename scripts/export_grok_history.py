@@ -30,7 +30,7 @@ import time
 from pathlib import Path
 from urllib.parse import quote
 
-from uc_browser import BrowserMode, UCBrowser
+from event_harvester.sources.uc_browser import BrowserMode, WebBrowser
 
 API = "https://grok.com/rest/app-chat"
 PAGE_SIZE = 60
@@ -119,8 +119,8 @@ def main() -> int:
     (out / "json").mkdir(parents=True, exist_ok=True)
     (out / "md").mkdir(parents=True, exist_ok=True)
 
-    with UCBrowser(mode=BrowserMode.CHROMIUM_EXT) as uc:
-        page = uc._context.new_page()
+    with WebBrowser(mode=BrowserMode.CHROMIUM_EXT) as uc:
+        page = uc.new_page()
         page.goto("https://grok.com/", wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(4000)
 

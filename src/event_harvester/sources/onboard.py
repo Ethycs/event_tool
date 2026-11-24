@@ -55,6 +55,7 @@ from event_harvester.sources.web_utils import (
     _DECIMATE_DATE_RE,
     _DECIMATE_TIME_RE,
     _extract_text,
+    is_bot_check,
 )
 from event_harvester.utils import data_path, load_json, save_json
 
@@ -338,7 +339,7 @@ def measure(url: str, html: str, ev: PageEvidence | None = None) -> PageEvidence
     ev.chars = len(text)
     ev.date_tokens = len(_DECIMATE_DATE_RE.findall(text))
     ev.time_tokens = len(_DECIMATE_TIME_RE.findall(text))
-    ev.blocked = "just a moment" in html[:4000].lower()
+    ev.blocked = is_bot_check(html[:4000])
 
     hrefs = _ANCHOR_RE.findall(html)
     ev.total_links = len(hrefs)

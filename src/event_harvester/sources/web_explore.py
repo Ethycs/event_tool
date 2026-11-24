@@ -143,7 +143,7 @@ def open_session(url: str, *, native_chrome: bool = False, wait_ms: int = 2500) 
     without any further action still replays to the right page — which is
     exactly the erobay case, and the reason that case looked "crystallised".
     """
-    from event_harvester.sources.uc_browser import UCBrowser
+    from event_harvester.sources.uc_browser import WebBrowser
 
     with _LOCK:
         _reap_idle()
@@ -156,15 +156,15 @@ def open_session(url: str, *, native_chrome: bool = False, wait_ms: int = 2500) 
             )
         session_id = secrets.token_hex(3)
 
-        uc = UCBrowser(native_chrome=native_chrome)
-        uc.__enter__()
+        uc = WebBrowser(native_chrome=native_chrome)
         try:
+            uc.start()
             page = uc.open(url, source_name=f"explore-{session_id}")
             if wait_ms:
                 page.wait_for_timeout(wait_ms)
         except Exception:
             try:
-                uc.__exit__(None, None, None)
+                uc.close()
             except Exception as e:  # noqa: BLE001
                 logger.debug("explore: teardown after failed open: %s", e)
             raise

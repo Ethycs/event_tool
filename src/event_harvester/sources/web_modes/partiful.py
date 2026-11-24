@@ -136,7 +136,7 @@ def _message(event: dict, name: str, city: str) -> dict | None:
     }
 
 
-def _do_partiful_inner(uc, src: dict, now: datetime | None = None) -> list[dict]:
+def _do_partiful_inner(src: dict, now: datetime | None = None) -> list[dict]:
     name = src.get("name", "partiful")
     city = str(src.get("city", DEFAULT_CITY))
     timeout = int(src.get("timeout_s", 20))
@@ -185,10 +185,10 @@ def _do_partiful_inner(uc, src: dict, now: datetime | None = None) -> list[dict]
     return messages
 
 
-def _do_partiful(uc, src: dict, tracer=None, capture=None, **_) -> list[dict]:
+def _do_partiful(src: dict, tracer=None, capture=None) -> list[dict]:
     with get_tracer(_TRACER).start_as_current_span("web.partiful") as span:
         span.set_attribute("source.name", src.get("name", "partiful"))
         span.set_attribute("source.city", str(src.get("city", DEFAULT_CITY)))
-        msgs = _do_partiful_inner(uc, src)
+        msgs = _do_partiful_inner(src)
         span.set_attribute("message.count", len(msgs))
         return msgs

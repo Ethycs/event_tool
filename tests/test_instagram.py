@@ -66,19 +66,13 @@ class FakePage:
         self.closed = True
 
 
-class FakeContext:
+class FakeUC:
     def __init__(self, page):
         self._page = page
+        self.timeout_ms = 30000
 
     def new_page(self):
         return self._page
-
-
-class FakeUC:
-    def __init__(self, page):
-        self._context = FakeContext(page)
-        self._stealth_plugin = None
-        self.timeout_ms = 30000
 
 
 def _query(**overrides) -> ig.GraphQLQuery:

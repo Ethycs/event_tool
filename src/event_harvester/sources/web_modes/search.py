@@ -201,9 +201,7 @@ def _do_search_inner(uc, src: dict, timeout_ms: int, max_events: int, page=None,
 
     if event_links:
         logger.info("%s: %d event links, fetching in parallel...", name, len(event_links))
-        results = _fetch_event_details_parallel(
-            uc._context, uc._stealth_plugin, event_links, timeout_ms,
-        )
+        results = _fetch_event_details_parallel(uc, event_links, timeout_ms)
         for lnk, text in results:
             if text:
                 _save_link_fingerprint(lnk)

@@ -144,9 +144,7 @@ def _do_feed_inner(uc, src: dict, max_events: int = 30, page=None, tracer=None, 
         if event_links:
             fetch_links = [l for l in event_links[:max_events] if not l.get("inline")]
             logger.info("%s: %d new event links, fetching in parallel...", name, len(fetch_links))
-            results = _fetch_event_details_parallel(
-                uc._context, uc._stealth_plugin, fetch_links, uc.timeout_ms,
-            )
+            results = _fetch_event_details_parallel(uc, fetch_links, uc.timeout_ms)
             for lnk, text in results:
                 if text:
                     _save_link_fingerprint(lnk)

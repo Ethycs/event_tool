@@ -663,12 +663,7 @@ def _open_recorded(uc, url: str, *, wait_ms: int, label: str, tracer=None, captu
     there is no interesting intermediate state, just "we asked, this is what
     the profile looked like".
     """
-    page = uc._context.new_page()
-    if getattr(uc, "_stealth_plugin", None):
-        try:
-            uc._stealth_plugin.apply_stealth_sync(page)
-        except Exception as e:  # noqa: BLE001 — stealth is best-effort
-            logger.debug("instagram: stealth failed for %s: %s", label, e)
+    page = uc.new_page()
 
     recorder = QueryRecorder().attach(page)
     page.goto(url, timeout=uc.timeout_ms, wait_until="domcontentloaded")

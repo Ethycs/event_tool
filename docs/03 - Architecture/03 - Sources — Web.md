@@ -1,6 +1,6 @@
 # Sources — Web
 
-**Status:** CURRENT · **Date:** 2026-08-06 (added `instagram.py` + `mode: "instagram"`) · **Applies to:** `src/event_harvester/sources/web_fetch.py`, `uc_browser.py`, `web_session.py`, `web_utils.py`, `feed_probe.py`, `instagram.py`, `web_steps.py`, `web_explore.py`, `src/event_harvester/sources/web_modes/{__init__,calendar,feed,search,raw,ics,chat,steps,instagram}.py`, `src/event_harvester/web_primitives.py`, `src/event_harvester/observability/hints.py`, `data/web_sources.json`, `ext/helpers/extract_event_links.js` · **Depends on:** `docs/04 - Reference/Universal Controller Guide.md`
+**Status:** CURRENT · **Date:** 2026-11-23 (browser access consolidated in `uc_browser.WebBrowser`; before that 2026-08-06, `instagram.py` + `mode: "instagram"`) · **Applies to:** `src/event_harvester/sources/web_fetch.py`, `uc_browser.py`, `web_session.py`, `web_utils.py`, `feed_probe.py`, `instagram.py`, `web_steps.py`, `web_explore.py`, `src/event_harvester/sources/web_modes/{__init__,calendar,feed,search,raw,ics,chat,steps,instagram}.py`, `src/event_harvester/web_primitives.py`, `src/event_harvester/observability/hints.py`, `data/web_sources.json`, `ext/helpers/extract_event_links.js` · **Depends on:** `docs/04 - Reference/Universal Controller Guide.md`
 
 The web fetch path turns `data/web_sources.json` into a list of message dicts by driving one or more headed Chromium/Chrome instances through Universal Controller (UC), routing each source through a mode-specific handler in `web_modes/`. `web_fetch.fetch_web_sources` is the sole entry point: it splits sources into a parallel pool of "standard" browsers plus one serial pool for `native_chrome` (Cloudflare) sources, and retries Cloudflare-blocked standard sources through native Chrome afterward. Everything downstream (`pipeline/harvest.py`) treats the return value as a flat `list[dict]` of chat-shaped messages, regardless of which mode produced them.
 
@@ -159,18 +159,41 @@ Auto-mode detection (`web_utils.py:_detect_mode`) order: ICS URL shortcut → `_
 
 **Undocumented-mode finding:** `ics` doesn't need a browser at all, but `fetch_web_sources`'s outer dispatch still enters the `_process_group`/`UCBrowser` context and iterates the source inside it — the `ics.py` module docstring itself flags this: "~1s of wasted setup per ICS source until we refactor to skip browser allocation for browser-free modes" (`ics.py:8`). `chat` sources are dispatched the same way — before the page-open branch — so they also skip the shared `_wait_cloudflare`/auto-detect path, but unlike `ics` they still open a page via `uc.open(...)` inside `_do_chat`. `instagram` (2026-08-06) joins that group for a third reason: it opens one page *per account* with a recorder attached before navigation, so a shared pre-opened page would be a page it immediately closes — which is exactly what `feed` mode still does and documents as interface-consistency overhead.
 
+**The wasted browser is gone as of 2026-11-23, by routing.** `web_fetch.HTTP_MODES` names the modes read over plain HTTP (`ics`, `rss`, `luma`, `partiful`). `fetch_web_sources` routes those sources to the `http` group (`_http_work`), which holds no browser, and their handlers no longer take a `uc` argument. The technique a mode uses is stated in that table; it is not inferred from whether a handler happened to touch the browser. *Measured 2026-11-23:* a run of `dnalounge`, `bottom-of-the-hill`, `luma` and `partiful` produced 179 messages with no `WebBrowser` constructed; `the-mix` (`raw`), `stud` (`calendar`) and `dnalounge` together produced 70 messages and one launch.
+
 ## Parallel-fetch model and why native-chrome stays serial
 
-`fetch_web_sources` (`web_fetch.py:85-317`):
+`fetch_web_sources` (`web_fetch.py`):
 
 1. Load sources (explicit list or `data/web_sources.json` via `_load_web_sources`).
 2. Drop sources on cooldown (`_is_on_cooldown`), unless `no_cooldown=True`.
-3. Split into `standard_srcs` (no `native_chrome` flag) and `native_srcs` (`native_chrome: true`).
+3. **Route by access technique.** `http_srcs` are the sources whose mode is in `HTTP_MODES`. The rest are browser sources, split into `standard_srcs` (no `native_chrome` flag) and `native_srcs` (`native_chrome: true`).
 4. `_chunk_sources(standard_srcs, parallel)` round-robins standard sources into up to `parallel` chunks (empty chunks dropped) — round-robin exists specifically so slow feed/calendar sources don't all land on one worker.
-5. A `ThreadPoolExecutor` runs one `_process_group` call per chunk, **plus one more** for the native group if non-empty — so total workers = `len(standard_chunks) + (1 if native_srcs else 0)`.
-6. Each `_process_group` opens exactly **one `UCBrowser`** (one Playwright instance, one Chromium/Chrome process) and iterates its sources **serially** inside that `with UCBrowser(...) as uc:` block.
-7. Any standard-group source that hits a Cloudflare "just a moment" page (and isn't already running with `native_chrome=True`) is queued into `cf_retries` instead of failing — closed without processing.
-8. After all parallel groups finish, `cf_retries` (deduplicated per group, then flattened) are retried **once**, serially, in a fresh `native_chrome=True` `_process_group` call.
+5. Each group runs in its own daemon thread (`_Group`): one `_browser_work` group per chunk, one more for the native group if non-empty, and one `_http_work` group if there are HTTP sources. Every source, of either kind, runs through `_run_source`: its span, its trace pair, its error boundary, its cooldown write, its recorded outcome.
+6. Each `_browser_work` group holds exactly **one `WebBrowser`** (one Playwright instance, one Chromium/Chrome process, launched on entering the `with` block) and iterates its sources **serially**. Inside it, `chat` and `instagram` open their own pages; every other mode shares one page-open and bot-check wait. After each source, in a `finally`, `uc.close_pages()` closes any tab the mode left open.
+7. Any standard-group source whose page is still a bot check after `_wait_cloudflare` (`web_utils.is_bot_check`) is queued into `cf_retries` instead of failing — closed without processing. In a native-Chrome group there is nowhere further to go: the source raises `SourceBlocked` and is recorded as `blocked`. The challenge page is never scraped.
+8. After all parallel groups finish, `cf_retries` (deduplicated per group, then flattened) are retried **once**, serially, in a fresh `native_chrome=True` group.
+9. `_report` logs the sources needing attention and appends the run to `data/.web_source_report.json`.
+
+### Per-source outcomes and the deadline (2026-11-24)
+
+Every source ends a run in exactly one state, recorded as a `SourceOutcome`:
+
+| State | Meaning |
+|---|---|
+| `ok` | at least one message, and at least `expect_min_events` if the source sets it |
+| `low` | fewer messages than `expect_min_events` (any mode; it was a `steps`-only tripwire before) |
+| `empty` | ran cleanly and found nothing |
+| `blocked` | a bot check stood where the page should be and did not clear; it needs a person at the browser |
+| `failed` | raised |
+| `hung` | ran past its deadline; its thread and browser were abandoned |
+| `skipped` | queued behind a hung source in the same browser, so it never ran |
+
+**The deadline.** Each group is a daemon thread (`_Group`), and `_await_groups` watches the source each one is on. A source that runs longer than `SOURCE_DEADLINE_S` (20 minutes; per source: `deadline_s`) is declared `hung`. The run stops waiting for that group, keeps every message the group had already produced, marks the sources behind it `skipped`, and returns. A thread cannot be killed, so the hung thread and its browser are left behind; if its call ever returns, the result is discarded and the thread closes its browser. The longest honest source measured took eleven minutes (about 350 detail pages).
+
+**The report.** `data/.web_source_report.json` holds the last 30 runs: per source its state, message count, seconds and a detail string. One `WARNING` line per run lists the sources that are `blocked`, `hung`, `skipped`, `failed` or `low`; one `INFO` line lists the `empty` ones. The run total (`Web sources: N messages from M sources.`) is unchanged, and is not a health signal: see `docs/08 - Analysis/03 - Nightly Harvest Health 2026-11.md`.
+
+`not implemented`: nothing tells a person that a source is `blocked`. A state that needs a human should park the tab in a long-lived, visible browser and notify; today the browser closes with its group. That is the Universal Controller service's job (`ext/universal_controller`, design in its own `docs/`).
 
 Native Chrome (`BrowserMode.NATIVE_CDP` in `ext/universal_controller/uc_browser/browser.py:_start_native_chrome`) launches the user's actual `chrome.exe` via `subprocess.Popen` with `--remote-debugging-port` and connects Playwright over CDP — it is **not** a second Playwright-launched browser process pool. Because there is one real Chrome window/profile involved (`data/.uc_chrome_profile`), and because native Chrome exists specifically to look like a real user to Cloudflare, the code deliberately keeps this group to a single serial worker — running several native-Chrome instances concurrently from one profile would both contend for the profile lock and defeat the "looks like one real user" premise that lets it pass Cloudflare's challenge in the first place. `parallel` only ever affects the standard-source chunking; the native bucket size is hardcoded to 1 group (`fetch_web_sources` never multiplies native workers by `parallel`).
 
@@ -210,11 +233,24 @@ Also note: the live `data/web_sources.json` (31 entries) diverges from the in-co
 | `data/.uc_chrome_profile/` | `_start_native_chrome`'s `subprocess.Popen(chrome.exe --user-data-dir=...)` | `BrowserMode.NATIVE_CDP` — a clean profile (only the KeePassXC-Browser extension staged in, not a full copy of the user's real Chrome profile — see `_copy_chrome_auth`'s docstring noting this was deliberately changed) |
 | `data/.keepassxc_extension/` | `_ensure_keepassxc_extension` (staged copy of the user's installed KeePassXC-Browser extension, `_metadata` stripped) | Loaded via `--load-extension` in native-Chrome mode only, for KeePassXC autofill |
 
-`uc_browser.py` in `src/event_harvester/sources/` is a **backward-compat shim** — it just re-exports `UCBrowser`/`BrowserMode` from the installed `uc_browser` package (`ext/universal_controller/`, editable pip install). All real browser-launch logic lives in `ext/universal_controller/uc_browser/browser.py`. `web_session.py` similarly re-exports `get_chrome_cookies`/`cookies_to_playwright` from `uc_browser.chrome_cookies` for legacy callers; the module's own remaining job is `extension_args()`, `wait_for_uc`, `apply_uc_patterns`, and the `web_login()` interactive flow.
+`uc_browser.py` in `src/event_harvester/sources/` is **the one place event_tool obtains a browser and its pages** (since 2026-11-23; before that it was a 17-line re-export shim). Its `WebBrowser` class wraps `UCBrowser` from the installed `uc_browser` package (`ext/universal_controller/`, editable pip install), where all real browser-launch logic still lives (`uc_browser/browser.py`).
+
+| `WebBrowser` owns | How |
+|---|---|
+| Starting | `with WebBrowser(...)` constructs and enters `UCBrowser(**kwargs)`; `start()` does the same for a holder that outlives one block (an explore session). Using it before that raises `RuntimeError`: it never launches implicitly. Whether a source needs a browser at all is decided by the routing in `web_fetch`, not here |
+| Pages | `open`, `open_with_intercept` and `new_page` are the only ways a page comes to exist; each is remembered. `close_pages()` closes those still open; `close()` does that and then closes the browser |
+| The controller's API | every other public attribute (`detect_all`, `dismiss_cookies`, `search`, `load_signatures`, `timeout_ms`, …) is forwarded unchanged |
+| The boundary | names starting with `_` are not forwarded, so `uc._context` raises `AttributeError`. `new_page()` is the single place the controller's context and stealth plugin are read, because the pinned controller (`99390a5`) has no public way to make an un-navigated page |
+
+Constructed in five places and nowhere else: `web_fetch._browser_work`, `web_explore.open_session`, the CLI's `_web_replay` and `_run_url_diagnostics`, and `scripts/export_grok_history.py`. `web_login()` in `web_session.py` is the one remaining direct Playwright launch (`launch_persistent_context` on `data/.chrome_profile`); it is a sign-in flow, not a harvest path, and was left alone.
+
+**One bot-check test.** `web_utils.is_bot_check(html)` is true when the HTML contains "just a moment" or "security verification". Before 2026-11-23 the string test was written out twelve times in six files and the copies disagreed: only `_wait_cloudflare`'s entry test knew the second phrase. `_poll_bot_check` is the one polling loop, used by `_wait_cloudflare` (15 s, 3 s settle) and by the detail-page fetch (10 s, 1 s settle). *Behaviour change:* a page showing only "security verification" is now waited on, reported as blocked, and queued for the native-Chrome retry; before, it was scraped as if it were the source. `unverified` against a live page of that kind. Two classifiers remain separate on purpose: `observability/hints.py:_CHALLENGE_RE` (page diagnosis, also matches captchas) and `onboard.py`'s HTTP-header probe (names the vendor that blocked).
+
+`web_session.py` re-exports `get_chrome_cookies`/`cookies_to_playwright` from `uc_browser.chrome_cookies` for legacy callers; the module's own remaining job is `extension_args()`, `wait_for_uc`, `apply_uc_patterns`, and the `web_login()` interactive flow.
 
 ## Per-source cooldown
 
-`web_utils.py:_load_cooldowns`/`_save_cooldown`/`_is_on_cooldown` read/write `data/.web_cooldowns.json` — a flat `{url: iso_timestamp}` map of last-successful-fetch times. `fetch_web_sources` filters sources against this **before** dispatch (`cd_hours = src.get("cooldown_hours", -1)`; skipped only if `cd_hours >= 0` and within the window — so a source with no `cooldown_hours` key is *never* cooldown-filtered, only ones that explicitly opt in with a non-negative value). A cooldown timestamp is only saved on a *successful* fetch (`if msgs: _save_cooldown(src["url"])`) inside `_process_group`, for every mode including `chat` and `ics`. `no_cooldown=True` (CLI/config flag) bypasses the whole filter regardless of per-source settings.
+`web_utils.py:_load_cooldowns`/`_save_cooldown`/`_is_on_cooldown` read/write `data/.web_cooldowns.json` — a flat `{url: iso_timestamp}` map of last-successful-fetch times. `fetch_web_sources` filters sources against this **before** dispatch (`cd_hours = src.get("cooldown_hours", -1)`; skipped only if `cd_hours >= 0` and within the window — so a source with no `cooldown_hours` key is *never* cooldown-filtered, only ones that explicitly opt in with a non-negative value). A cooldown timestamp is only saved when a source returns messages (`if msgs: _save_cooldown(src["url"])` in `_run_source`), for every mode including `chat` and `ics`; a `blocked`, `failed` or `hung` source saves none. `no_cooldown=True` (CLI/config flag) bypasses the whole filter regardless of per-source settings.
 
 ## L1 primitive verbs (`web_primitives.py`)
 
@@ -273,7 +309,7 @@ Every mode produces the same message shape consumed by the downstream pipeline:
 }
 ```
 
-Two extraction paths feed `content`, tried in this order wherever a detail page is fetched (`_fetch_event_detail`/`_fetch_event_details_parallel` in `web_utils.py`, and inline in `_do_ics_inner`):
+Two extraction paths feed `content`, tried in this order wherever a detail page is fetched (`_detail_text`, called by `_fetch_event_details_parallel` in `web_utils.py`, and inline in `_do_ics_inner`):
 
 1. **Structured data first** — `_extract_structured_data` looks for `schema.org` `Event` JSON-LD (`<script type="application/ld+json">`, including `@graph`-wrapped arrays and list-valued `@type`), pulling `title`/`date`/`time`/`location`/`link`/`details` and formatting them as newline-joined `key: value` lines. No LLM involved.
 2. **Fallback to raw text** — `_extract_text` strips `<script>`/`<style>` blocks then all remaining tags, collapses whitespace. Used whenever JSON-LD is absent, or for whole-page raw/calendar-fallback content. `_decimate_text` (used elsewhere in the pipeline, not inline in these fetchers) centers a window around the densest date/time-anchor cluster when text exceeds `max_chars`, so long pages don't drown the eventual LLM extraction step in nav/footer junk.
@@ -294,8 +330,12 @@ Injected ads (`ad_id`/`is_ad`/`injected`) are dropped, and a `seen` set spans ev
 
 | Module | Failure mode | Handling |
 |---|---|---|
-| `web_fetch.py` | Cloudflare "just a moment" on a standard-group source | Page closed, source queued to `cf_retries`, retried once serially under `native_chrome=True` |
-| `web_fetch.py` | Exception anywhere inside one source's processing | Caught per-source in `_process_group`'s `try/except`; logged, OTel span records the exception, loop continues to the next source in that group — one bad source never aborts the whole run |
+| `web_fetch.py` | Bot check (`is_bot_check`) still showing on a standard-group source after `_wait_cloudflare` | Page closed, source queued to `cf_retries`, retried once serially under `native_chrome=True` |
+| `web_fetch.py` | A mode returns or raises with a tab still open | `uc.close_pages()` in the per-source `finally` closes it and logs the count at debug level. *Measured 2026-11-23:* a mode forced to raise after the shared page-open left one tab, and the sweep closed one |
+| `web_fetch.py` | A source runs past its deadline (a browser call that never returns) | `_await_groups` records it `hung`, records the sources behind it `skipped`, keeps the group's finished messages, and stops waiting. *Before 2026-11-24:* the job waited to its 90-minute limit and discarded the whole run, twice in the week of 2026-11-17 |
+| `web_fetch.py` | Bot check still showing in native Chrome | `SourceBlocked`: no message, no cooldown, state `blocked`. *Before 2026-11-24:* the challenge page was scraped and emitted as one message. *Measured 2026-11-24 against the live site:* `erobay` reported `blocked` after 17 s and emitted nothing |
+| `web_utils.py` `_fetch_event_details_parallel` | A detail page still shows a bot check after its 10 s wait | `None` for that link, and one warning with the count; the challenge text is not emitted as the event's detail |
+| `web_fetch.py` | Exception anywhere inside one source's processing | Caught per-source in `_run_source`; logged, OTel span records the exception, state `failed`, and the group continues to its next source — one bad source never aborts the whole run |
 | `web_modes/calendar.py` | Cloudflare still blocking after `_wait_cloudflare` | Page closed, `[]` returned (no retry queued from inside a mode handler — retry only happens for the *initial* page-open Cloudflare check in `fetch_web_sources` itself) |
 | `web_modes/feed.py` | `page` param passed in but feed needs interception from first load | Pre-opened page is closed and a fresh one opened via `open_with_intercept` — documented in the module docstring as "interface consistency" overhead |
 | `web_modes/feed.py` | Captured response body isn't valid JSON | Tried as one object, then line-by-line (`loads_multi`); a body that parses as neither yields no posts and is skipped |
@@ -310,7 +350,7 @@ Injected ads (`ad_id`/`is_ad`/`injected`) are dropped, and a `seen` set spans ev
 | `web_modes/steps.py` | A step fails mid-route | Walk stops, partial links are still fetched and returned, and the failure is logged *with* a page diagnosis. `expect_min_events` (if set) warns separately when the yield drops |
 | `sources/web_explore.py` | Session cap reached | `RuntimeError` naming the open sessions — raised *before* a browser is launched |
 | `uc_browser` (`browser.py`) `_start_native_chrome` | `chrome.exe` not found, or CDP port never comes up after 15×1s retries | Falls back to Playwright `channel="chrome"` launch (if binary missing) or gives up and leaves `_context = None` (if CDP connect fails) — a `None` context will raise on first use downstream, `unverified` whether callers handle this gracefully |
-| `web_utils.py` `_fetch_event_detail(s)` | Any exception during a detail-page fetch (timeout, navigation error, etc.) | Caught broadly, page closed if possible, `None` returned for that link — link is silently dropped, not retried |
+| `web_utils.py` `_fetch_event_details_parallel` | Any exception during a detail-page fetch (timeout, navigation error, etc.) | Caught broadly, tab closed in a `finally`, `None` returned for that link — link is silently dropped, not retried. Before 2026-11-23 a tab whose `goto` raised was never closed. `_fetch_event_detail` (the single-page variant, no callers) was deleted; it alone called `_is_dead_page`, so **dead-page detection does not run on any live path** — `_is_dead_page` survives with its tests and no caller |
 | `web_utils.py` `_load_web_sources` | Missing/corrupt `data/web_sources.json` | **BUG** — see schema section above; returns `{}` instead of the documented `_DEFAULT_SOURCES` fallback |
 
 ## Verification
@@ -336,4 +376,13 @@ pixi run event-harvester web login
 pixi run event-harvester --only web --web-source instagram --no-cooldown
 ```
 
-`unverified`: neither command was executed as part of writing this document (read-only research pass); behavior above is derived from static reading of `web_fetch.py`, `web_utils.py`, `web_modes/*.py`, `browser.py`, and the test suite (`tests/test_web_fetch_helpers.py`, `tests/test_web_fetch_parallel.py`, `tests/test_web_primitives.py`, `tests/test_web_ics_diag.py`), not from running the harvester.
+`unverified`: neither command was executed as part of writing this document (read-only research pass); behavior above is derived from static reading of `web_fetch.py`, `web_utils.py`, `web_modes/*.py`, `browser.py`, and the test suite (`tests/test_web_fetch_helpers.py`, `tests/test_web_fetch_parallel.py`, `tests/test_web_primitives.py`, `tests/test_web_ics_diag.py`), not from running the harvester. The exceptions are the passages dated 2026-11-23, which were run.
+
+For the browser seam:
+
+```bash
+pixi run --frozen -e dev pytest -q tests/test_uc_browser.py
+grep -rn -E 'UCBrowser\(|\._context\b|_stealth_plugin' --include='*.py' src scripts
+```
+
+The tests should pass (7 on 2026-11-23). The grep should print lines in `src/event_harvester/sources/uc_browser.py` only; a hit anywhere else is a caller reaching past `WebBrowser`, and it will break when Universal Controller runs as a service.

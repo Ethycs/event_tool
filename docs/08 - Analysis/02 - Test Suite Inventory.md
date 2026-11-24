@@ -94,7 +94,7 @@ Every module below has **zero** references from any file in `tests/` (confirmed 
 | `src/event_harvester/cli/commands/watch.py` | 40 | `no coverage`. |
 | `src/event_harvester/logging_tags.py` | 30 | `no coverage`. |
 | `src/event_harvester/cli/commands/mcp.py` | 22 | `no coverage`. |
-| `src/event_harvester/sources/uc_browser.py` | 17 | `no coverage` of the real class — only its *duck-typed fake* (`FakeUC`) is exercised, in `test_web_primitives.py`. |
+| `src/event_harvester/sources/uc_browser.py` | 130 | Covered since 2026-11-23 by `tests/test_uc_browser.py` (7 tests, against a fake controller): explicit start, page tracking and sweep, the private-name boundary, and that `web_fetch` routes a plain-HTTP source past the browser. The real `UCBrowser` it wraps is still exercised only by live runs. |
 
 ---
 

@@ -95,9 +95,7 @@ def _do_steps_inner(uc, src: dict, timeout_ms: int, max_events: int,
 
     if event_links:
         logger.info("%s: %d event link(s) from route, fetching...", name, len(event_links))
-        fetched = _fetch_event_details_parallel(
-            uc._context, uc._stealth_plugin, event_links, timeout_ms,
-        )
+        fetched = _fetch_event_details_parallel(uc, event_links, timeout_ms)
         for lnk, text in fetched:
             if not text:
                 continue

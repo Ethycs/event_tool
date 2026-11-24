@@ -25,6 +25,7 @@ from event_harvester.sources.web_utils import (
     _save_link_fingerprint,
     _scroll_for_seconds,
     _wait_cloudflare,
+    is_bot_check,
 )
 
 logger = logging.getLogger("event_harvester.web_fetch")
@@ -241,7 +242,7 @@ def _calcium_forward_months(uc, src: dict, url: str, name: str, tracer, capture)
                 html = _wait_cloudflare(page, headless=False)
                 web_checkpoint.record(page, m_url)
             page.close()
-            if "just a moment" in html.lower():
+            if is_bot_check(html):
                 logger.warning("%s: month +%d grid blocked, stopping the walk", name, offset)
                 break
             m_links = _parse_calcium_links(html)
@@ -306,9 +307,7 @@ def _calcium_messages(uc, src: dict, event_links: list[dict], domain: str,
     details: dict[str, str] = {}
     if src.get("fetch_details"):
         logger.info("%s: fetching %d detail page(s).", name, len(upcoming))
-        for lnk, text in _fetch_event_details_parallel(
-            uc._context, uc._stealth_plugin, upcoming, timeout_ms,
-        ):
+        for lnk, text in _fetch_event_details_parallel(uc, upcoming, timeout_ms):
             if text:
                 details[lnk["url"]] = text
 
@@ -380,7 +379,7 @@ def _do_calendar_inner(uc, src: dict, timeout_ms: int, max_events: int, page=Non
     if page is None:
         page = uc.open(url, source_name=name, tracer=tracer, capture=capture)
         html = _wait_cloudflare(page, headless=False)
-        if "just a moment" in html.lower():
+        if is_bot_check(html):
             page.close()
             return []
     else:
@@ -477,9 +476,7 @@ def _do_calendar_inner(uc, src: dict, timeout_ms: int, max_events: int, page=Non
 
         # Fetch detail pages in parallel (5 tabs at a time)
         if fetch_links:
-            results = _fetch_event_details_parallel(
-                uc._context, uc._stealth_plugin, fetch_links, timeout_ms,
-            )
+            results = _fetch_event_details_parallel(uc, fetch_links, timeout_ms)
             for lnk, text in results:
                 if text:
                     _save_link_fingerprint(lnk)

@@ -213,8 +213,8 @@ class TestLumaPlaceId:
 
         monkeypatch.setattr(luma, "resolve_place_id", boom)
         monkeypatch.setattr(luma, "fetch_entries", lambda *a, **k: [])
-        luma._do_luma_inner(None, {"url": "x", "name": "luma",
-                                   "place_api_id": "discplace-CONFIGURED"})
+        luma._do_luma_inner({"url": "x", "name": "luma",
+                             "place_api_id": "discplace-CONFIGURED"})
 
 
 class TestLumaWindow:
@@ -224,14 +224,14 @@ class TestLumaWindow:
             _luma_event(name="far", start="2027-08-12T01:00:00.000Z"),
         ])
         out = luma._do_luma_inner(
-            None, {"url": "x", "name": "luma", "place_api_id": "p",
-                   "forward_days": 21}, now=NOW,
+            {"url": "x", "name": "luma", "place_api_id": "p",
+             "forward_days": 21}, now=NOW,
         )
         assert [m["content"].split("\n")[0] for m in out] == ["soon"]
 
     def test_no_place_id_yields_nothing_rather_than_raising(self, monkeypatch):
         monkeypatch.setattr(luma, "resolve_place_id", lambda *a, **k: None)
-        assert luma._do_luma_inner(None, {"url": "x", "name": "luma"}) == []
+        assert luma._do_luma_inner({"url": "x", "name": "luma"}) == []
 
 
 # ── Partiful ─────────────────────────────────────────────────────────
@@ -349,7 +349,6 @@ def _patch_fetch(monkeypatch, html: str):
 
 def _run(city: str = "SF"):
     return partiful._do_partiful_inner(
-        None,
         {"url": "https://partiful.com/explore", "name": "partiful",
          "city": city, "forward_days": 30},
         now=NOW,

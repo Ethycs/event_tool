@@ -1,7 +1,7 @@
 """RSS mode: fetch an RSS/Atom feed and emit one message per upcoming item.
 
 Sibling of `ics.py` and browser-free for the same reason — the outer dispatch
-in `web_fetch.py` still allocates a browser it will not use.
+in `web_fetch.py` hands it a browser that is never started unless used.
 
 **Why this exists.** Bottom of the Hill publishes a calendar page of ~40 shows
 as one 338 KB HTML table. Scraped as `raw` it becomes a single 30,164-character
@@ -56,7 +56,7 @@ _TITLE_DATE = re.compile(r"\b(\d{4})\s+(\d{1,2})\s*/\s*(\d{1,2})\b")
 _TAGS = re.compile(r"<[^>]+>")
 
 
-def _do_rss(uc, src: dict, page=None, tracer=None, capture=None) -> list[dict]:
+def _do_rss(src: dict, tracer=None, capture=None) -> list[dict]:
     """RSS mode (OTel-wrapped). Body in :func:`_do_rss_inner`."""
     name = src.get("name", "rss")
     otel_tracer = get_tracer("event_harvester.web_fetch")

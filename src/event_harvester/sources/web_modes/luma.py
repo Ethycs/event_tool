@@ -1,7 +1,7 @@
 """Luma mode: ask Luma's own discovery API, one message per event.
 
-Browser-free, like `ics.py` and `rss.py` — the outer dispatch in
-`web_fetch.py` still allocates a browser this never touches.
+Read over plain HTTP, like `ics.py` and `rss.py`: no browser is involved, and
+`web_fetch.HTTP_MODES` routes it outside every browser group.
 
 **Why this exists.** Luma was already configured, as `mode: "calendar"` against
 `lu.ma/discover`, and measured 2026-08-10 it returned **1 message and 1 event**
@@ -199,7 +199,7 @@ def _message(entry: dict, name: str) -> dict | None:
     }
 
 
-def _do_luma_inner(uc, src: dict, now: datetime | None = None) -> list[dict]:
+def _do_luma_inner(src: dict, now: datetime | None = None) -> list[dict]:
     name = src.get("name", "luma")
     timeout = int(src.get("timeout_s", 20))
     forward = int(src.get("forward_days", DEFAULT_FORWARD_DAYS))
@@ -265,9 +265,9 @@ def _do_luma_inner(uc, src: dict, now: datetime | None = None) -> list[dict]:
     return messages
 
 
-def _do_luma(uc, src: dict, tracer=None, capture=None, **_) -> list[dict]:
+def _do_luma(src: dict, tracer=None, capture=None) -> list[dict]:
     with get_tracer(_TRACER).start_as_current_span("web.luma") as span:
         span.set_attribute("source.name", src.get("name", "luma"))
-        msgs = _do_luma_inner(uc, src)
+        msgs = _do_luma_inner(src)
         span.set_attribute("message.count", len(msgs))
         return msgs
