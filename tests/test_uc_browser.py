@@ -289,6 +289,18 @@ class FakeServiceClient:
     calls: list[tuple] = []
     titles: list[str] = []
     busy = False
+    pages: list[dict] = []
+    knows_lifetime = True
+
+    def windows(self):
+        return {"native": {"pages": type(self).pages}}
+
+    def set_page_lifetime(self, window, target_id, client_id, lifetime):
+        if not type(self).knows_lifetime:
+            from uc_browser.service.errors import ServiceError
+
+            raise ServiceError("http_404", "Not Found", 404)
+        type(self).calls.append(("lifetime", target_id, client_id, lifetime))
 
     def __init__(self, url):
         self.url = url
@@ -325,6 +337,7 @@ def service(monkeypatch):
     import uc_browser.service.client as real
 
     FakeServiceClient.calls, FakeServiceClient.busy = [], False
+    FakeServiceClient.pages, FakeServiceClient.knows_lifetime = [], True
     monkeypatch.setattr(real, "ServiceClient", FakeServiceClient)
     monkeypatch.setattr(uc_browser.time, "sleep", lambda _s: None)
     return FakeServiceClient
@@ -360,3 +373,36 @@ def test_a_busy_service_window_is_an_error_not_a_reason_to_attach(service):
     with pytest.raises(ServiceError, match="held by explore:1"):
         uc_browser.prepare_native(SERVICE_ROUTE, URL, 5)
     assert service.calls == [("register", "native", "event_tool:1:2", True)]
+
+
+def test_a_kept_page_outlives_the_reservation_and_replaces_last_nights(service):
+    """One kept page per site: the new one is kept first, then the old one of
+    the same site is closed. Another site's kept page and the blank tab stay."""
+    service.titles = ["Venue calendar"]
+    service.pages = [
+        {"target_id": "BLANK", "url": "about:blank", "holder": None},
+        {"target_id": "OLD", "url": "https://www.venue.example/cal.pl?Op=ShowIt", "holder": "window"},
+        {"target_id": "OTHER", "url": "https://elsewhere.example/", "holder": "window"},
+        {"target_id": "T1", "url": URL, "holder": "window"},
+    ]
+
+    assert uc_browser.prepare_native(SERVICE_ROUTE, URL, 30, keep=True) == (True, "Venue calendar")
+    assert service.calls[3:] == [
+        ("lifetime", "T1", "C1", "window"),
+        ("close_page", "OLD"),
+        ("close_client", "C1"),
+    ]
+
+
+def test_a_page_that_did_not_get_through_is_never_kept(service):
+    service.titles = ["Just a moment..."]
+
+    assert uc_browser.prepare_native(SERVICE_ROUTE, URL, 5, keep=True)[0] is False
+    assert service.calls[3:] == [("close_page", "T1"), ("close_client", "C1")]
+
+
+def test_a_service_that_cannot_keep_pages_costs_only_the_tab(service):
+    service.titles, service.knows_lifetime = ["Venue calendar"], False
+
+    assert uc_browser.prepare_native(SERVICE_ROUTE, URL, 30, keep=True) == (True, "Venue calendar")
+    assert service.calls[3:] == [("close_page", "T1"), ("close_client", "C1")]

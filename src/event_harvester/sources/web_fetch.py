@@ -658,7 +658,9 @@ def fetch_web_sources(
         from event_harvester.sources.uc_browser import WebBrowser, not_through, prepare_native
 
         wait_s = int(src.get("bot_check_wait_s", BOT_CHECK_WAIT_S))
-        through, title = prepare_native(uc_kwargs, src["url"], wait_s)
+        through, title = prepare_native(
+            uc_kwargs, src["url"], wait_s, keep=bool(src.get("keep_page_open")),
+        )
         if not through:
             raise not_through(title, wait_s)
         with WebBrowser(**uc_kwargs) as uc:

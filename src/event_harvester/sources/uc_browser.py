@@ -202,8 +202,43 @@ def pass_check_unattached(endpoint: str, url: str, wait_s: int) -> tuple[bool, s
             logger.debug("closing the unattached tab failed: %s", e)
 
 
+def _site(url: str) -> str:
+    from urllib.parse import urlparse
+
+    return (urlparse(url).hostname or "").removeprefix("www.")
+
+
+def _keep_page(client, window: str, target_id: str, client_id: str, url: str) -> bool:
+    """Give the page that just got through the window's lifetime; drop the one it replaces.
+
+    The page then outlives this client: the service does not close it when the
+    reservation ends and never attaches to it on its own. Returns whether it
+    was kept. A service that cannot do this says so and the page is closed as
+    before.
+
+    At most one kept page per site: once the new one is kept, older kept pages
+    of the same site are closed, in that order so the window is never without
+    one. event_tool stores nothing about them; it reads them back from the
+    window (holder ``window``, by URL).
+    """
+    try:
+        client.set_page_lifetime(window, target_id, client_id, "window")
+    except Exception as e:  # noqa: BLE001 — keeping the page is optional; the fetch is not
+        logger.warning("The UC service did not keep the page open for %s: %s", _site(url), e)
+        return False
+    try:
+        pages = (client.windows().get(window) or {}).get("pages") or []
+        for page in pages:
+            if (page.get("holder") == "window" and page.get("target_id") != target_id
+                    and _site(str(page.get("url", ""))) == _site(url)):
+                client.close_page(window, page["target_id"])
+    except Exception as e:  # noqa: BLE001 — a leftover tab is not worth the source
+        logger.warning("An older kept page for %s could not be closed: %s", _site(url), e)
+    return True
+
+
 def pass_check_in_service(
-    service: str, window: str, label: str | None, url: str, wait_s: int,
+    service: str, window: str, label: str | None, url: str, wait_s: int, *, keep: bool = False,
 ) -> tuple[bool, str]:
     """Load ``url`` in a quiet window of the UC service; wait for it.
 
@@ -215,21 +250,27 @@ def pass_check_in_service(
 
     A refused reservation (``busy``, naming who holds the window) is raised,
     not waited on: it is not permission to attach or to launch another browser.
+
+    ``keep``: a page that got through is left open in the window
+    (:func:`_keep_page`). A page that did not is always closed.
     """
     from uc_browser.service.client import ServiceClient
 
     client = ServiceClient(service)
     client_id = client.register_client(window, label, unattached=True)
-    target_id = None
+    target_id, kept = None, False
     try:
         client.start_window(window)
         target_id = client.new_page(window, client_id, url=url)
-        return _wait_through(
+        through, title = _wait_through(
             lambda: str(client.page_info(window, target_id).get("title", "")), url, wait_s,
         )
+        if through and keep:
+            kept = _keep_page(client, window, target_id, client_id, url)
+        return through, title
     finally:
         for what, close in (
-            ("page", lambda: target_id and client.close_page(window, target_id)),
+            ("page", lambda: target_id and not kept and client.close_page(window, target_id)),
             ("reservation", lambda: client.close_client(client_id)),
         ):
             try:
@@ -238,7 +279,9 @@ def pass_check_in_service(
                 logger.warning("closing the quiet %s at the UC service failed: %s", what, e)
 
 
-def prepare_native(uc_kwargs: dict, url: str, wait_s: int) -> tuple[bool, str]:
+def prepare_native(
+    uc_kwargs: dict, url: str, wait_s: int, *, keep: bool = False,
+) -> tuple[bool, str]:
     """Let ``url`` load in the native browser with nothing attached, before any attach.
 
     ``(through, last title)``, by whichever way the route offers: a quiet
@@ -249,6 +292,9 @@ def prepare_native(uc_kwargs: dict, url: str, wait_s: int) -> tuple[bool, str]:
     A browser whose window is minimized is refused first
     (:class:`native_window.NativeWindowNotDrawn`): nothing in it is drawn, so
     a page there would not get through and the wait would only be spent.
+
+    ``keep`` (a source's ``keep_page_open``) leaves the page open once it is
+    through. Only the service's window offers that; elsewhere it is ignored.
     """
     from event_harvester.sources.native_window import require_drawn
 
@@ -256,6 +302,7 @@ def prepare_native(uc_kwargs: dict, url: str, wait_s: int) -> tuple[bool, str]:
     if "service" in uc_kwargs:
         return pass_check_in_service(
             uc_kwargs["service"], uc_kwargs["window"], uc_kwargs.get("label"), url, wait_s,
+            keep=keep,
         )
     if "cdp_endpoint" in uc_kwargs:
         return pass_check_unattached(uc_kwargs["cdp_endpoint"], url, wait_s)
