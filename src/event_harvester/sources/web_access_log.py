@@ -1,10 +1,10 @@
-"""Access log: when each web source's state changed, and every failure.
+"""Access log: when each web source's state changed, per method, and every failure.
 
 Some things about a source cannot be read; they can only be observed. How long
 a passed bot check lasts is one: the clearance cookie says a year, the site
 decides, and nothing on this side says which. So every access to a source is
-compared with the last one, and two kinds of line are appended to
-``data/.web_access_log.jsonl``:
+compared with the last one **by the same access method**, and two kinds of
+line are appended to ``data/.web_access_log.jsonl``:
 
 * ``change`` — the state differs from last time. The line says what it was,
   since when, and how long it held: at least ``held_min_s`` (it was last *seen*
@@ -13,9 +13,16 @@ compared with the last one, and two kinds of line are appended to
 * ``fail`` — the state is a failing one and has not changed. One line per
   access, so a source that fails every night leaves a line every night.
 
-``data/.web_access_state.json`` holds each source's current state, when it
-began and when it was last seen, which is what makes a change detectable across
-runs and processes.
+**Per method, because methods do not share verifications.** A check passed in
+one browser, or by one way of driving it, says nothing about another:
+``erobay`` cleared by hand in a plain Chrome was challenged again fifteen
+minutes later in the harvest's own Chrome on the same profile (2026-11-24).
+So the state is kept for each ``(source, method)`` pair, where the method is
+the route ``web_fetch`` took: ``http``, ``standard`` or ``native``.
+
+``data/.web_access_state.json`` holds each pair's current state, when it began
+and when it was last seen, which is what makes a change detectable across runs
+and processes.
 
 A state recorded with ``observed=False`` (a source skipped because its browser
 was lost) is logged as a failure of the run but does not move the source's
@@ -53,24 +60,25 @@ def _span(seconds: int | None) -> str:
     return f"{hours}h{rest // 60:02d}m"
 
 
-def record(source: str, state: str, detail: str = "", *, messages: int = 0,
+def record(source: str, state: str, detail: str = "", *, method: str, messages: int = 0,
            observed: bool = True, at: datetime | None = None) -> dict | None:
-    """Record one access to ``source``. Returns the line written, if any.
+    """Record one access to ``source`` by ``method``. Returns the line written, if any.
 
     Called by the code that made the access, as it finishes. Nothing is
     entered by hand. ``at`` sets the clock for tests.
     """
     now = at or datetime.now(timezone.utc)
+    key = f"{source} via {method}"
+    base = {"at": _iso(now), "source": source, "method": method}
     with _lock:
         states = load_json(STATE_FILE, default={}) or {}
-        previous = states.get(source)
+        previous = states.get(key)
         line: dict | None = None
 
         if not observed:
-            line = {"at": _iso(now), "source": source, "event": "fail", "state": state,
-                    "detail": detail}
+            line = {**base, "event": "fail", "state": state, "detail": detail}
         elif previous is None or previous["state"] != state:
-            line = {"at": _iso(now), "source": source, "event": "change", "state": state,
+            line = {**base, "event": "change", "state": state,
                     "messages": messages, "detail": detail,
                     "was": None, "was_since": None, "held_min_s": None, "held_max_s": None}
             if previous is not None:
@@ -81,11 +89,11 @@ def record(source: str, state: str, detail: str = "", *, messages: int = 0,
                     held_min_s=int((last - since).total_seconds()),
                     held_max_s=int((now - since).total_seconds()),
                 )
-            states[source] = {"state": state, "since": _iso(now), "last": _iso(now)}
+            states[key] = {"state": state, "since": _iso(now), "last": _iso(now)}
         else:
             previous["last"] = _iso(now)
             if state in FAIL_STATES:
-                line = {"at": _iso(now), "source": source, "event": "fail", "state": state,
+                line = {**base, "event": "fail", "state": state,
                         "since": previous["since"], "detail": detail}
 
         if line is not None:
@@ -98,7 +106,7 @@ def record(source: str, state: str, detail: str = "", *, messages: int = 0,
     if line is not None and line["event"] == "change" and line["was"] is not None:
         logger.warning(
             "%s: access state changed %s → %s (was %s for between %s and %s).",
-            source, line["was"], state, line["was"],
+            key, line["was"], state, line["was"],
             _span(line["held_min_s"]), _span(line["held_max_s"]),
         )
     return line

@@ -49,6 +49,7 @@ from event_harvester.sources.web_utils import (  # noqa: F401
     _DEFAULT_SOURCES,
     _JUNK_LINK_TITLES,
     _WEB_SOURCES_FILE,
+    BOT_CHECK_WAIT_S,
     DEFAULT_SCROLL_SECONDS,
     SourceBlocked,
     SourceDeviated,
@@ -119,13 +120,20 @@ class SourceOutcome:
     messages: int = 0
     seconds: float = 0.0
     detail: str = ""
+    #: The access method the source was reached by: ``http``, ``standard``
+    #: (Chromium with the UC extension) or ``native`` (installed Chrome).
+    method: str = ""
 
 
 class _Group:
     """One worker thread: its sources, what it has produced, where it is."""
 
-    def __init__(self, label: str, sources: list[dict], work):
+    def __init__(self, label: str, method: str, sources: list[dict], work):
         self.label = label
+        #: The access method every source in this group is reached by. A
+        #: check passed by one method says nothing about another, so states
+        #: are recorded per method.
+        self.method = method
         self.sources = sources
         self.messages: list[dict] = []
         self.cf_retries: list[dict] = []
@@ -149,6 +157,16 @@ class _Group:
             self.done.set()
 
 
+def _log_access(name: str, state: str, detail: str, method: str, *,
+                messages: int = 0, observed: bool = True) -> None:
+    try:
+        web_access_log.record(
+            name, state, detail, method=method, messages=messages, observed=observed,
+        )
+    except Exception as e:  # noqa: BLE001 — the log must not cost the harvest
+        logger.warning("Could not write the access log for %s: %s", name, e)
+
+
 def _note(outcomes: dict[str, SourceOutcome], outcome: SourceOutcome) -> None:
     """Keep ``outcome`` for the run report and put it in the access log.
 
@@ -157,13 +175,10 @@ def _note(outcomes: dict[str, SourceOutcome], outcome: SourceOutcome) -> None:
     it is logged as a failure of the run without moving the source's state.
     """
     outcomes[outcome.name] = outcome
-    try:
-        web_access_log.record(
-            outcome.name, outcome.state, outcome.detail,
-            messages=outcome.messages, observed=outcome.state != "skipped",
-        )
-    except Exception as e:  # noqa: BLE001 — the log must not cost the harvest
-        logger.warning("Could not write the access log for %s: %s", outcome.name, e)
+    _log_access(
+        outcome.name, outcome.state, outcome.detail, outcome.method,
+        messages=outcome.messages, observed=outcome.state != "skipped",
+    )
 
 
 def _await_groups(groups: list[_Group], outcomes: dict[str, SourceOutcome],
@@ -202,14 +217,14 @@ def _await_groups(groups: list[_Group], outcomes: dict[str, SourceOutcome],
             )
             _note(outcomes, SourceOutcome(
                 name, src.get("mode") or "auto", "hung", seconds=round(ran, 1),
-                detail=f"exceeded its {ran:.0f}s deadline",
+                detail=f"exceeded its {ran:.0f}s deadline", method=group.method,
             ))
             for later in group.sources[group.sources.index(src) + 1:]:
                 later_name = later.get("name", later["url"])
                 if later_name not in outcomes:
                     _note(outcomes, SourceOutcome(
                         later_name, later.get("mode") or "auto", "skipped",
-                        detail=f"queued behind {name}, which hung",
+                        detail=f"queued behind {name}, which hung", method=group.method,
                     ))
         if pending:
             pending[0].done.wait(poll_s)
@@ -223,7 +238,8 @@ def _await_groups(groups: list[_Group], outcomes: dict[str, SourceOutcome],
             name = src.get("name", src["url"])
             if name not in outcomes:
                 _note(outcomes, SourceOutcome(
-                    name, src.get("mode") or "auto", "failed", detail=str(group.error)[:200],
+                    name, src.get("mode") or "auto", "failed",
+                    detail=str(group.error)[:200], method=group.method,
                 ))
 
 
@@ -439,9 +455,17 @@ def fetch_web_sources(
                 # report and the messages cannot disagree about it.
                 return
             group.messages.extend(msgs)
-        if state != "deferred":
+        if state == "deferred":
+            # Blocked by this method and handed to another. The run's outcome
+            # for the source comes from the retry; this method's failure is
+            # still a fact about this method.
+            _log_access(
+                name, "blocked", "bot check; handed to the native Chrome retry", group.method,
+            )
+        else:
             _note(outcomes, SourceOutcome(
                 name, mode, state, len(msgs), round(time.monotonic() - started, 1), detail,
+                method=group.method,
             ))
         if msgs:
             _save_cooldown(src["url"])
@@ -485,7 +509,10 @@ def fetch_web_sources(
             page, html = replayed
         else:
             page = uc.open(src["url"], source_name=name, tracer=tracer, capture=capture)
-            html = _wait_cloudflare(page, headless=False)
+            html = _wait_cloudflare(
+                page, headless=False,
+                wait_s=int(src.get("bot_check_wait_s", BOT_CHECK_WAIT_S)),
+            )
 
         # Bot check not cleared. A standard browser hands the source to the
         # native Chrome retry. In native Chrome there is nowhere further to
@@ -582,13 +609,13 @@ def fetch_web_sources(
     standard_chunks = _chunk_sources(standard_srcs, parallel)
     groups: list[_Group] = []
     if http_srcs:
-        groups.append(_Group("http", http_srcs, _http_work))
+        groups.append(_Group("http", "http", http_srcs, _http_work))
     for i, chunk in enumerate(standard_chunks):
-        groups.append(_Group(f"standard-{i}", chunk, partial(_browser_work, {})))
+        groups.append(_Group(f"standard-{i}", "standard", chunk, partial(_browser_work, {})))
     if native_srcs:
-        groups.append(
-            _Group("native", native_srcs, partial(_browser_work, {"native_chrome": True})),
-        )
+        groups.append(_Group(
+            "native", "native", native_srcs, partial(_browser_work, {"native_chrome": True}),
+        ))
     logger.info(
         "Web fetch: %d source(s) over plain HTTP; %d standard source(s) across "
         "%d browser(s); %d native_chrome source(s) serial.",
@@ -600,7 +627,10 @@ def fetch_web_sources(
     cf_retries = [src for group in groups for src in group.cf_retries]
     if cf_retries:
         logger.info("Retrying %d source(s) with native Chrome (Cloudflare)...", len(cf_retries))
-        retry = _Group("native-retry", cf_retries, partial(_browser_work, {"native_chrome": True}))
+        retry = _Group(
+            "native-retry", "native", cf_retries,
+            partial(_browser_work, {"native_chrome": True}),
+        )
         groups.append(retry)
         _await_groups([retry], outcomes)
 

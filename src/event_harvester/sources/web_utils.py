@@ -296,8 +296,20 @@ def _poll_bot_check(page, html: str, *, seconds: int, settle_ms: int) -> str:
     return html
 
 
-def _wait_cloudflare(page, headless: bool = True) -> str:
-    """Wait for Cloudflare challenge to resolve. Returns page HTML."""
+#: Seconds a headed browser waits on a bot check for it to clear. Override
+#: per source with ``bot_check_wait_s`` in ``web_sources.json``.
+BOT_CHECK_WAIT_S = 15
+
+
+def _wait_cloudflare(page, headless: bool = True, wait_s: int = BOT_CHECK_WAIT_S) -> str:
+    """Wait for Cloudflare challenge to resolve. Returns page HTML.
+
+    ``wait_s`` is the window a person has to click the check in this browser.
+    A check cleared in another browser, or by another method, does not count
+    here: measured 2026-11-24, ``erobay`` cleared by hand in a plain Chrome
+    was challenged again 15 minutes later in the harvest's own Chrome on the
+    same profile, and cleared there only when clicked there.
+    """
     try:
         page.wait_for_load_state("load", timeout=15000)
     except Exception:
@@ -317,10 +329,13 @@ def _wait_cloudflare(page, headless: bool = True) -> str:
     if headless:
         logger.warning("Cloudflare challenge (headless can't solve). Skipping.")
         return html
-    print("  Cloudflare captcha — click it in the browser window (15s timeout)...")
-    html = _poll_bot_check(page, html, seconds=15, settle_ms=3000)
+    logger.warning(
+        "Bot check on %s — click it in the browser window (waiting %ds).",
+        getattr(page, "url", "the page"), wait_s,
+    )
+    html = _poll_bot_check(page, html, seconds=wait_s, settle_ms=3000)
     if is_bot_check(html):
-        logger.warning("Cloudflare did not resolve in 15s. Skipping.")
+        logger.warning("Bot check did not clear in %ds.", wait_s)
     return html
 
 

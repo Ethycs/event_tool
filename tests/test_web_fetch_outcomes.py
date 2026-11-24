@@ -74,15 +74,28 @@ class FakeController:
         return self._context.new_page()
 
 
+class Harness(list):
+    """The URLs whose cooldown was saved, plus the bot-check windows asked for."""
+
+    waits: list[int]
+
+
 @pytest.fixture
 def harness(monkeypatch):
     """A harvest with fake browsers and no writes outside ``tmp_path``."""
     FakeController.launches = []
     FakeController.html_for = staticmethod(lambda kwargs: CONTENT)
-    saved: list[str] = []
+    saved = Harness()
     monkeypatch.setattr(uc_browser, "UCBrowser", FakeController)
     monkeypatch.setattr(web_fetch, "_save_cooldown", saved.append)
-    monkeypatch.setattr(web_fetch, "_wait_cloudflare", lambda page, headless=False: page.content())
+    waits: list[int] = []
+
+    def wait(page, headless=False, wait_s=15):
+        waits.append(wait_s)
+        return page.content()
+
+    saved.waits = waits
+    monkeypatch.setattr(web_fetch, "_wait_cloudflare", wait)
     monkeypatch.setattr(
         web_fetch, "_do_raw",
         lambda uc, src, page=None, **_kw: [{"id": src["name"], "channel": src["name"]}],
@@ -124,8 +137,12 @@ def test_a_harvest_logs_the_change_in_a_sources_access_state(harness):
     assert lines[1]["held_max_s"] is not None
 
 
-def test_a_standard_bot_check_goes_to_native_and_its_final_state_is_reported(harness):
-    """Cleared on the retry: one message, state ok, and two launches to get it."""
+def test_a_standard_bot_check_goes_to_native_and_each_method_keeps_its_own_state(harness):
+    """Cleared on the retry: one message, state ok, and two launches to get it.
+    The log holds both truths, because a check passed by one method says
+    nothing about the other: standard was blocked, native was fine."""
+    from event_harvester.sources import web_access_log
+
     FakeController.html_for = staticmethod(
         lambda kwargs: CONTENT if kwargs.get("native_chrome") else CHALLENGE,
     )
@@ -135,6 +152,23 @@ def test_a_standard_bot_check_goes_to_native_and_its_final_state_is_reported(har
     assert [m["id"] for m in out] == ["venue"]
     assert FakeController.launches == [{}, {"native_chrome": True}]
     assert _states() == {"venue": "ok"}
+    lines = [json.loads(line) for line in web_access_log.LOG_FILE.read_text().splitlines()]
+    assert [(line["method"], line["state"]) for line in lines] == [
+        ("standard", "blocked"), ("native", "ok"),
+    ]
+    run = json.loads(web_fetch._REPORT_FILE.read_text())["runs"][-1]
+    assert run["sources"]["venue"]["method"] == "native"
+
+
+def test_a_source_can_give_a_person_longer_to_clear_its_check(harness):
+    """Fifteen seconds is not long enough to reach a KVM. The window is the
+    source's to set, and it applies in the browser the harvest itself drives."""
+    web_fetch.fetch_web_sources([
+        _raw("erobay", native_chrome=True, bot_check_wait_s=120),
+        _raw("other", native_chrome=True),
+    ])
+
+    assert harness.waits == [120, 15]
 
 
 def test_a_hung_source_costs_only_itself_and_what_was_queued_behind_it(harness, monkeypatch):
