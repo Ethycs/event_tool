@@ -69,6 +69,9 @@ class FakeController:
     def open(self, url, **_kw):
         return self._context.new_page()
 
+    def new_page(self):
+        return self._context.new_page()
+
     def detect_all(self, page):
         return {"search": []}
 

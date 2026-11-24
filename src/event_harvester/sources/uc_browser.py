@@ -94,18 +94,11 @@ class WebBrowser:
         """A blank page, prepared the way ``open`` prepares one, not navigated.
 
         For callers that must attach listeners before the first request, or
-        that navigate with their own wait. The pinned controller has no public
-        way to make a page without navigating it, so this is the single place
-        its context and stealth plugin are touched.
+        that navigate with their own wait (``UCBrowser.new_page``). Attached
+        to the UC service, the page is leased to this client there.
         """
-        uc = self._controller()
-        page = uc._context.new_page()
+        page = self._controller().new_page()
         self._pages.append(page)
-        if uc._stealth_plugin:
-            try:
-                uc._stealth_plugin.apply_stealth_sync(page)
-            except Exception as e:  # noqa: BLE001 — stealth is best-effort
-                logger.debug("stealth failed on a new page: %s", e)
         return page
 
     def close_pages(self) -> int:

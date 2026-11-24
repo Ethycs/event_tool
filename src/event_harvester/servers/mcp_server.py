@@ -1119,14 +1119,15 @@ def build_server(
             "decline_event for obvious non-events or duplicates."
         )
 
-    # Site-specific automation tools (Grok). Lazy: doesn't spin up a
-    # browser until the first grok_* tool is called. Implementation
-    # lives in the universal_controller submodule so other projects
-    # using uc_browser get the same MCP surface for free.
+    # Site-specific automation tools (Grok). Thin clients of the Universal
+    # Controller service that event_tool names here (EH_UC_SERVICE_URL); the
+    # browser and the signed-in account live in that service, not in this
+    # process. With no service configured they still register, and answer
+    # with an error saying so; they never launch a browser of their own.
     try:
         from uc_browser.mcp.grok_tools import register_grok_tools
 
-        register_grok_tools(server)
+        register_grok_tools(server, service_url=load_config().web.uc_service or None)
     except Exception as e:  # pragma: no cover
         logger.warning("Skipped Grok MCP tools (import failed): %s", e)
 

@@ -274,13 +274,14 @@ class WebConfig:
     # via --debug-web-screenshots CLI flag or WEB_DEBUG_SCREENSHOTS=1
     # env var. Implies debug_trace=True — see load_config().
     debug_screenshots: bool = False
-    # The Universal Controller service, and the window of it that native-Chrome
-    # sources use. Both set: the native route attaches to that long-lived
-    # window, so a bot check a person clears there is cleared in a browser
-    # that does not close between runs. Either unset: the native route
-    # launches its own Chrome and closes it, as before. The two are different
-    # access methods and are logged separately. Env: WEB_UC_SERVICE (e.g.
-    # http://127.0.0.1:4010) and WEB_UC_NATIVE_WINDOW (e.g. native).
+    # The Universal Controller service (EH_UC_SERVICE_URL, e.g.
+    # http://127.0.0.1:4010). event_tool names it; nothing in the controller
+    # library reads the environment to find it. Used by the Grok MCP tools,
+    # and by the native web route when a window is named too
+    # (WEB_UC_NATIVE_WINDOW, e.g. native): the native route then attaches to
+    # that long-lived window. With no window named, the native route launches
+    # its own Chrome or attaches to one already open on its port, as before.
+    # Each is a different access method and is logged separately.
     uc_service: str = ""
     uc_native_window: str = ""
 
@@ -563,7 +564,7 @@ def load_config() -> AppConfig:
             parallel=max(1, int(os.getenv("WEB_PARALLEL", "3"))),
             debug_trace=os.getenv("WEB_DEBUG_TRACE", "").lower() in ("1", "true", "yes"),
             debug_screenshots=os.getenv("WEB_DEBUG_SCREENSHOTS", "").lower() in ("1", "true", "yes"),
-            uc_service=os.getenv("WEB_UC_SERVICE", "").strip(),
+            uc_service=os.getenv("EH_UC_SERVICE_URL", "").strip(),
             uc_native_window=os.getenv("WEB_UC_NATIVE_WINDOW", "").strip(),
         ),
         caps=CapConfig(

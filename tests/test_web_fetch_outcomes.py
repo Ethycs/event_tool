@@ -73,6 +73,9 @@ class FakeController:
     def open(self, url, **_kw):
         return self._context.new_page()
 
+    def new_page(self):
+        return self._context.new_page()
+
 
 class Harness(list):
     """The URLs whose cooldown was saved, plus the bot-check windows asked for."""

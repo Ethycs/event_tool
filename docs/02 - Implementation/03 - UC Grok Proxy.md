@@ -1,5 +1,7 @@
 # Calling `uc-grok` via the litellm proxy
-**Status:** CURRENT · **Date:** 2026-11-17 · **Applies to:** `litellm.config.yaml`, `uc_provider_loader.py`, `ext/universal_controller/uc_browser/sites/grok_fast.py` · **Depends on:** `docs/03 - Architecture/10 - LLM Layer & Interlock.md`
+**Status:** PARTLY SUPERSEDED 2026-11-24 — see the note below · **Date:** 2026-11-17 · **Applies to:** `litellm.config.yaml`, `uc_provider_loader.py`, `ext/universal_controller/uc_browser/sites/grok_fast.py` · **Depends on:** `docs/03 - Architecture/10 - LLM Layer & Interlock.md`
+
+> **2026-11-24: the proxy no longer runs from this repo.** On `smallblackbox` the Grok browser and account are held by the Universal Controller service (user unit `uc-service`, `127.0.0.1:4010`, window `grok`, profile still `data/.grok/.uc_chromium_profile` here), and the proxy is a thin HTTP client of it (user unit `uc-grok-proxy`, `127.0.0.1:4000`, same model names `uc-grok` and `grok-browser`). Both units run from `/home/rabbit/universal_controller` and its own environment; the proxy's config is that checkout's `grok-proxy.config.yaml`. This repo's `litellm.config.yaml` and `uc_provider_loader.py` are no longer what serves port 4000. The Grok MCP tools in `servers/mcp_server.py` are thin clients of the same service, named by `EH_UC_SERVICE_URL` in `.env`. What follows describes the earlier arrangement: the calling examples still hold; the unit, profile-launch and cookie-copy sections do not describe what is running. The as-built description of the service is in the controller's own `docs/`.
 
 The litellm proxy fronts our browser-driven Grok client as an OpenAI-compatible
 endpoint. Any OpenAI SDK, curl, Cline/Continue plugin, etc. that can point at a
