@@ -107,6 +107,12 @@ def _devtools(endpoint: str, path: str, method: str = "GET"):
         return body
 
 
+#: Seconds an unattached page may go on showing its own address as its title
+#: (not rendered yet) before it is given up on. Separate from a source's
+#: ``bot_check_wait_s``, which is how long a bot-check title is waited out.
+LOAD_WAIT_S = 30
+
+
 def _wait_through(read_title, url: str, wait_s: int) -> tuple[bool, str]:
     """Read a page's title once a second until it is past its bot check.
 
@@ -114,22 +120,56 @@ def _wait_through(read_title, url: str, wait_s: int) -> tuple[bool, str]:
     for every way of loading a page unattached: through when, on two
     consecutive reads, the title is not empty, is not still the address (the
     page has not rendered yet) and is not a bot-check title.
+
+    Two things can keep a page from being through and they have their own
+    clocks: a bot-check title is waited out for ``wait_s`` seconds, a page
+    that has not rendered for ``LOAD_WAIT_S``. The caller tells them apart by
+    the last title (:func:`not_through`). Measured 2026-11-24 on ``ra-sf``:
+    its title is ``ra.co`` while it loads, for 1 to 5 s on three runs and for
+    more than 15 s on a fourth, which one shared 15 s clock reported as a bot
+    check that was never there.
     """
     from event_harvester.sources.web_utils import is_bot_check
 
     bare = url.split("://", 1)[-1]
-    title, settled = "", 0
-    for second in range(1, wait_s + 1):
+    title, settled, checking, loading_for = "", 0, 0, 0
+    for second in range(1, wait_s + LOAD_WAIT_S + 1):
         time.sleep(1)
         now = read_title()
         if now != title:
             logger.info("Unattached page, %ds in: title %r -> %r", second, title[:80], now[:80])
             title = now
         loading = not title or title in url or bare.startswith(title)
-        settled = 0 if loading or is_bot_check(title) else settled + 1
+        check = not loading and is_bot_check(title)
+        settled = 0 if loading or check else settled + 1
+        checking += check
+        loading_for += loading
         if settled >= 2:
             return True, title
+        if checking >= wait_s or loading_for >= LOAD_WAIT_S:
+            break
     return False, title
+
+
+def not_through(title: str, wait_s: int) -> Exception:
+    """The error for a page that did not get through, by what it last showed.
+
+    A bot-check title is a block: it needs a person. Anything else is a page
+    that did not render, which is a deviation and says nothing about a check.
+    """
+    from event_harvester.sources.web_utils import SourceBlocked, SourceDeviated, is_bot_check
+
+    if is_bot_check(title):
+        return SourceBlocked(
+            "the source's page", "cloudflare_challenge",
+            f"a bot check was still up after {wait_s}s in the native browser with "
+            f"nothing attached (title {title[:60]!r})",
+        )
+    return SourceDeviated(
+        "the source's page", "not_loaded",
+        f"the page had not rendered after {LOAD_WAIT_S}s in the native browser with "
+        f"nothing attached (title still {title[:60]!r})",
+    )
 
 
 def pass_check_unattached(endpoint: str, url: str, wait_s: int) -> tuple[bool, str]:
@@ -227,19 +267,13 @@ def native_browser(url: str, wait_s: int) -> "WebBrowser":
 
     For callers that hold one browser on one address (the explore tool, the
     CLI replay). Attaching first can itself stop a bot check from finishing,
-    so the address is loaded unattached before the browser is handed out, and
-    a page that does not get through raises ``SourceBlocked``.
+    so the address is loaded unattached before the browser is handed out. A
+    page that does not get through raises what :func:`not_through` says it is.
     """
-    from event_harvester.sources.web_utils import SourceBlocked
-
     _method, uc_kwargs = native_route()
     through, title = prepare_native(uc_kwargs, url, wait_s)
     if not through:
-        raise SourceBlocked(
-            "the page", "cloudflare_challenge",
-            f"not through after {wait_s}s in the native browser with nothing attached "
-            f"(title {title[:60]!r})",
-        )
+        raise not_through(title, wait_s)
     return WebBrowser(**uc_kwargs)
 
 

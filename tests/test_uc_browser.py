@@ -222,6 +222,24 @@ def test_a_page_still_showing_its_address_has_not_loaded(devtools):
     assert uc_browser.pass_check_unattached("http://b", URL, 4)[0] is False
 
 
+def test_a_slow_page_gets_its_own_clock_and_is_not_called_a_bot_check(devtools):
+    """Measured on ra-sf: its title is `ra.co` while it loads. One run took more
+    than its 15 s bot-check wait to render and was reported blocked by a check
+    that was never on the page."""
+    from event_harvester.sources.web_utils import SourceBlocked, SourceDeviated
+
+    slow = ["venue.example"] * 20 + ["Venue calendar"]
+    devtools(slow)
+    assert uc_browser.pass_check_unattached("http://b", URL, 15) == (True, "Venue calendar")
+
+    devtools(["venue.example"])
+    through, title = uc_browser.pass_check_unattached("http://b", URL, 15)
+    assert not through
+    never_rendered = uc_browser.not_through(title, 15)
+    assert isinstance(never_rendered, SourceDeviated) and not isinstance(never_rendered, SourceBlocked)
+    assert isinstance(uc_browser.not_through("Just a moment...", 15), SourceBlocked)
+
+
 def test_a_configured_service_window_wins_and_nothing_else_is_tried(monkeypatch):
     """Once the service owns the native profile, a caller that fell back to
     the open port or to launching would start a second browser on it."""

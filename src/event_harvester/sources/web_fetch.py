@@ -652,18 +652,15 @@ def fetch_web_sources(
         check does not finish while one is. Only once that page is through
         does this attach, for this source alone, and detach again. A check
         that does not finish unattached is `blocked` without attaching: an
-        attached attempt cleared one once in seven measured runs.
+        attached attempt cleared one once in seven measured runs. A page that
+        never rendered is `deviated`, not blocked: nothing says a check was up.
         """
-        from event_harvester.sources.uc_browser import WebBrowser, prepare_native
+        from event_harvester.sources.uc_browser import WebBrowser, not_through, prepare_native
 
         wait_s = int(src.get("bot_check_wait_s", BOT_CHECK_WAIT_S))
         through, title = prepare_native(uc_kwargs, src["url"], wait_s)
         if not through:
-            raise SourceBlocked(
-                "the source's page", "cloudflare_challenge",
-                f"not through after {wait_s}s in the native browser with nothing attached "
-                f"(title {title[:60]!r})",
-            )
+            raise not_through(title, wait_s)
         with WebBrowser(**uc_kwargs) as uc:
             try:
                 return _browser_source(uc, src, True, cf_retries, tracer=tracer, capture=capture)
