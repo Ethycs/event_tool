@@ -615,6 +615,17 @@ def fetch_web_sources(
         from event_harvester.sources.uc_browser import WebBrowser
 
         native = final
+        if "cdp_endpoint" in uc_kwargs:
+            # A person's open browser: attach per source, after its page has
+            # loaded there with nothing attached. See `_open_browser_source`.
+            for src in group.sources:
+                if group.abandoned:
+                    break
+                _run_source(
+                    group, src,
+                    partial(_open_browser_source, uc_kwargs, src, group.cf_retries),
+                )
+            return
         with WebBrowser(**uc_kwargs) as uc:
             for src in group.sources:
                 if group.abandoned:
@@ -632,6 +643,31 @@ def fetch_web_sources(
                         logger.debug(
                             "%s: closed %d page(s) left open.", src.get("name"), leaked,
                         )
+
+    def _open_browser_source(uc_kwargs: dict, src: dict, cf_retries: list, *, tracer, capture):
+        """One source through a person's open browser (``native:open-browser``).
+
+        Its page is first loaded there with no client attached, because a bot
+        check does not finish while one is. Only once that page is through
+        does this attach, for this source alone, and detach again. A check
+        that does not finish unattached is `blocked` without attaching: an
+        attached attempt cleared one once in seven measured runs.
+        """
+        from event_harvester.sources.uc_browser import WebBrowser, pass_check_unattached
+
+        wait_s = int(src.get("bot_check_wait_s", BOT_CHECK_WAIT_S))
+        through, title = pass_check_unattached(uc_kwargs["cdp_endpoint"], src["url"], wait_s)
+        if not through:
+            raise SourceBlocked(
+                "the source's page", "cloudflare_challenge",
+                f"not through after {wait_s}s in the open browser with nothing attached "
+                f"(title {title[:60]!r})",
+            )
+        with WebBrowser(**uc_kwargs) as uc:
+            try:
+                return _browser_source(uc, src, True, cf_retries, tracer=tracer, capture=capture)
+            finally:
+                uc.close_pages()
 
     # How the native route gets its browser. Named here, by the client: a
     # window of the UC service when one is configured, else whatever

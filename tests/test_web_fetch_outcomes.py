@@ -101,6 +101,9 @@ def harness(monkeypatch):
     monkeypatch.setattr(web_fetch, "_wait_cloudflare", wait)
     monkeypatch.setattr(uc_browser, "_port_open", lambda port: False)
     monkeypatch.setattr(
+        uc_browser, "pass_check_unattached", lambda endpoint, url, wait_s: (True, "a page"),
+    )
+    monkeypatch.setattr(
         web_fetch, "_do_raw",
         lambda uc, src, page=None, **_kw: [{"id": src["name"], "channel": src["name"]}],
     )
@@ -127,6 +130,20 @@ def test_attaching_to_an_open_browser_is_logged_as_its_own_method(harness, monke
         {"cdp_endpoint": "http://127.0.0.1:9222", "label": "event_tool"},
     ]
     assert all(line["was"] is None for line in lines)  # two methods, two first sights
+
+
+def test_a_check_that_does_not_finish_unattached_is_blocked_without_attaching(harness, monkeypatch):
+    """Attaching to a page whose check is still running is what stops it from
+    finishing, so the harvest must not attach to find out."""
+    monkeypatch.setattr(uc_browser, "_port_open", lambda port: True)
+    monkeypatch.setattr(
+        uc_browser, "pass_check_unattached",
+        lambda endpoint, url, wait_s: (False, "Just a moment..."),
+    )
+
+    assert web_fetch.fetch_web_sources([_raw("erobay", native_chrome=True)]) == []
+    assert _states() == {"erobay": "blocked"}
+    assert FakeController.launches == []
 
 
 def _states() -> dict[str, str]:

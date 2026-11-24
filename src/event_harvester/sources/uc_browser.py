@@ -27,6 +27,7 @@ store, ``timeout_ms``.
 from __future__ import annotations
 
 import logging
+import time
 
 from uc_browser import BrowserMode, UCBrowser
 
@@ -68,6 +69,63 @@ def native_route() -> tuple[str, dict]:
             "cdp_endpoint": f"http://127.0.0.1:{NATIVE_CDP_PORT}", "label": "event_tool",
         }
     return "native", {"native_chrome": True}
+
+
+def _devtools(endpoint: str, path: str, method: str = "GET"):
+    """One call to the browser's own HTTP endpoint. Not a CDP session."""
+    import json
+    import urllib.request
+
+    request = urllib.request.Request(f"{endpoint}{path}", method=method)
+    with urllib.request.urlopen(request, timeout=10) as response:  # noqa: S310 — loopback
+        body = response.read().decode("utf-8", "replace")
+    try:
+        return json.loads(body)
+    except ValueError:
+        return body
+
+
+def pass_check_unattached(endpoint: str, url: str, wait_s: int) -> tuple[bool, str]:
+    """Load ``url`` in the open browser with no client attached; wait for it.
+
+    Returns ``(through, last title)``. The page is opened, watched and closed
+    through the browser's HTTP endpoints (``/json/new``, ``/json/list``,
+    ``/json/close``), so no CDP session exists while its bot check runs.
+    Measured 2026-11-24 on erobay: loaded this way the check finished by
+    itself within 8 s and the harvest, attaching afterwards, was not
+    challenged; with a client attached from the start the same check span for
+    120 s. It did not finish this way while the X screen was blanked.
+
+    A title that is still the address means the page has not rendered yet.
+    """
+    from urllib.parse import quote
+
+    from event_harvester.sources.web_utils import is_bot_check
+
+    tab = _devtools(endpoint, "/json/new?" + quote(url, safe=":/?="), method="PUT")
+    tab_id = tab["id"]
+    bare = url.split("://", 1)[-1]
+    title, settled = "", 0
+    try:
+        for second in range(1, wait_s + 1):
+            time.sleep(1)
+            now = next(
+                (str(t.get("title", "")) for t in _devtools(endpoint, "/json/list")
+                 if t.get("id") == tab_id), "",
+            )
+            if now != title:
+                logger.info("Unattached page, %ds in: title %r -> %r", second, title[:80], now[:80])
+                title = now
+            loading = not title or title in url or bare.startswith(title)
+            settled = 0 if loading or is_bot_check(title) else settled + 1
+            if settled >= 2:
+                return True, title
+        return False, title
+    finally:
+        try:
+            _devtools(endpoint, f"/json/close/{tab_id}")
+        except Exception as e:  # noqa: BLE001 — the tab may already be gone
+            logger.debug("closing the unattached tab failed: %s", e)
 
 
 class WebBrowser:

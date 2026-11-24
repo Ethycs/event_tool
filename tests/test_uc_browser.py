@@ -166,3 +166,57 @@ def test_a_detail_tab_whose_navigation_fails_is_still_closed(controller):
         assert failed.closed and loaded.closed
     assert results[0] == (links[0], None)
     assert results[1][0] is links[1] and "Doors at eight." in results[1][1]
+
+
+class FakeDevtools:
+    """Chrome's HTTP endpoint: one tab, whose title follows ``titles``."""
+
+    def __init__(self, titles):
+        self.titles = list(titles)
+        self.calls: list[tuple[str, str]] = []
+
+    def __call__(self, endpoint, path, method="GET"):
+        self.calls.append((method, path))
+        if path.startswith("/json/new"):
+            return {"id": "TAB"}
+        if path == "/json/list":
+            title = self.titles.pop(0) if len(self.titles) > 1 else self.titles[0]
+            return [{"id": "OTHER", "title": "New Tab"}, {"id": "TAB", "title": title}]
+        return "Target is closing"
+
+
+URL = "https://venue.example/cal.pl?Op=ShowIt&Name=Community"
+
+
+@pytest.fixture
+def devtools(monkeypatch):
+    monkeypatch.setattr(uc_browser.time, "sleep", lambda _s: None)
+
+    def install(titles):
+        fake = FakeDevtools(titles)
+        monkeypatch.setattr(uc_browser, "_devtools", fake)
+        return fake
+
+    return install
+
+
+def test_an_unattached_page_is_through_once_its_check_is_gone(devtools):
+    fake = devtools(["venue.example/cal.pl?Op=ShowIt", "Just a moment...", "Venue calendar"])
+
+    assert uc_browser.pass_check_unattached("http://b", URL, 30) == (True, "Venue calendar")
+    # The whole address reaches the browser: a bare `&` would end it early.
+    assert fake.calls[0] == ("PUT", "/json/new?https://venue.example/cal.pl?Op=ShowIt%26Name=Community")
+    assert fake.calls[-1] == ("GET", "/json/close/TAB")
+
+
+def test_a_check_that_never_finishes_is_not_through_and_its_tab_is_closed(devtools):
+    fake = devtools(["Just a moment..."])
+
+    assert uc_browser.pass_check_unattached("http://b", URL, 5) == (False, "Just a moment...")
+    assert fake.calls[-1] == ("GET", "/json/close/TAB")
+
+
+def test_a_page_still_showing_its_address_has_not_loaded(devtools):
+    devtools(["venue.example/cal.pl?Op=ShowIt&Name=Community"])
+
+    assert uc_browser.pass_check_unattached("http://b", URL, 4)[0] is False
