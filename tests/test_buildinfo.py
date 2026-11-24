@@ -83,6 +83,26 @@ class TestStaleness:
         assert first == second
         assert buildinfo.booted_sha.cache_info().hits >= 1
 
+    def test_each_server_records_its_commit_at_start_not_at_the_first_question(self):
+        """Measured 2026-11-24: a server started at 05:47 on one commit, first
+        asked at 05:53 after another, reported the later commit, a 05:53 start
+        and `stale: false`. The modules imported buildinfo inside the handler."""
+        import subprocess
+        import sys
+
+        probe = (
+            "import sys, importlib\n"
+            "importlib.import_module(sys.argv[1])\n"
+            "b = sys.modules.get('event_harvester.buildinfo')\n"
+            "print(bool(b) and b.booted_sha.cache_info().currsize)\n"
+        )
+        for module in ("mcp_server", "gateway", "site"):
+            out = subprocess.run(
+                [sys.executable, "-c", probe, f"event_harvester.servers.{module}"],
+                capture_output=True, text=True, timeout=120,
+            )
+            assert out.stdout.strip().endswith("1"), (module, out.stdout, out.stderr[-300:])
+
 
 class TestBuildInfo:
     def test_it_carries_what_a_diagnosis_needs(self):

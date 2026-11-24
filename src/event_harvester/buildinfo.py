@@ -80,6 +80,14 @@ def booted_sha() -> str | None:
     return _read_head_sha()
 
 
+# Read it now, at import. Every long-lived surface imports this module at its
+# own top level, so "now" is process start. Until 2026-11-24 each surface
+# imported it inside its health handler and the first call filled the cache:
+# a server started on one commit and first asked after a later one reported
+# the later commit, a start time hours late, and `stale: false`.
+booted_sha()
+
+
 def current_sha() -> str | None:
     """The SHA checked out right now. Uncached, read every call."""
     return _read_head_sha()

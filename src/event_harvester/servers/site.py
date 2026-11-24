@@ -33,6 +33,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+# buildinfo records the commit and the time at import, which must be process
+# start, so it is imported here and not in the health handler.
+from event_harvester.buildinfo import build_info
 from event_harvester.observability.metrics import count, record
 from event_harvester.observability.tracing import get_tracer, set_span_attrs, traced
 from event_harvester.utils import REPO_ROOT, data_path
@@ -559,8 +562,6 @@ def build_app(cfg, *, interval_hours: float = DEFAULT_INTERVAL_HOURS,
         # Identity, so "is this service running current code?" is a field
         # rather than an investigation. See buildinfo.py.
         try:
-            from event_harvester.buildinfo import build_info
-
             payload["build"] = build_info()
         except Exception as e:  # noqa: BLE001 - health must never 500
             payload["build"] = {"error": f"{type(e).__name__}: {e}"}

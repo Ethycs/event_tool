@@ -22,6 +22,10 @@ from datetime import date, datetime, timezone
 from typing import Any
 
 from event_harvester import __version__
+
+# buildinfo records the commit and the time at import, which must be process
+# start, so it is imported here and not in the tool that reports it.
+from event_harvester.buildinfo import build_info
 from event_harvester.cli.parse_helpers import VALID_PLATFORMS, resolve_platforms
 from event_harvester.config import AppConfig, load_config
 from event_harvester.observability.tracing import traced
@@ -623,7 +627,6 @@ def build_server(
     def config_summary() -> dict[str, Any]:
         """Return enabled sources, caps, credential readiness, and identity."""
         from event_harvester import jobs
-        from event_harvester.buildinfo import build_info
 
         summary = _summarize_config(load_config())
         # Which code this process is running, and whether it owns the queue.

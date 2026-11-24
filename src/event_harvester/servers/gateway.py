@@ -43,6 +43,10 @@ import logging
 import os
 from typing import Any
 
+# Imported here, not in the health handler: it records the commit and the time
+# at import, which must be process start. See buildinfo.py.
+from event_harvester.buildinfo import build_info
+
 logger = logging.getLogger("event_harvester.gateway")
 
 DEFAULT_HOST = "127.0.0.1"
@@ -238,8 +242,6 @@ def build_gateway(env: dict[str, str] | None = None, *, name: str = "gateway") -
     @gateway.custom_route("/healthz", methods=["GET"])
     async def _healthz(_request):  # pragma: no cover - exercised by run
         from starlette.responses import JSONResponse
-
-        from event_harvester.buildinfo import build_info
 
         # Says nothing about backends or auth — it is reachable by anyone who
         # can reach the port, including before auth. Build identity is not
