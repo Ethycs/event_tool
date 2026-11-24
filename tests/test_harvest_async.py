@@ -260,3 +260,39 @@ class TestWebSourceFilter:
         all_src = [{"name": "luma", "url": "u1"}]
         got = self._run_with_filter(cfg, monkeypatch, all_sources=all_src)
         assert got == "UNSET"
+
+    def test_one_sources_cached_messages_are_not_served_to_another(self, cfg, monkeypatch):
+        """Measured 2026-11-24: a job for `midway` returned the 273 messages an
+        `erobay` job had cached two hours earlier, and fetched nothing."""
+        all_src = [{"name": "erobay", "url": "u1"}, {"name": "midway", "url": "u2"}]
+        fetched: list[str] = []
+
+        def fake_fetch(**kw):
+            names = [s["name"] for s in kw["sources"]]
+            fetched.extend(names)
+            return [{**_make_msg("web"), "id": n, "channel": n} for n in names]
+
+        monkeypatch.setattr(
+            "event_harvester.sources.web_fetch._load_web_sources", lambda: all_src,
+        )
+
+        def run(name):
+            return asyncio.run(harvest_mod.harvest_messages(
+                cfg, no_discord=True, no_telegram=True, no_gmail=True, no_signal=True,
+                web_source=name,
+            ))
+
+        patches = _patch_all_sources(web=lambda **kw: fake_fetch(**kw))
+        for p in patches:
+            p.start()
+        try:
+            run("erobay")
+            second = run("midway")
+            repeat = run("midway")
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert [m["channel"] for m in second] == ["midway"]
+        assert [m["channel"] for m in repeat] == ["midway"]
+        assert fetched == ["erobay", "midway"]  # the repeat came from the cache

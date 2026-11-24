@@ -76,6 +76,13 @@ async def harvest_messages(
             ("web", no_web),
         ] if not skip
     )
+    # Which web sources this run is limited to (empty: all of them). Part of
+    # the cache's identity, in the same order of precedence `_run_web` applies:
+    # a run of one source must not be served the messages of another.
+    web_filter = [] if no_web else sorted(
+        n.lower()
+        for n in (web_sources or ([web_source] if web_source else cfg.web.selected_names) or [])
+    )
 
     # ── Load from file ────────────────────────────────────────────────────
     if load_path:
@@ -96,6 +103,7 @@ async def harvest_messages(
             if (
                 datetime.now(timezone.utc) - cached_at < CACHE_MAX_AGE
                 and cached_sources == active_sources
+                and cache_data.get("web_filter") == web_filter
             ):
                 messages = cache_data["messages"]
                 age_min = int((datetime.now(timezone.utc) - cached_at).total_seconds() / 60)
@@ -361,6 +369,7 @@ async def harvest_messages(
                     json.dumps({
                         "cached_at": datetime.now(timezone.utc).isoformat(),
                         "sources": active_sources,
+                        "web_filter": web_filter,
                         "messages": cache_msgs,
                     }, ensure_ascii=False),
                     encoding="utf-8",
