@@ -237,6 +237,8 @@ async def harvest_messages(
                             "parallel": cfg.web.parallel,
                             "debug_trace": getattr(cfg.web, "debug_trace", False),
                             "debug_screenshots": getattr(cfg.web, "debug_screenshots", False),
+                            "uc_service": getattr(cfg.web, "uc_service", ""),
+                            "uc_native_window": getattr(cfg.web, "uc_native_window", ""),
                         }
                         # Merge filter sources: explicit `web_sources` list wins,
                         # then the single-name `web_source` (back-compat shim),

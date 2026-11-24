@@ -20,6 +20,7 @@ locations (``web_utils`` / ``web_modes.*``).
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -128,8 +129,12 @@ class SourceOutcome:
 class _Group:
     """One worker thread: its sources, what it has produced, where it is."""
 
-    def __init__(self, label: str, method: str, sources: list[dict], work):
+    def __init__(self, label: str, method: str, sources: list[dict], work, on_abandon=None):
         self.label = label
+        #: Called once if the group is given up on. For a group attached to
+        #: the UC service this revokes its pages there, which is what
+        #: unblocks the stuck thread.
+        self.on_abandon = on_abandon
         #: The access method every source in this group is reached by. A
         #: check passed by one method says nothing about another, so states
         #: are recorded per method.
@@ -155,6 +160,19 @@ class _Group:
             self.error = e
         finally:
             self.done.set()
+
+
+def _revoke(service: str, label: str) -> None:
+    """Have the UC service close the pages of the client(s) labelled ``label``.
+
+    A thread stuck in a browser call cannot be killed from here. The service
+    holds the browser, so it can close the page under the call, and the call
+    then fails and the thread unwinds.
+    """
+    from uc_browser.service.client import ServiceClient
+
+    result = ServiceClient(service).revoke(label)
+    logger.warning("Revoked %s at the UC service: %s", label, result)
 
 
 def _log_access(name: str, state: str, detail: str, method: str, *,
@@ -211,6 +229,11 @@ def _await_groups(groups: list[_Group], outcomes: dict[str, SourceOutcome],
                     continue
                 group.abandoned = True
             pending.remove(group)
+            if group.on_abandon is not None:
+                try:
+                    group.on_abandon()
+                except Exception as e:  # noqa: BLE001 — best effort; the run goes on
+                    logger.warning("Could not release the hung group %s: %s", group.label, e)
             name = src.get("name", src["url"])
             logger.error(
                 "%s: no result after %.0fs — giving up on it and on its browser.", name, ran,
@@ -303,6 +326,8 @@ def fetch_web_sources(
     parallel: int = 1,
     debug_trace: bool = False,
     debug_screenshots: bool = False,
+    uc_service: str = "",
+    uc_native_window: str = "",
 ) -> list[dict]:
     """Fetch events from all configured web sources.
 
@@ -580,11 +605,14 @@ def fetch_web_sources(
                 pass
         return msgs
 
-    def _browser_work(uc_kwargs: dict, group: _Group) -> None:
-        """One browser for the group, its sources one after another."""
+    def _browser_work(uc_kwargs: dict, final: bool, group: _Group) -> None:
+        """One browser for the group, its sources one after another.
+
+        ``final``: there is no further route to hand a bot-checked source to.
+        """
         from event_harvester.sources.uc_browser import WebBrowser
 
-        native = bool(uc_kwargs.get("native_chrome"))
+        native = final
         with WebBrowser(**uc_kwargs) as uc:
             for src in group.sources:
                 if group.abandoned:
@@ -603,6 +631,19 @@ def fetch_web_sources(
                             "%s: closed %d page(s) left open.", src.get("name"), leaked,
                         )
 
+    # How the native route gets its browser. Named here, by the client: a
+    # window of the UC service when one is configured, else a Chrome this run
+    # launches and closes. They are different methods and are logged as
+    # such: a check cleared by one does not carry to the other.
+    on_abandon = None
+    if uc_service and uc_native_window:
+        label = f"event_tool:{os.getpid()}:{int(time.time())}"
+        native_method = f"service:{uc_native_window}"
+        native_browser = {"service": uc_service, "window": uc_native_window, "label": label}
+        on_abandon = partial(_revoke, uc_service, label)
+    else:
+        native_method, native_browser = "native", {"native_chrome": True}
+
     # One worker for the plain-HTTP sources; standard browser sources split
     # across ``parallel`` browsers; native_chrome stays in one bucket. Each
     # browser group runs in its own thread with its own Playwright instance.
@@ -611,15 +652,19 @@ def fetch_web_sources(
     if http_srcs:
         groups.append(_Group("http", "http", http_srcs, _http_work))
     for i, chunk in enumerate(standard_chunks):
-        groups.append(_Group(f"standard-{i}", "standard", chunk, partial(_browser_work, {})))
+        groups.append(_Group(
+            f"standard-{i}", "standard", chunk, partial(_browser_work, {}, False),
+        ))
     if native_srcs:
         groups.append(_Group(
-            "native", "native", native_srcs, partial(_browser_work, {"native_chrome": True}),
+            "native", native_method, native_srcs,
+            partial(_browser_work, native_browser, True), on_abandon=on_abandon,
         ))
     logger.info(
         "Web fetch: %d source(s) over plain HTTP; %d standard source(s) across "
-        "%d browser(s); %d native_chrome source(s) serial.",
+        "%d browser(s); %d native_chrome source(s) serial via %s.",
         len(http_srcs), len(standard_srcs), len(standard_chunks), len(native_srcs),
+        native_method,
     )
     _await_groups(groups, outcomes)
 
@@ -628,8 +673,8 @@ def fetch_web_sources(
     if cf_retries:
         logger.info("Retrying %d source(s) with native Chrome (Cloudflare)...", len(cf_retries))
         retry = _Group(
-            "native-retry", "native", cf_retries,
-            partial(_browser_work, {"native_chrome": True}),
+            "native-retry", native_method, cf_retries,
+            partial(_browser_work, native_browser, True), on_abandon=on_abandon,
         )
         groups.append(retry)
         _await_groups([retry], outcomes)
