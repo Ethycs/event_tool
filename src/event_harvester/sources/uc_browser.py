@@ -205,7 +205,14 @@ def prepare_native(uc_kwargs: dict, url: str, wait_s: int) -> tuple[bool, str]:
     reservation in the UC service's window, or the open browser's own HTTP
     endpoints. A Chrome this run launches has no unattached state to load a
     page in, so there is nothing to prepare.
+
+    A browser whose window is minimized is refused first
+    (:class:`native_window.NativeWindowNotDrawn`): nothing in it is drawn, so
+    a page there would not get through and the wait would only be spent.
     """
+    from event_harvester.sources.native_window import require_drawn
+
+    require_drawn(uc_kwargs)
     if "service" in uc_kwargs:
         return pass_check_in_service(
             uc_kwargs["service"], uc_kwargs["window"], uc_kwargs.get("label"), url, wait_s,
