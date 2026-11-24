@@ -24,7 +24,8 @@
     "native_chrome": true,
     "cooldown_hours": 4,
     "scroll_seconds": 5,
-    "bot_check_wait_s": 120
+    "bot_check_wait_s": 120,
+    "keep_page_open": true
   },
   {
     "url": "https://www.instagram.com/",
