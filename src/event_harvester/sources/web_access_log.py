@@ -57,8 +57,8 @@ def record(source: str, state: str, detail: str = "", *, messages: int = 0,
            observed: bool = True, at: datetime | None = None) -> dict | None:
     """Record one access to ``source``. Returns the line written, if any.
 
-    ``at`` is for an observation made earlier than now (a check a person
-    cleared at the browser, a state read back from a journal).
+    Called by the code that made the access, as it finishes. Nothing is
+    entered by hand. ``at`` sets the clock for tests.
     """
     now = at or datetime.now(timezone.utc)
     with _lock:
