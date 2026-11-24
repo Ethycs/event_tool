@@ -32,14 +32,50 @@ from uc_browser import BrowserMode, UCBrowser
 
 logger = logging.getLogger("event_harvester.uc_browser")
 
-__all__ = ["BrowserMode", "WebBrowser"]
+__all__ = ["BrowserMode", "NATIVE_CDP_PORT", "WebBrowser", "native_route"]
+
+#: The debugging port of the Chrome a person keeps open for sources whose bot
+#: check only a person can clear (the ``uc-native-window`` user unit).
+NATIVE_CDP_PORT = 9222
+
+
+def _port_open(port: int) -> bool:
+    import socket
+
+    with socket.socket() as s:
+        s.settimeout(0.5)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def native_route() -> tuple[str, dict]:
+    """How native-Chrome work gets its browser now: ``(method, WebBrowser arguments)``.
+
+    A Chrome open on the native port is attached to by naming its endpoint:
+    the controller launches nothing, and on exit closes only the pages this
+    client opened. With nothing listening there, the controller launches
+    Chrome itself and closes it. They are different access methods and are
+    logged as such. Measured 2026-11-24 on erobay: a check a person cleared in
+    an open, unattached Chrome held for the pages opened after it; the same
+    check never completed in a Chrome launched with the automation attached
+    (two attended runs of 120 s, two unattended of 60 s).
+
+    The endpoint is named here, by event_tool. The controller does not look
+    for an open browser on its own (it did until ``04b200f``), and it refuses
+    to launch on a profile another browser holds.
+    """
+    if _port_open(NATIVE_CDP_PORT):
+        return "native:open-browser", {
+            "cdp_endpoint": f"http://127.0.0.1:{NATIVE_CDP_PORT}", "label": "event_tool",
+        }
+    return "native", {"native_chrome": True}
 
 
 class WebBrowser:
     """A controlled browser for one thread.
 
     ``uc_kwargs`` go to ``UCBrowser`` unchanged (``native_chrome=True``,
-    ``mode=BrowserMode.CHROMIUM_EXT``, ...). Sync Playwright is bound to the
+    ``mode=BrowserMode.CHROMIUM_EXT``, ``cdp_endpoint=...``, ...). Native work
+    takes them from :func:`native_route`. Sync Playwright is bound to the
     thread that started it, so use one instance per thread.
     """
 

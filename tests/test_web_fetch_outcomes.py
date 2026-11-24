@@ -99,7 +99,7 @@ def harness(monkeypatch):
 
     saved.waits = waits
     monkeypatch.setattr(web_fetch, "_wait_cloudflare", wait)
-    monkeypatch.setattr(web_fetch, "_port_open", lambda port: False)
+    monkeypatch.setattr(uc_browser, "_port_open", lambda port: False)
     monkeypatch.setattr(
         web_fetch, "_do_raw",
         lambda uc, src, page=None, **_kw: [{"id": src["name"], "channel": src["name"]}],
@@ -114,11 +114,18 @@ def test_attaching_to_an_open_browser_is_logged_as_its_own_method(harness, monke
     from event_harvester.sources import web_access_log
 
     web_fetch.fetch_web_sources([_raw("erobay", native_chrome=True)])
-    monkeypatch.setattr(web_fetch, "_port_open", lambda port: True)
+    monkeypatch.setattr(uc_browser, "_port_open", lambda port: True)
     web_fetch.fetch_web_sources([_raw("erobay", native_chrome=True)])
 
     lines = [json.loads(line) for line in web_access_log.LOG_FILE.read_text().splitlines()]
     assert [line["method"] for line in lines] == ["native", "native:open-browser"]
+    # The open browser is attached to by naming it. Asking the controller for
+    # native Chrome there would launch a second browser on a held profile,
+    # which it refuses (measured 2026-11-24: every native source failed).
+    assert FakeController.launches == [
+        {"native_chrome": True},
+        {"cdp_endpoint": "http://127.0.0.1:9222", "label": "event_tool"},
+    ]
     assert all(line["was"] is None for line in lines)  # two methods, two first sights
 
 

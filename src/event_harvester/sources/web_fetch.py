@@ -164,19 +164,6 @@ class _Group:
             self.done.set()
 
 
-#: The fixed debugging port the pinned controller's native mode launches
-#: Chrome on, and attaches to if something already answers there.
-NATIVE_CDP_PORT = 9222
-
-
-def _port_open(port: int) -> bool:
-    import socket
-
-    with socket.socket() as s:
-        s.settimeout(0.5)
-        return s.connect_ex(("127.0.0.1", port)) == 0
-
-
 def _revoke(service: str, label: str) -> None:
     """Have the UC service close the pages of the client(s) labelled ``label``.
 
@@ -647,26 +634,20 @@ def fetch_web_sources(
                         )
 
     # How the native route gets its browser. Named here, by the client: a
-    # window of the UC service when one is configured, else a Chrome this run
-    # launches and closes. They are different methods and are logged as
-    # such: a check cleared by one does not carry to the other.
+    # window of the UC service when one is configured, else whatever
+    # ``native_route`` finds (a person's open Chrome, or one this run
+    # launches). They are different methods and are logged as such: a check
+    # cleared by one does not carry to the other.
+    from event_harvester.sources.uc_browser import native_route
+
     on_abandon = None
     if uc_service and uc_native_window:
         label = f"event_tool:{os.getpid()}:{int(time.time())}"
         native_method = f"service:{uc_native_window}"
         native_browser = {"service": uc_service, "window": uc_native_window, "label": label}
         on_abandon = partial(_revoke, uc_service, label)
-    elif _port_open(NATIVE_CDP_PORT):
-        # A Chrome is already open on the native port, so the controller will
-        # attach to it and not launch one. That is a different method from a
-        # Chrome this run starts with the automation attached from the first
-        # request. Measured 2026-11-24 on erobay: a check a person cleared in
-        # an open, unattached Chrome held for the pages opened after it; the
-        # same check never completed in a Chrome launched with the automation
-        # attached (two attended runs of 120 s, two unattended of 60 s).
-        native_method, native_browser = "native:open-browser", {"native_chrome": True}
     else:
-        native_method, native_browser = "native", {"native_chrome": True}
+        native_method, native_browser = native_route()
 
     # One worker for the plain-HTTP sources; standard browser sources split
     # across ``parallel`` browsers; native_chrome stays in one bucket. Each
