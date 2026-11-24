@@ -196,7 +196,21 @@ Every source ends a run in exactly one state, recorded as a `SourceOutcome`:
 
 **The access log** (`sources/web_access_log.py`, 2026-11-24). Some things about a source cannot be read off it and can only be observed: how long a passed bot check lasts is the case that prompted this (the clearance cookie says a year; the site decides). So every outcome is compared, as it happens and in the client, with the last outcome for that source **by the same access method**, and appended to `data/.web_access_log.jsonl`.
 
-**Methods do not share verifications.** The method is the route `web_fetch` took: `http`, `standard` (Chromium with the UC extension) or `native` (installed Chrome driven over CDP). State is kept per `(source, method)` pair, every line and every report entry carries `method`, and a standard-browser source handed to the native retry leaves two lines: `blocked` by `standard`, then whatever `native` found. *Measured 2026-11-24 on `erobay`:* cleared by hand in a plain Chrome at 02:15, it was challenged again at 02:30 in the harvest's own Chrome on the same profile. At 02:33, in the harvest's own Chrome with the automation attached and the owner at the KVM, the check cleared about 15 seconds into the wait and the source returned 273 messages. A check has to be cleared in the browser, and by the method, that will use it. `bot_check_wait_s` on a source sets how long that browser holds the check open for a person (default 15 s; `erobay` is set to 120).
+**Methods do not share verifications.** The method is the route `web_fetch` took: `http`, `standard` (Chromium with the UC extension), `native` (installed Chrome that the run launches, with the automation attached from the first request), `native:open-browser` (the run attaches to a Chrome already open on the native port, `web_fetch.NATIVE_CDP_PORT` = 9222), or `service:<window>` (a window of the UC service; off unless `WEB_UC_SERVICE` and `WEB_UC_NATIVE_WINDOW` are set). State is kept per `(source, method)` pair, every line and every report entry carries `method`, and a standard-browser source handed to the native retry leaves two lines: `blocked` by `standard`, then whatever the native route found. `bot_check_wait_s` on a source sets how long the harvest's own browser holds a check open (default 15 s; `erobay` is set to 120).
+
+*Measured 2026-11-24 on `erobay` (Cloudflare), owner at the KVM, all on the native profile:*
+
+| Method | Runs | Result |
+|---|---|---|
+| plain Chrome, debugging port open, nothing attached; a person clicks | 02:15, 03:43 | a box was offered and the check cleared, both times |
+| harvest attaches to that open browser afterwards (`native:open-browser`) | 02:16, 03:43 | no challenge; 273 messages, both times |
+| Chrome launched with the automation attached (`native`) | 02:30, 03:18, 03:31, and two unattended | never cleared: 'Performing security verification' with a spinner for up to 120 s, no box offered, title unchanged (screenshot under `data/.web_hints/`) |
+| same, one run | 02:33 | cleared 15 s into the wait. Unexplained |
+| a later, separately launched Chrome on the same profile | 02:30, 15 minutes after the 02:15 clearance | challenged again; the clearance cookie was no longer in the profile |
+
+Launching from the systemd service or from an interactive session made no difference: both spun for 60 s unattended and reported the same `navigator` values (`webdriver` false, no WebGL context). So a check is cleared by a person in a browser with no automation attached, and used by attaching to that browser while it stays open.
+
+**The open browser.** The user unit `uc-native-window` (`~/.config/systemd/user/uc-native-window.service`, enabled 2026-11-24) runs a plain Google Chrome on `data/.uc_chrome_profile` with `--remote-debugging-port=9222` and nothing attached. A person clears checks there over KVM; the pinned controller's native mode attaches to whatever answers on 9222, so while the unit is up every native source runs as `native:open-browser`. It is interim: the UC service's `native` window is meant to replace it, once it is established that a page can wait for a person there with no CDP client attached to it. `unverified`: how long a clearance lasts in the open browser; the access log is what will say.
 
 | Line | Written when | Carries |
 |---|---|---|
