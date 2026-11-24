@@ -92,9 +92,11 @@ The structural difference from `feed_probe` is that **validation is impossible h
 
 ## Modes
 
-**The modes are** `calendar`, `feed`, `search`, `raw`, `ics`, `chat`, `steps` (2026-07-30), `instagram` (2026-08-06), `rss` (2026-08-07), and `luma` + `partiful` (2026-08-10). Each has its own file, OTel span, and dispatch branch in `fetch_web_sources`; `web_modes/__init__.py` re-exports them and `__all__` is the count.
+**The modes are** `calendar`, `feed`, `search`, `raw`, `ics`, `chat`, `steps` (2026-07-30), `instagram` (2026-08-06), `rss` (2026-08-07), `luma` + `partiful` (2026-08-10), and `jsonld` (2026-11-24). Each has its own file, OTel span, and dispatch branch in `fetch_web_sources`; `web_modes/__init__.py` re-exports them and `__all__` is the count.
 
-**Four of the eleven are browser-free** — `ics`, `rss`, `luma`, `partiful` — and that group keeps growing for one reason: a platform that publishes structured data does not need to be scraped, and scraping it is *worse*, not merely more expensive. See below.
+**Five of the twelve are browser-free** — `ics`, `rss`, `luma`, `partiful`, `jsonld` — and that group keeps growing for one reason: a platform that publishes structured data does not need to be scraped, and scraping it is *worse*, not merely more expensive. See below.
+
+**`jsonld` reads what a listing page says about itself** (`web_modes/jsonld.py`, 2026-11-24): the schema.org `Event` items in the page's JSON-LD, one message each, dropping events that have ended. Its expectation is its own: no Event item at all is a deviation; all of them over is `empty`. *Measured 2026-11-24:* `midway`, which `calendar` mode in native Chrome reported `deviated` (2 dated links in the visible listing), publishes 47 `MusicEvent` items over plain HTTP, 19 of them current. `makerfaire`, repointed from the site's home page to `/bay-area/`, publishes one Event, the September 2026 faire, which has ended: 0 messages, `empty`, until the page lists the next one.
 
 ## Modules: `luma.py` and `partiful.py` — read what the platform already publishes
 
@@ -159,7 +161,7 @@ Auto-mode detection (`web_utils.py:_detect_mode`) order: ICS URL shortcut → `_
 
 **Undocumented-mode finding:** `ics` doesn't need a browser at all, but `fetch_web_sources`'s outer dispatch still enters the `_process_group`/`UCBrowser` context and iterates the source inside it — the `ics.py` module docstring itself flags this: "~1s of wasted setup per ICS source until we refactor to skip browser allocation for browser-free modes" (`ics.py:8`). `chat` sources are dispatched the same way — before the page-open branch — so they also skip the shared `_wait_cloudflare`/auto-detect path, but unlike `ics` they still open a page via `uc.open(...)` inside `_do_chat`. `instagram` (2026-08-06) joins that group for a third reason: it opens one page *per account* with a recorder attached before navigation, so a shared pre-opened page would be a page it immediately closes — which is exactly what `feed` mode still does and documents as interface-consistency overhead.
 
-**The wasted browser is gone as of 2026-11-23, by routing.** `web_fetch.HTTP_MODES` names the modes read over plain HTTP (`ics`, `rss`, `luma`, `partiful`). `fetch_web_sources` routes those sources to the `http` group (`_http_work`), which holds no browser, and their handlers no longer take a `uc` argument. The technique a mode uses is stated in that table; it is not inferred from whether a handler happened to touch the browser. *Measured 2026-11-23:* a run of `dnalounge`, `bottom-of-the-hill`, `luma` and `partiful` produced 179 messages with no `WebBrowser` constructed; `the-mix` (`raw`), `stud` (`calendar`) and `dnalounge` together produced 70 messages and one launch.
+**The wasted browser is gone as of 2026-11-23, by routing.** `web_fetch.HTTP_MODES` names the modes read over plain HTTP (`ics`, `rss`, `luma`, `partiful`, and from 2026-11-24 `jsonld`). `fetch_web_sources` routes those sources to the `http` group (`_http_work`), which holds no browser, and their handlers no longer take a `uc` argument. The technique a mode uses is stated in that table; it is not inferred from whether a handler happened to touch the browser. *Measured 2026-11-23:* a run of `dnalounge`, `bottom-of-the-hill`, `luma` and `partiful` produced 179 messages with no `WebBrowser` constructed; `the-mix` (`raw`), `stud` (`calendar`) and `dnalounge` together produced 70 messages and one launch.
 
 ## Parallel-fetch model and why native-chrome stays serial
 
@@ -228,7 +230,7 @@ Launching from the systemd service or from an interactive session made no differ
 | `search` | a page that answers a query with event links | deviation when the page showed no links at all, unless the page itself says the search matched nothing (`empty`). Links already held are not a deviation |
 | `steps` | its recorded route | deviation when the route broke and left nothing, carrying the route's own diagnosis. A partial walk that produced messages still returns them |
 | `chat` | a reply of at least 50 characters | deviation |
-| `raw`, `feed` | any text; any captured responses | no expectation, so nothing to deviate from. `badlands` (`raw`) has returned an expired-domain page every night and is still reported `ok` |
+| `raw`, `feed` | any text; any captured responses | no expectation, so nothing to deviate from. `not implemented`: a per-source statement of what a `raw` page must contain. `badlands` (`raw`) returned a parked page ('The domain has expired', ParkLogic) every night and was reported `ok`; the browser stays on the source's own host, so comparing hosts would not have caught it (measured 2026-11-24). The source was removed from `data/web_sources.json` that day |
 
 Nothing here uses Universal Controller's `has_login_wall`: it tests a `blocking` key the engine never emits, so it has always returned false (`ext/universal_controller`, Engine Gaps roadmap). The two calls to it, in `search` and `chat`, were removed.
 

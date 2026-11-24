@@ -227,13 +227,6 @@
     "cooldown_hours": 6
   },
   {
-    "url": "https://sfbadlands.com",
-    "name": "badlands",
-    "mode": "raw",
-    "category": "venues",
-    "cooldown_hours": 6
-  },
-  {
     "url": "https://www.driftwoodbarsf.com",
     "name": "driftwood",
     "mode": "raw",
@@ -385,10 +378,8 @@
   {
     "url": "https://themidwaysf.com/events/",
     "name": "midway",
-    "mode": "calendar",
+    "mode": "jsonld",
     "category": "venues",
-    "native_chrome": true,
-    "scroll_seconds": 8,
     "cooldown_hours": 6
   },
   {
@@ -416,11 +407,9 @@
     "cooldown_hours": 6
   },
   {
-    "url": "https://makerfaire.com/",
+    "url": "https://makerfaire.com/bay-area/",
     "name": "makerfaire",
-    "mode": "calendar",
-    "native_chrome": true,
-    "scroll_seconds": 8,
+    "mode": "jsonld",
     "cooldown_hours": 12
   },
   {

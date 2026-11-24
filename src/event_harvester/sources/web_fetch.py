@@ -34,6 +34,7 @@ from event_harvester.sources.web_modes.chat import _do_chat
 from event_harvester.sources.web_modes.feed import _do_feed
 from event_harvester.sources.web_modes.ics import _do_ics
 from event_harvester.sources.web_modes.instagram import _do_instagram
+from event_harvester.sources.web_modes.jsonld import _do_jsonld
 from event_harvester.sources.web_modes.luma import _do_luma
 from event_harvester.sources.web_modes.partiful import _do_partiful
 from event_harvester.sources.web_modes.raw import _do_raw
@@ -86,6 +87,7 @@ HTTP_MODES = {
     "rss": _do_rss,            # RSS / Atom feed
     "luma": _do_luma,          # Luma's keyless discovery API
     "partiful": _do_partiful,  # the props Partiful's pages are rendered from
+    "jsonld": _do_jsonld,      # schema.org Event items in the page's JSON-LD
 }
 
 

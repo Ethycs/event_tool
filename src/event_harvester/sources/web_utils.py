@@ -588,13 +588,14 @@ def _first_image(value) -> str:
     return str(value or "").strip()
 
 
-def _extract_structured_data(html: str) -> dict | None:
-    """Extract schema.org Event JSON-LD from HTML.
+def structured_events(html: str):
+    """Every schema.org Event in the page's JSON-LD, in document order.
 
     Many event sites embed structured data like:
       <script type="application/ld+json">{"@type": "Event", ...}</script>
 
-    Returns a dict with title, date, time, location, link, details — or None.
+    Yields dicts with title, date, time, location, link, details, image, and
+    the raw ``start`` and ``end``. Items with no name are skipped.
     """
     import json as _json
 
@@ -664,7 +665,7 @@ def _extract_structured_data(html: str) -> dict | None:
                     time_str += " - " + end.split("T")[1][:5]
 
             if title:
-                return {
+                yield {
                     "title": title,
                     "date": date_str,
                     "time": time_str,
@@ -675,9 +676,14 @@ def _extract_structured_data(html: str) -> dict | None:
                     # allows a bare URL, a list, or an ImageObject, so the
                     # shape is normalised here rather than at each caller.
                     "image": _first_image(item.get("image")),
+                    "start": start,
+                    "end": end,
                 }
 
-    return None
+
+def _extract_structured_data(html: str) -> dict | None:
+    """The first schema.org Event in the page's JSON-LD, or ``None``."""
+    return next(structured_events(html), None)
 
 
 _DEAD_PAGE_RE = re.compile(
