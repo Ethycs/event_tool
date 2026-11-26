@@ -683,6 +683,13 @@ def fetch_web_sources(
     # One worker for the plain-HTTP sources; standard browser sources split
     # across ``parallel`` browsers; native_chrome stays in one bucket. Each
     # browser group runs in its own thread with its own Playwright instance.
+    #
+    # The native group starts only after the standard browsers have closed.
+    # Both are windows on one screen, and a bot check is only passed on a page
+    # that is being drawn. Started together (2026-11-26, 06:54:47 for both),
+    # the standard browser's window was over the native one and over erobay's
+    # check when read 99 s into its 120 s wait, and raising the native window
+    # did not put it back on top.
     standard_chunks = _chunk_sources(standard_srcs, parallel)
     groups: list[_Group] = []
     if http_srcs:
@@ -691,8 +698,9 @@ def fetch_web_sources(
         groups.append(_Group(
             f"standard-{i}", "standard", chunk, partial(_browser_work, {}, False),
         ))
+    native_groups: list[_Group] = []
     if native_srcs:
-        groups.append(_Group(
+        native_groups.append(_Group(
             "native", native_method, native_srcs,
             partial(_browser_work, native_browser, True), on_abandon=on_abandon,
         ))
@@ -703,6 +711,9 @@ def fetch_web_sources(
         native_method,
     )
     _await_groups(groups, outcomes)
+    if native_groups:
+        groups.extend(native_groups)
+        _await_groups(native_groups, outcomes)
 
     # Phase 4: Cloudflare auto-retry with native Chrome
     cf_retries = [src for group in groups for src in group.cf_retries]

@@ -214,6 +214,31 @@ def test_a_source_can_give_a_person_longer_to_clear_its_check(harness):
     assert harness.waits == [120, 15]
 
 
+def test_the_native_browser_opens_only_once_the_standard_one_has_closed(harness, monkeypatch):
+    """Two headed browsers at once put one window over the other, and a bot
+    check is not passed on a page that is not being drawn."""
+    order: list[str] = []
+
+    def kind(controller) -> str:
+        return "native" if controller.kwargs.get("native_chrome") else "standard"
+
+    def enter(self):
+        order.append(f"{kind(self)} opens")
+        return self
+
+    def leave(self, *_a):
+        time.sleep(0.2)  # a standard browser still closing when a native one could start
+        order.append(f"{kind(self)} closes")
+
+    monkeypatch.setattr(FakeController, "__enter__", enter)
+    monkeypatch.setattr(FakeController, "__exit__", leave)
+
+    out = web_fetch.fetch_web_sources([_raw("checked", native_chrome=True), _raw("plain")])
+
+    assert sorted(m["id"] for m in out) == ["checked", "plain"]
+    assert order == ["standard opens", "standard closes", "native opens", "native closes"]
+
+
 def test_a_hung_source_costs_only_itself_and_what_was_queued_behind_it(harness, monkeypatch):
     release = threading.Event()
 

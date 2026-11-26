@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
 from contextlib import asynccontextmanager
@@ -657,12 +658,22 @@ def build_app(cfg, *, interval_hours: float = DEFAULT_INTERVAL_HOURS,
         )
 
     async def _loop():
-        """Rebuild every `interval_hours`, forever."""
+        """Rebuild every `interval_hours`, forever, counted from process start.
+
+        Each refresh is due one interval after the last one was due, not
+        after it finished. Counted from the finish, a 45-minute harvest moved
+        the daily run 45 minutes later every day (queued 06:09:36 on
+        2026-11-25, 06:54:46 on 2026-11-26). A refresh that overruns whole
+        intervals skips them: one run at a time, never a backlog.
+        """
         seconds = max(60.0, float(interval_hours) * 3600.0)
+        clock = asyncio.get_running_loop().time
+        due = clock() + seconds
         while True:
-            await asyncio.sleep(seconds)
+            await asyncio.sleep(max(0.0, due - clock()))
             logger.info("site: scheduled refresh")
             await refresh(state, cfg, harvest=True)
+            due += seconds * max(1, math.ceil((clock() - due) / seconds))
 
     @asynccontextmanager
     async def lifespan(_app):
