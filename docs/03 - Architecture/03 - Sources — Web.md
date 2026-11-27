@@ -270,6 +270,8 @@ Native Chrome (`BrowserMode.NATIVE_CDP` in `ext/universal_controller/uc_browser/
 
 *After that harvest, 2026-11-26:* with the change loaded (`1fe46db`, harvest service restarted 07:40:23) `erobay` was run alone at 07:41:45. Its check was up as a checkbox within 2 s; nothing lay over the window; one click through the KVM at 07:41:53 and the page was through at 07:41:55; 269 messages, 105 events, the page kept. The events cache merges a run into what it already holds (`mcp_server`: new events plus the still-future existing ones, de-duplicated), so a one-source run after a harvest repairs that source without repeating the harvest; the site was then rebuilt from the cache (`POST /refresh?harvest=0`, 761 events). This says nothing yet about the changed order in a full harvest: the first such run is the next scheduled one.
 
+*Verified in a full harvest, 2026-11-27* (07:39:55–08:20:36 UTC, `1fe46db`): 10 plain-HTTP and 37 standard sources ran first; the native group started once the standard browser had closed. `erobay`'s check was up at 08:13:26 as a checkbox; the native window was on top with nothing over the box; one click through the KVM at 08:13:34, through at 08:13:38; `erobay` ok, 270 messages, then `ra-sf` ok, 18 messages in 74 s. 47 of 49 sources ok, 2 empty (`gay-agenda`, `makerfaire`), 766 events on the site. The click was still needed and was made by an agent woken for it; the changed order is what let it land.
+
 ## `data/web_sources.json` entry schema
 
 One JSON array of source objects (`_load_web_sources` in `web_utils.py:83-88`, fallback `_DEFAULT_SOURCES` at `web_utils.py:71-80` if the file is absent). Fields actually read by the code, by consumer:
