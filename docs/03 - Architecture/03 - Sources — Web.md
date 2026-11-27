@@ -272,6 +272,16 @@ Native Chrome (`BrowserMode.NATIVE_CDP` in `ext/universal_controller/uc_browser/
 
 *Verified in a full harvest, 2026-11-27* (07:39:55–08:20:36 UTC, `1fe46db`): 10 plain-HTTP and 37 standard sources ran first; the native group started once the standard browser had closed. `erobay`'s check was up at 08:13:26 as a checkbox; the native window was on top with nothing over the box; one click through the KVM at 08:13:34, through at 08:13:38; `erobay` ok, 270 messages, then `ra-sf` ok, 18 messages in 74 s. 47 of 49 sources ok, 2 empty (`gay-agenda`, `makerfaire`), 766 events on the site. The click was still needed and was made by an agent woken for it; the changed order is what let it land.
 
+**Which clicks the check accepts** (measured 2026-11-27 22:10–22:20 UTC, in two throwaway Chrome 157 profiles with no automation attached, since removed). The question was whether the Universal Controller's Tampermonkey userscript could click the box. A probe userscript was installed through Tampermonkey 5.5.1, matching `erobay.com` and `challenges.cloudflare.com`, reporting through the tab title.
+
+| Click made by | Result |
+|---|---|
+| a script inside the page: `element.click()` on the checkbox, from within Cloudflare's own frame | rejected, 3 of 3: the box stayed unchecked (`checked=false` 1.5 s later) and the check restarted 4–5 s after each click |
+| the KVM (hardware pointer), with the same script and hook still installed, straight after those three | through in 2.0 s |
+| an X server test event (`XTestFakeButtonEvent`) from a program on this host, fresh profile, no extension | through in 2.4 s |
+
+What else that run showed: a userscript does run inside Cloudflare's frame in an unautomated Chrome; the box sits in a closed shadow root, reachable only by wrapping `attachShadow` before the frame's own script runs; the script found the box 3–5 s after the frame loaded; and the script's presence, wrap included, did not stop a real click from passing (the check sat for 25 s with no restart, then passed on the KVM click). So a userscript can *see* the check and cannot *pass* it: the click has to come from outside the page. The controller's published userscript (`https://ethycs.github.io/universal_controller/universal-controller.user.js`, v1.0.0, identical to a build of its `main`) has none of this: no pattern for a verification box, no shadow-root handling, only `element.click()`, no action without its panel, and no network call. `not implemented`: any unattended click. One reading per row except the first.
+
 ## `data/web_sources.json` entry schema
 
 One JSON array of source objects (`_load_web_sources` in `web_utils.py:83-88`, fallback `_DEFAULT_SOURCES` at `web_utils.py:71-80` if the file is absent). Fields actually read by the code, by consumer:
