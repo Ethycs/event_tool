@@ -3,7 +3,7 @@
 Some things about a source cannot be read; they can only be observed. How long
 a passed bot check lasts is one: the clearance cookie says a year, the site
 decides, and nothing on this side says which. So every access to a source is
-compared with the last one **by the same access method**, and two kinds of
+compared with the last one **by the same access method**, and three kinds of
 line are appended to ``data/.web_access_log.jsonl``:
 
 * ``change`` — the state differs from last time. The line says what it was,
@@ -12,13 +12,18 @@ line are appended to ``data/.web_access_log.jsonl``:
   changed by now). The truth lies between; the gap is the sampling interval.
 * ``fail`` — the state is a failing one and has not changed. One line per
   access, so a source that fails every night leaves a line every night.
+* ``click`` — something this program did during an access that is not a
+  state: it pressed a bot check's box, or could not and says why
+  (:func:`note`). It moves no state; the access's own line follows it.
 
 **Per method, because methods do not share verifications.** A check passed in
 one browser, or by one way of driving it, says nothing about another:
 ``erobay`` cleared by hand in a plain Chrome was challenged again fifteen
 minutes later in the harvest's own Chrome on the same profile (2026-11-24).
 So the state is kept for each ``(source, method)`` pair, where the method is
-the route ``web_fetch`` took: ``http``, ``standard`` or ``native``.
+the route ``web_fetch`` took: ``http``, ``standard``, ``native``,
+``native:open-browser`` or ``service:<window>``, with ``+click`` appended for a
+source whose check this program clicks.
 
 ``data/.web_access_state.json`` holds each pair's current state, when it began
 and when it was last seen, which is what makes a change detectable across runs
@@ -109,4 +114,20 @@ def record(source: str, state: str, detail: str = "", *, method: str, messages: 
             key, line["was"], state, line["was"],
             _span(line["held_min_s"]), _span(line["held_max_s"]),
         )
+    return line
+
+
+def note(source: str, event: str, detail: str, *, method: str,
+         at: datetime | None = None) -> dict:
+    """Append a line for something done during an access. Returns the line.
+
+    Not a state: nothing in ``STATE_FILE`` moves. ``event`` names what was
+    done (``click``).
+    """
+    line = {"at": _iso(at or datetime.now(timezone.utc)), "source": source,
+            "method": method, "event": event, "detail": detail}
+    with _lock:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with LOG_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(line, ensure_ascii=False) + "\n")
     return line

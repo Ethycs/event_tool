@@ -113,7 +113,43 @@ def _devtools(endpoint: str, path: str, method: str = "GET"):
 LOAD_WAIT_S = 30
 
 
-def _wait_through(read_title, url: str, wait_s: int) -> tuple[bool, str]:
+#: Seconds into a bot check at which its box is clicked, for a source that
+#: asks for that (``bot_check_click``). Measured 2026-11-27: the box is there
+#: 3 to 5 s after the check's frame loads, and every click that passed was made
+#: 5 s or more after the check came up. The second is for a first press that
+#: was refused or came too early; a check that is still up after it is left.
+CHECK_CLICK_AT_S = (6, 24)
+
+
+def check_clicker(uc_kwargs: dict, offset, report):
+    """An ``on_check`` that clicks a bot check's box in the native browser.
+
+    ``offset`` is the box's position from the top-left of the browser's
+    window (a source's ``bot_check_click``). The press comes from the X
+    server, not from the page (:mod:`native_pointer` says why and when it
+    refuses). ``report(detail)`` is told of every press and every refusal;
+    neither ends the wait, which goes on reading the title either way.
+    """
+    from event_harvester.sources import native_pointer
+    from event_harvester.sources.native_window import browser_pid, debug_port
+
+    def on_check(seconds: int, title: str) -> None:
+        if seconds not in CHECK_CLICK_AT_S:
+            return
+        try:
+            port = debug_port(uc_kwargs)
+            pid = browser_pid(port) if port else None
+            if pid is None:
+                raise native_pointer.ClickRefused("the native browser's process was not found")
+            x, y = native_pointer.click(pid, (int(offset[0]), int(offset[1])), title)
+            report(f"bot check up {seconds}s: clicked its box at {x},{y} on the screen")
+        except Exception as e:  # noqa: BLE001 — reported; the wait goes on
+            report(f"bot check up {seconds}s: its box was not clicked: {e}")
+
+    return on_check
+
+
+def _wait_through(read_title, url: str, wait_s: int, on_check=None) -> tuple[bool, str]:
     """Read a page's title once a second until it is past its bot check.
 
     ``(through, last title)``. This is event_tool's readiness rule, the same
@@ -128,6 +164,9 @@ def _wait_through(read_title, url: str, wait_s: int) -> tuple[bool, str]:
     its title is ``ra.co`` while it loads, for 1 to 5 s on three runs and for
     more than 15 s on a fourth, which one shared 15 s clock reported as a bot
     check that was never there.
+
+    ``on_check(seconds, title)`` is called on every read that shows a
+    bot-check title, with how many such reads there have been.
     """
     from event_harvester.sources.web_utils import is_bot_check
 
@@ -146,6 +185,8 @@ def _wait_through(read_title, url: str, wait_s: int) -> tuple[bool, str]:
         loading_for += loading
         if settled >= 2:
             return True, title
+        if check and on_check is not None:
+            on_check(checking, title)
         if checking >= wait_s or loading_for >= LOAD_WAIT_S:
             break
     return False, title
@@ -172,7 +213,9 @@ def not_through(title: str, wait_s: int) -> Exception:
     )
 
 
-def pass_check_unattached(endpoint: str, url: str, wait_s: int) -> tuple[bool, str]:
+def pass_check_unattached(
+    endpoint: str, url: str, wait_s: int, *, on_check=None,
+) -> tuple[bool, str]:
     """Load ``url`` in the open browser with no client attached; wait for it.
 
     Returns ``(through, last title)``. The page is opened, watched and closed
@@ -194,7 +237,7 @@ def pass_check_unattached(endpoint: str, url: str, wait_s: int) -> tuple[bool, s
         )
 
     try:
-        return _wait_through(title, url, wait_s)
+        return _wait_through(title, url, wait_s, on_check)
     finally:
         try:
             _devtools(endpoint, f"/json/close/{tab_id}")
@@ -239,6 +282,7 @@ def _keep_page(client, window: str, target_id: str, client_id: str, url: str) ->
 
 def pass_check_in_service(
     service: str, window: str, label: str | None, url: str, wait_s: int, *, keep: bool = False,
+    on_check=None,
 ) -> tuple[bool, str]:
     """Load ``url`` in a quiet window of the UC service; wait for it.
 
@@ -264,6 +308,7 @@ def pass_check_in_service(
         target_id = client.new_page(window, client_id, url=url)
         through, title = _wait_through(
             lambda: str(client.page_info(window, target_id).get("title", "")), url, wait_s,
+            on_check,
         )
         if through and keep:
             kept = _keep_page(client, window, target_id, client_id, url)
@@ -280,7 +325,7 @@ def pass_check_in_service(
 
 
 def prepare_native(
-    uc_kwargs: dict, url: str, wait_s: int, *, keep: bool = False,
+    uc_kwargs: dict, url: str, wait_s: int, *, keep: bool = False, on_check=None,
 ) -> tuple[bool, str]:
     """Let ``url`` load in the native browser with nothing attached, before any attach.
 
@@ -295,6 +340,9 @@ def prepare_native(
 
     ``keep`` (a source's ``keep_page_open``) leaves the page open once it is
     through. Only the service's window offers that; elsewhere it is ignored.
+
+    ``on_check`` is passed to :func:`_wait_through`: what to do while a bot
+    check is up (:func:`check_clicker`).
     """
     from event_harvester.sources.native_window import require_drawn
 
@@ -302,10 +350,10 @@ def prepare_native(
     if "service" in uc_kwargs:
         return pass_check_in_service(
             uc_kwargs["service"], uc_kwargs["window"], uc_kwargs.get("label"), url, wait_s,
-            keep=keep,
+            keep=keep, on_check=on_check,
         )
     if "cdp_endpoint" in uc_kwargs:
-        return pass_check_unattached(uc_kwargs["cdp_endpoint"], url, wait_s)
+        return pass_check_unattached(uc_kwargs["cdp_endpoint"], url, wait_s, on_check=on_check)
     return True, ""
 
 

@@ -25,7 +25,8 @@
     "cooldown_hours": 4,
     "scroll_seconds": 5,
     "bot_check_wait_s": 120,
-    "keep_page_open": true
+    "keep_page_open": true,
+    "bot_check_click": [48, 423]
   },
   {
     "url": "https://www.instagram.com/",

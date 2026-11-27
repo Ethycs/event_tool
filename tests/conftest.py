@@ -69,16 +69,20 @@ def _isolate_web_access_log(tmp_path, monkeypatch):
 def _no_real_native_browser(monkeypatch):
     """No test may reach the Chrome a person keeps open on the native port,
     the UC service's native window named in this machine's ``.env``, or the
-    desktop's X server.
+    desktop's X server, and none may move or press its pointer.
 
     On 2026-11-24 a test that named the open-browser route without stubbing
     the page preparation opened a tab in the owner's live browser and held it
     for fifteen seconds. Tests that want any of these say so themselves.
     """
-    from event_harvester.sources import native_window, uc_browser
+    from event_harvester.sources import native_pointer, native_window, uc_browser
+
+    def no_click(pid, offset, expect_title):
+        raise AssertionError("a test tried to click on the real desktop")
 
     monkeypatch.setattr(uc_browser, "_port_open", lambda port: False)
     monkeypatch.setattr(native_window, "native_window_state", lambda uc_kwargs: None)
+    monkeypatch.setattr(native_pointer, "click", no_click)
     monkeypatch.setenv("WEB_UC_NATIVE_WINDOW", "")
 
 

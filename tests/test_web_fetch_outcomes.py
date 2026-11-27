@@ -101,7 +101,8 @@ def harness(monkeypatch):
     monkeypatch.setattr(web_fetch, "_wait_cloudflare", wait)
     monkeypatch.setattr(uc_browser, "_port_open", lambda port: False)
     monkeypatch.setattr(
-        uc_browser, "pass_check_unattached", lambda endpoint, url, wait_s: (True, "a page"),
+        uc_browser, "pass_check_unattached",
+        lambda endpoint, url, wait_s, **_kw: (True, "a page"),
     )
     monkeypatch.setattr(
         web_fetch, "_do_raw",
@@ -138,12 +139,80 @@ def test_a_check_that_does_not_finish_unattached_is_blocked_without_attaching(ha
     monkeypatch.setattr(uc_browser, "_port_open", lambda port: True)
     monkeypatch.setattr(
         uc_browser, "pass_check_unattached",
-        lambda endpoint, url, wait_s: (False, "Just a moment..."),
+        lambda endpoint, url, wait_s, **_kw: (False, "Just a moment..."),
     )
 
     assert web_fetch.fetch_web_sources([_raw("erobay", native_chrome=True)]) == []
     assert _states() == {"erobay": "blocked"}
     assert FakeController.launches == []
+
+
+def test_a_source_whose_check_is_clicked_has_its_own_method_and_a_line_per_click(
+    harness, monkeypatch,
+):
+    """How a check was passed is part of the method: a source this program
+    clicks through must not share a state with one that got through unaided,
+    and each press is in the log, made by the program that pressed."""
+    from event_harvester.sources import native_pointer, native_window, web_access_log
+
+    asked: list = []
+    pressed: list = []
+
+    def load(endpoint, url, wait_s, on_check=None):
+        asked.append((url, on_check is not None))
+        if on_check is not None:
+            for second in range(1, 8):  # a check that is up for seven reads
+                on_check(second, "Just a moment...")
+        return True, "a page"
+
+    def press(pid, offset, expect_title):
+        pressed.append((pid, offset, expect_title))
+        return 292, 443
+
+    monkeypatch.setattr(uc_browser, "_port_open", lambda port: True)
+    monkeypatch.setattr(uc_browser, "pass_check_unattached", load)
+    monkeypatch.setattr(native_window, "browser_pid", lambda port: 4242)
+    monkeypatch.setattr(native_pointer, "click", press)
+
+    web_fetch.fetch_web_sources([
+        _raw("erobay", native_chrome=True, bot_check_click=[48, 423]),
+        _raw("venue", native_chrome=True),
+    ])
+
+    assert asked == [("https://erobay.example/", True), ("https://venue.example/", False)]
+    assert pressed == [(4242, (48, 423), "Just a moment...")]  # once, at its second
+    lines = [json.loads(line) for line in web_access_log.LOG_FILE.read_text().splitlines()]
+    assert [(line["source"], line["method"], line["event"]) for line in lines] == [
+        ("erobay", "native:open-browser+click", "click"),
+        ("erobay", "native:open-browser+click", "change"),
+        ("venue", "native:open-browser", "change"),
+    ]
+    assert "292,443" in lines[0]["detail"]
+    run = json.loads(web_fetch._REPORT_FILE.read_text())["runs"][-1]
+    assert run["sources"]["erobay"]["method"] == "native:open-browser+click"
+
+
+def test_a_click_that_cannot_be_made_is_logged_and_does_not_end_the_wait(harness, monkeypatch):
+    from event_harvester.sources import native_pointer, native_window, web_access_log
+
+    def load(endpoint, url, wait_s, on_check=None):
+        on_check(6, "Just a moment...")
+        return False, "Just a moment..."
+
+    def refuse(pid, offset, expect_title):
+        raise native_pointer.ClickRefused("another window lies over the point 292,443")
+
+    monkeypatch.setattr(uc_browser, "_port_open", lambda port: True)
+    monkeypatch.setattr(uc_browser, "pass_check_unattached", load)
+    monkeypatch.setattr(native_window, "browser_pid", lambda port: 4242)
+    monkeypatch.setattr(native_pointer, "click", refuse)
+
+    web_fetch.fetch_web_sources([_raw("erobay", native_chrome=True, bot_check_click=[48, 423])])
+
+    lines = [json.loads(line) for line in web_access_log.LOG_FILE.read_text().splitlines()]
+    assert [line["event"] for line in lines] == ["click", "change"]
+    assert "not clicked" in lines[0]["detail"] and "lies over" in lines[0]["detail"]
+    assert lines[1]["state"] == "blocked"
 
 
 def _states() -> dict[str, str]:

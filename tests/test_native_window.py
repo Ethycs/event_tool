@@ -72,7 +72,7 @@ def test_a_minimized_browser_is_refused_before_any_page_is_opened(monkeypatch):
     monkeypatch.setattr(native_window, "native_window_state", lambda uc_kwargs: "minimized")
     monkeypatch.setattr(
         uc_browser, "pass_check_unattached",
-        lambda endpoint, url, wait_s: opened.append(url) or (True, "t"),
+        lambda endpoint, url, wait_s, **_kw: opened.append(url) or (True, "t"),
     )
 
     with pytest.raises(NativeWindowNotDrawn, match="minimized"):

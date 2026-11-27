@@ -186,6 +186,28 @@ def _log_access(name: str, state: str, detail: str, method: str, *,
         logger.warning("Could not write the access log for %s: %s", name, e)
 
 
+def _method(group: _Group, src: dict) -> str:
+    """The access method ``src`` is reached by in ``group``.
+
+    A source whose bot check this program clicks (``bot_check_click``) is
+    reached by a method of its own, ``<route>+click``: how a check was passed
+    is part of the method, and a state reached by one method says nothing
+    about another. Only the routes that load a page unattached can click.
+    """
+    if src.get("bot_check_click") and group.method.startswith(("service:", "native:")):
+        return f"{group.method}+click"
+    return group.method
+
+
+def _log_click(name: str, method: str, detail: str) -> None:
+    """Put a click on a bot check, or the reason there was none, in the access log."""
+    logger.warning("%s: %s", name, detail)
+    try:
+        web_access_log.note(name, "click", detail, method=method)
+    except Exception as e:  # noqa: BLE001 — the log must not cost the harvest
+        logger.warning("Could not write the access log for %s: %s", name, e)
+
+
 def _note(outcomes: dict[str, SourceOutcome], outcome: SourceOutcome) -> None:
     """Keep ``outcome`` for the run report and put it in the access log.
 
@@ -241,14 +263,15 @@ def _await_groups(groups: list[_Group], outcomes: dict[str, SourceOutcome],
             )
             _note(outcomes, SourceOutcome(
                 name, src.get("mode") or "auto", "hung", seconds=round(ran, 1),
-                detail=f"exceeded its {ran:.0f}s deadline", method=group.method,
+                detail=f"exceeded its {ran:.0f}s deadline", method=_method(group, src),
             ))
             for later in group.sources[group.sources.index(src) + 1:]:
                 later_name = later.get("name", later["url"])
                 if later_name not in outcomes:
                     _note(outcomes, SourceOutcome(
                         later_name, later.get("mode") or "auto", "skipped",
-                        detail=f"queued behind {name}, which hung", method=group.method,
+                        detail=f"queued behind {name}, which hung",
+                        method=_method(group, later),
                     ))
         if pending:
             pending[0].done.wait(poll_s)
@@ -263,7 +286,7 @@ def _await_groups(groups: list[_Group], outcomes: dict[str, SourceOutcome],
             if name not in outcomes:
                 _note(outcomes, SourceOutcome(
                     name, src.get("mode") or "auto", "failed",
-                    detail=str(group.error)[:200], method=group.method,
+                    detail=str(group.error)[:200], method=_method(group, src),
                 ))
 
 
@@ -486,12 +509,13 @@ def fetch_web_sources(
             # for the source comes from the retry; this method's failure is
             # still a fact about this method.
             _log_access(
-                name, "blocked", "bot check; handed to the native Chrome retry", group.method,
+                name, "blocked", "bot check; handed to the native Chrome retry",
+                _method(group, src),
             )
         else:
             _note(outcomes, SourceOutcome(
                 name, mode, state, len(msgs), round(time.monotonic() - started, 1), detail,
-                method=group.method,
+                method=_method(group, src),
             ))
         if msgs:
             _save_cooldown(src["url"])
@@ -623,7 +647,10 @@ def fetch_web_sources(
                     break
                 _run_source(
                     group, src,
-                    partial(_open_browser_source, uc_kwargs, src, group.cf_retries),
+                    partial(
+                        _open_browser_source, uc_kwargs, src, group.cf_retries,
+                        _method(group, src),
+                    ),
                 )
             return
         with WebBrowser(**uc_kwargs) as uc:
@@ -644,7 +671,9 @@ def fetch_web_sources(
                             "%s: closed %d page(s) left open.", src.get("name"), leaked,
                         )
 
-    def _open_browser_source(uc_kwargs: dict, src: dict, cf_retries: list, *, tracer, capture):
+    def _open_browser_source(
+        uc_kwargs: dict, src: dict, cf_retries: list, method: str, *, tracer, capture,
+    ):
         """One source through a browser that outlives the run.
 
         That is ``native:open-browser`` or ``service:<window>``. The source's
@@ -654,12 +683,28 @@ def fetch_web_sources(
         that does not finish unattached is `blocked` without attaching: an
         attached attempt cleared one once in seven measured runs. A page that
         never rendered is `deviated`, not blocked: nothing says a check was up.
+
+        A source with ``bot_check_click`` has its check's box clicked while it
+        waits (`uc_browser.check_clicker`), and every press or refusal is
+        written to the access log under ``method``.
         """
-        from event_harvester.sources.uc_browser import WebBrowser, not_through, prepare_native
+        from event_harvester.sources.uc_browser import (
+            WebBrowser,
+            check_clicker,
+            not_through,
+            prepare_native,
+        )
 
         wait_s = int(src.get("bot_check_wait_s", BOT_CHECK_WAIT_S))
+        on_check = None
+        if src.get("bot_check_click"):
+            on_check = check_clicker(
+                uc_kwargs, src["bot_check_click"],
+                partial(_log_click, src.get("name", src["url"]), method),
+            )
         through, title = prepare_native(
             uc_kwargs, src["url"], wait_s, keep=bool(src.get("keep_page_open")),
+            on_check=on_check,
         )
         if not through:
             raise not_through(title, wait_s)

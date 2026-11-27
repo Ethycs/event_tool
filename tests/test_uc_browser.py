@@ -240,6 +240,20 @@ def test_a_slow_page_gets_its_own_clock_and_is_not_called_a_bot_check(devtools):
     assert isinstance(uc_browser.not_through("Just a moment...", 15), SourceBlocked)
 
 
+def test_the_check_callback_hears_only_reads_that_show_a_check(devtools):
+    """The box is clicked by seconds into the check, so the count must be of
+    the check and not of the page's load before it or its content after."""
+    heard: list = []
+    devtools(["venue.example"] * 3 + ["Just a moment..."] * 4 + ["Venue calendar"])
+
+    through, _title = uc_browser.pass_check_unattached(
+        "http://b", URL, 30, on_check=lambda seconds, title: heard.append((seconds, title)),
+    )
+
+    assert through
+    assert heard == [(n, "Just a moment...") for n in (1, 2, 3, 4)]
+
+
 def test_a_configured_service_window_wins_and_nothing_else_is_tried(monkeypatch):
     """Once the service owns the native profile, a caller that fell back to
     the open port or to launching would start a second browser on it."""
@@ -270,14 +284,15 @@ def test_no_browser_is_handed_out_for_a_page_that_did_not_get_through(controller
 
     monkeypatch.setattr(uc_browser, "_port_open", lambda port: True)
     monkeypatch.setattr(
-        uc_browser, "pass_check_unattached", lambda endpoint, url, wait_s: (False, "Just a moment..."),
+        uc_browser, "pass_check_unattached",
+        lambda endpoint, url, wait_s, **_kw: (False, "Just a moment..."),
     )
     with pytest.raises(SourceBlocked):
         uc_browser.native_browser("https://venue.example/", 5)
     assert controller.launched == 0
 
     monkeypatch.setattr(
-        uc_browser, "pass_check_unattached", lambda endpoint, url, wait_s: (True, "Venue"),
+        uc_browser, "pass_check_unattached", lambda endpoint, url, wait_s, **_kw: (True, "Venue"),
     )
     with uc_browser.native_browser("https://venue.example/", 5) as uc:
         assert uc._uc.kwargs == {"cdp_endpoint": "http://127.0.0.1:9222", "label": "event_tool"}
